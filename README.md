@@ -1,16 +1,22 @@
-# EPUB Web Viewer 피드백
+# 🔑 Personal Google Drive Refresh Token Server
 
-EPUB Web Viewer를 사용하면서 발견한 버그나 개선 의견을 남겨 주세요.
+EPUB Web Viewer 사용자를 위한 초경량 전용 Google OAuth Refresh Token 서버입니다.
+사용자의 개인 서버(Oracle Linux, Synology, NAS 등)에서 구동되며, Google Drive 연동 시 1시간마다 만료되는 Access Token을 자동으로 무중단 갱신합니다.
 
-## 작성 방법
+---
 
-1. 기존 Issues에서 비슷한 내용이 있는지 확인해 주세요.
-2. 같은 내용이 없다면 새 Issue를 작성해 주세요.
-3. 버그는 발생 상황과 재현 방법을 함께 적어 주세요.
+## 🛠️ 요구사항 (Requirements)
 
-GitHub 로그인이 필요합니다.
+- **Node.js**: v18.0.0 이상
+- **Google Cloud Console**: OAuth 2.0 Client ID 및 Client Secret
 
-개인정보, 비밀번호, 인증 토큰, EPUB 원본 파일은 작성하지 마세요.
-작성한 Issue 내용과 GitHub 사용자명은 공개될 수 있습니다.
+---
 
-감사합니다.
+## 📦 설치 및 준비 (Installation)
+
+```bash
+# refresh-server 디렉터리로 이동
+cd refresh-server
+
+# 의존성 패키지 설치
+npm install
