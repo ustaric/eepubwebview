@@ -44,7 +44,6 @@ export const config = {
     redirectUri: process.env.GOOGLE_REDIRECT_URI.trim(),
     scopes: [
       'https://www.googleapis.com/auth/drive.file',
-      'https://www.googleapis.com/auth/drive.appdata'
     ]
   },
   security: {
