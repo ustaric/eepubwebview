@@ -1,11 +1,12 @@
 /**
  * @file server.js
- * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 HTTP 서버 (웹 설정 관리자 & 원클릭 복사 탑재)
+ * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 HTTP 서버 (ADMIN_PASSWORD 기반 관리자 보안 인증 탑재)
  */
 
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { URL } from 'url';
 import { config } from './config.js';
@@ -19,9 +20,11 @@ const ENV_PATH = path.resolve(__dirname, '.env');
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
 
+// 🔒 [관리자 인증 세션] 유효 세션 토큰 저장소 (메모리 격리)
+const adminSessionTokens = new Set();
+
 /**
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
- * 1분 동안 동일 IP에서 최대 60회까지 요청 허용
  */
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -173,7 +176,7 @@ function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true
 }
 
 /**
- * 📁 .env 파일 파싱 헬퍼
+ * 📁 .env 파일 읽기 헬퍼
  */
 function readEnvFile() {
   const envData = {};
@@ -193,7 +196,7 @@ function readEnvFile() {
 }
 
 /**
- * 📁 .env 파일 안전 덮어쓰기 헬퍼
+ * 📁 .env 파일 쓰기 헬퍼 (ADMIN_PASSWORD 보존)
  */
 function writeEnvFile(newValues) {
   const current = readEnvFile();
@@ -208,7 +211,8 @@ function writeEnvFile(newValues) {
     `TOKEN_ENCRYPTION_KEY=${merged.TOKEN_ENCRYPTION_KEY || ''}`,
     `TOKEN_FILE=${merged.TOKEN_FILE || './data/token.enc'}`,
     `ALLOWED_ORIGIN=${merged.ALLOWED_ORIGIN || '*'}`,
-    `STORAGE_MODE=${merged.STORAGE_MODE === 'true' ? 'true' : 'false'}`
+    `STORAGE_MODE=${merged.STORAGE_MODE === 'true' ? 'true' : 'false'}`,
+    `ADMIN_PASSWORD=${merged.ADMIN_PASSWORD || ''}`
   ];
 
   fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf-8');
@@ -234,7 +238,167 @@ function ensureStorageDirectories() {
 }
 
 /**
- * 🎨 웹 설정 대시보드 HTML 렌더러 (Git 주소 및 원클릭 복사 탑재)
+ * 🍪 요청 헤더에서 쿠키 파싱
+ */
+function parseCookies(req) {
+  const list = {};
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return list;
+
+  cookieHeader.split(';').forEach((cookie) => {
+    let [name, ...rest] = cookie.split('=');
+    name = name?.trim();
+    if (!name) return;
+    const value = rest.join('=').trim();
+    list[name] = decodeURIComponent(value);
+  });
+  return list;
+}
+
+/**
+ * 🔒 관리자 인증 세션 유효성 검사
+ */
+function isAuthenticated(req) {
+  const env = readEnvFile();
+  const adminPassword = env.ADMIN_PASSWORD;
+
+  // 비밀번호가 아예 설정되지 않은 최초 상태면 로그인 페이지에서 등록 유도
+  if (!adminPassword || adminPassword.trim() === '') {
+    return false;
+  }
+
+  const cookies = parseCookies(req);
+  const sessionToken = cookies['admin_session'];
+  return Boolean(sessionToken && adminSessionTokens.has(sessionToken));
+}
+
+/**
+ * 🔑 관리자 로그인 화면 렌더러
+ */
+function renderLoginPageHtml(errorMessage = null, isInitialSetup = false) {
+  const title = isInitialSetup ? '🔒 관리자 비밀번호 최초 설정' : '🔑 관리자 로그인';
+  const subtitle = isInitialSetup 
+    ? '서버를 보호하기 위해 새 관리자 비밀번호를 먼저 등록하세요.' 
+    : '서버 제어 센터에 접근하려면 관리자 비밀번호를 입력하세요.';
+
+  let errorBanner = '';
+  if (errorMessage) {
+    errorBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title} - EPUB Server</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --danger: #ef4444;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px 24px;
+      max-width: 400px;
+      width: 100%;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+      text-align: center;
+    }
+    .icon {
+      font-size: 40px;
+      margin-bottom: 12px;
+    }
+    h2 {
+      margin: 0 0 8px 0;
+      font-size: 20px;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin: 0 0 20px 0;
+      line-height: 1.5;
+    }
+    .alert {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--danger);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      text-align: left;
+    }
+    input[type="password"] {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 12px;
+      font-size: 15px;
+      box-sizing: border-box;
+      outline: none;
+      margin-bottom: 16px;
+      transition: border-color 0.2s;
+    }
+    input[type="password"]:focus {
+      border-color: var(--primary);
+    }
+    button {
+      width: 100%;
+      background: var(--primary);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: var(--primary-hover);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">${isInitialSetup ? '🔒' : '🔑'}</div>
+    <h2>${title}</h2>
+    <p>${subtitle}</p>
+    ${errorBanner}
+    <form method="POST" action="/admin/login">
+      <input type="password" name="password" placeholder="비밀번호 입력" required autofocus autocomplete="current-password">
+      <button type="submit">${isInitialSetup ? '비밀번호 등록 및 대시보드 진입' : '대시보드 잠금 해제'}</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * 🎨 웹 설정 대시보드 HTML 렌더러
  */
 function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null) {
   const env = readEnvFile();
@@ -294,18 +458,34 @@ function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null
       width: 100%;
     }
     .header {
-      text-align: center;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
       margin-bottom: 24px;
     }
     .header h1 {
-      font-size: 24px;
-      margin: 0 0 8px 0;
+      font-size: 22px;
+      margin: 0 0 4px 0;
       font-weight: 700;
     }
     .header p {
       color: var(--text-muted);
-      font-size: 14px;
+      font-size: 13px;
       margin: 0;
+    }
+    .btn-logout {
+      background: #334155;
+      color: #f1f5f9;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    .btn-logout:hover {
+      background: var(--danger);
+      border-color: var(--danger);
     }
     .card {
       background: var(--card-bg);
@@ -523,13 +703,16 @@ function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null
 <body>
   <div class="container">
     <div class="header">
-      <h1>⚙️ EPUB Server 제어 센터</h1>
-      <p>Google OAuth 갱신 프록시 및 로컬 동기화 스토리지 통합 제어</p>
+      <div>
+        <h1>⚙️ EPUB Server 제어 센터</h1>
+        <p>Google OAuth 갱신 프록시 및 로컬 동기화 스토리지 통합 제어</p>
+      </div>
+      <a href="/admin/logout" class="btn-logout">🔒 로그아웃</a>
     </div>
 
     ${alertBanner}
 
-    <!-- 🌟 원클릭 주요 주소 복사 카드 (깃허브 및 서버 URL) -->
+    <!-- 🌟 원클릭 주요 주소 복사 카드 -->
     <div class="card">
       <div class="section-title">
         <span>📋 주요 접속 정보 원클릭 복사</span>
@@ -627,6 +810,11 @@ function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null
           <label>허용 웹 뷰어 Origin (CORS)</label>
           <input type="text" name="ALLOWED_ORIGIN" value="${allowedOrigin}" placeholder="https://내뷰어주소.vercel.app 또는 *">
         </div>
+
+        <div class="form-group">
+          <label>🔒 관리자 페이지 비밀번호 변경 (.env 자동 반영)</label>
+          <input type="password" name="NEW_ADMIN_PASSWORD" placeholder="•••••••• (비밀번호 변경 시에만 새 비밀번호 입력)" autocomplete="new-password">
+        </div>
       </div>
 
       <button type="submit" class="btn-submit">💾 설정 저장 및 환경 적용</button>
@@ -695,16 +883,100 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 2. 🌟 웹 관리자 제어 대시보드 화면 서빙 (GET /admin 및 GET /settings)
+  // 2. 🌟 관리자 로그인 처리 (POST /admin/login)
+  if (req.method === 'POST' && pathname === '/admin/login') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      const params = new URLSearchParams(body);
+      const inputPass = params.get('password')?.trim() || '';
+      const env = readEnvFile();
+      const currentPass = env.ADMIN_PASSWORD;
+
+      // 1) 최초 설정인 경우: 입력된 비밀번호를 .env에 즉시 저장하고 세션 발급
+      if (!currentPass || currentPass.trim() === '') {
+        if (!inputPass) {
+          const html = renderLoginPageHtml('비밀번호를 입력해 주세요.', true);
+          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+          return;
+        }
+
+        writeEnvFile({ ADMIN_PASSWORD: inputPass });
+        console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
+
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        adminSessionTokens.add(sessionToken);
+
+        res.writeHead(302, {
+          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
+          'Location': '/admin'
+        });
+        res.end();
+        return;
+      }
+
+      // 2) 기존 비밀번호 검증
+      if (inputPass === currentPass) {
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        adminSessionTokens.add(sessionToken);
+
+        res.writeHead(302, {
+          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
+          'Location': '/admin'
+        });
+        res.end();
+      } else {
+        const html = renderLoginPageHtml('비밀번호가 올바르지 않습니다.', false);
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      }
+    });
+    return;
+  }
+
+  // 3. 🌟 관리자 로그아웃 처리 (GET /admin/logout)
+  if (req.method === 'GET' && pathname === '/admin/logout') {
+    const cookies = parseCookies(req);
+    const sessionToken = cookies['admin_session'];
+    if (sessionToken) {
+      adminSessionTokens.delete(sessionToken);
+    }
+    res.writeHead(302, {
+      'Set-Cookie': 'admin_session=; Path=/; HttpOnly; Max-Age=0',
+      'Location': '/admin'
+    });
+    res.end();
+    return;
+  }
+
+  // 4. 🌟 관리자 제어 대시보드 화면 서빙 (GET /admin 및 GET /settings)
   if (req.method === 'GET' && (pathname === '/admin' || pathname === '/settings')) {
+    const env = readEnvFile();
+    const isInitialSetup = !env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.trim() === '';
+
+    // 인증되지 않았으면 로그인(또는 최초 설정) 화면 표시
+    if (!isAuthenticated(req)) {
+      const html = renderLoginPageHtml(null, isInitialSetup);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
     const html = renderAdminSettingsHtml(req);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
     return;
   }
 
-  // 3. 🌟 웹 관리자 설정 저장 처리 (POST /admin/save)
+  // 5. 🌟 웹 관리자 설정 저장 처리 (POST /admin/save - 인증 필수)
   if (req.method === 'POST' && pathname === '/admin/save') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return;
+    }
+
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
@@ -730,10 +1002,14 @@ const server = http.createServer(async (req, res) => {
         const origin = params.get('ALLOWED_ORIGIN')?.trim();
         if (origin) updates.ALLOWED_ORIGIN = origin;
 
-        // .env 영구 갱신
+        const newAdminPassword = params.get('NEW_ADMIN_PASSWORD')?.trim();
+        if (newAdminPassword) {
+          updates.ADMIN_PASSWORD = newAdminPassword;
+          console.log('🔒 [Admin] 관리자 비밀번호가 새 비밀번호로 갱신되었습니다.');
+        }
+
         writeEnvFile(updates);
 
-        // 저장소 모드 ON일 경우 폴더 자동 생성 및 권한 세팅
         if (isStorageMode) {
           ensureStorageDirectories();
         }
@@ -755,7 +1031,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. Google OAuth 로그인 시작
+  // 6. Google OAuth 로그인 시작
   if (req.method === 'GET' && pathname === '/auth/google') {
     try {
       const authUrl = generateAuthUrl();
@@ -768,7 +1044,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 5. Google OAuth 콜백 처리
+  // 7. Google OAuth 콜백 처리
   if (req.method === 'GET' && pathname === '/auth/google/callback') {
     const code = reqUrl.searchParams.get('code');
     const state = reqUrl.searchParams.get('state');
@@ -804,7 +1080,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 6. Access Token 발급 요청
+  // 8. Access Token 발급 요청
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req)) {
       return sendJsonResponse(req, res, 429, {
