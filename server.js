@@ -1,27 +1,28 @@
 /**
  * @file server.js
- * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 HTTP 서버 (ADMIN_PASSWORD 기반 관리자 보안 인증 탑재)
+ * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
+ * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js 조립
+ * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
 import http from 'http';
 import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import { fileURLToPath } from 'url';
 import { URL } from 'url';
 import { config } from './config.js';
 import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToken } from './googleAuth.js';
 import { hasRefreshToken } from './tokenStore.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const ENV_PATH = path.resolve(__dirname, '.env');
-
-// 공식 깃허브 저장소 주소
-const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
-
-// 🔒 [관리자 인증 세션] 유효 세션 토큰 저장소 (메모리 격리)
-const adminSessionTokens = new Set();
+// 🌟 분리된 3대 전담 모듈 import
+import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './src/envManager.js';
+import {
+  isAuthenticated,
+  createAdminSession,
+  destroyAdminSession,
+  parseCookies,
+  renderLoginPageHtml,
+  renderAdminSettingsHtml
+} from './src/adminController.js';
+import { storageService } from './src/storageService.js';
 
 /**
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
@@ -82,7 +83,7 @@ function setCorsHeaders(req, res) {
     }
   }
 
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
@@ -176,685 +177,33 @@ function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true
 }
 
 /**
- * 📁 .env 파일 읽기 헬퍼
+ * HTTP 요청 Body 버퍼 수신 헬퍼 (최대 100MB 안전 제한)
+ * @param {http.IncomingMessage} req 
+ * @param {number} [maxBytes=104857600] 100MB
+ * @returns {Promise<Buffer>}
  */
-function readEnvFile() {
-  const envData = {};
-  if (!fs.existsSync(ENV_PATH)) return envData;
+function readRequestBodyBuffer(req, maxBytes = 104857600) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let received = 0;
 
-  const content = fs.readFileSync(ENV_PATH, 'utf-8');
-  content.split('\n').forEach((line) => {
-    const trimmed = line.trim();
-    if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
-      const idx = trimmed.indexOf('=');
-      const key = trimmed.substring(0, idx).trim();
-      const val = trimmed.substring(idx + 1).trim().replace(/^['"]|['"]$/g, '');
-      envData[key] = val;
-    }
-  });
-  return envData;
-}
-
-/**
- * 📁 .env 파일 쓰기 헬퍼 (ADMIN_PASSWORD 보존)
- */
-function writeEnvFile(newValues) {
-  const current = readEnvFile();
-  const merged = { ...current, ...newValues };
-
-  const lines = [
-    `PORT=${merged.PORT || '3001'}`,
-    `HOST=${merged.HOST || '127.0.0.1'}`,
-    `GOOGLE_CLIENT_ID=${merged.GOOGLE_CLIENT_ID || ''}`,
-    `GOOGLE_CLIENT_SECRET=${merged.GOOGLE_CLIENT_SECRET || ''}`,
-    `GOOGLE_REDIRECT_URI=${merged.GOOGLE_REDIRECT_URI || ''}`,
-    `TOKEN_ENCRYPTION_KEY=${merged.TOKEN_ENCRYPTION_KEY || ''}`,
-    `TOKEN_FILE=${merged.TOKEN_FILE || './data/token.enc'}`,
-    `ALLOWED_ORIGIN=${merged.ALLOWED_ORIGIN || '*'}`,
-    `STORAGE_MODE=${merged.STORAGE_MODE === 'true' ? 'true' : 'false'}`,
-    `ADMIN_PASSWORD=${merged.ADMIN_PASSWORD || ''}`
-  ];
-
-  fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf-8');
-}
-
-/**
- * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅
- */
-function ensureStorageDirectories() {
-  const dirs = [
-    path.resolve(__dirname, 'data'),
-    path.resolve(__dirname, 'data/books'),
-    path.resolve(__dirname, 'data/settings'),
-    path.resolve(__dirname, 'data/archive')
-  ];
-
-  dirs.forEach((dir) => {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
-    }
-  });
-  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings)');
-}
-
-/**
- * 🍪 요청 헤더에서 쿠키 파싱
- */
-function parseCookies(req) {
-  const list = {};
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) return list;
-
-  cookieHeader.split(';').forEach((cookie) => {
-    let [name, ...rest] = cookie.split('=');
-    name = name?.trim();
-    if (!name) return;
-    const value = rest.join('=').trim();
-    list[name] = decodeURIComponent(value);
-  });
-  return list;
-}
-
-/**
- * 🔒 관리자 인증 세션 유효성 검사
- */
-function isAuthenticated(req) {
-  const env = readEnvFile();
-  const adminPassword = env.ADMIN_PASSWORD;
-
-  // 비밀번호가 아예 설정되지 않은 최초 상태면 로그인 페이지에서 등록 유도
-  if (!adminPassword || adminPassword.trim() === '') {
-    return false;
-  }
-
-  const cookies = parseCookies(req);
-  const sessionToken = cookies['admin_session'];
-  return Boolean(sessionToken && adminSessionTokens.has(sessionToken));
-}
-
-/**
- * 🔑 관리자 로그인 화면 렌더러
- */
-function renderLoginPageHtml(errorMessage = null, isInitialSetup = false) {
-  const title = isInitialSetup ? '🔒 관리자 비밀번호 최초 설정' : '🔑 관리자 로그인';
-  const subtitle = isInitialSetup 
-    ? '서버를 보호하기 위해 새 관리자 비밀번호를 먼저 등록하세요.' 
-    : '서버 제어 센터에 접근하려면 관리자 비밀번호를 입력하세요.';
-
-  let errorBanner = '';
-  if (errorMessage) {
-    errorBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
-  }
-
-  return `<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} - EPUB Server</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --danger: #ef4444;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg);
-      color: var(--text);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-      padding: 16px;
-      box-sizing: border-box;
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 32px 24px;
-      max-width: 400px;
-      width: 100%;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
-      text-align: center;
-    }
-    .icon {
-      font-size: 40px;
-      margin-bottom: 12px;
-    }
-    h2 {
-      margin: 0 0 8px 0;
-      font-size: 20px;
-    }
-    p {
-      color: var(--text-muted);
-      font-size: 13px;
-      margin: 0 0 20px 0;
-      line-height: 1.5;
-    }
-    .alert {
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 16px;
-      background: rgba(239, 68, 68, 0.15);
-      color: var(--danger);
-      border: 1px solid rgba(239, 68, 68, 0.3);
-      text-align: left;
-    }
-    input[type="password"] {
-      width: 100%;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
-      padding: 12px;
-      font-size: 15px;
-      box-sizing: border-box;
-      outline: none;
-      margin-bottom: 16px;
-      transition: border-color 0.2s;
-    }
-    input[type="password"]:focus {
-      border-color: var(--primary);
-    }
-    button {
-      width: 100%;
-      background: var(--primary);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 12px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-    button:hover {
-      background: var(--primary-hover);
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">${isInitialSetup ? '🔒' : '🔑'}</div>
-    <h2>${title}</h2>
-    <p>${subtitle}</p>
-    ${errorBanner}
-    <form method="POST" action="/admin/login">
-      <input type="password" name="password" placeholder="비밀번호 입력" required autofocus autocomplete="current-password">
-      <button type="submit">${isInitialSetup ? '비밀번호 등록 및 대시보드 진입' : '대시보드 잠금 해제'}</button>
-    </form>
-  </div>
-</body>
-</html>`;
-}
-
-/**
- * 🎨 웹 설정 대시보드 HTML 렌더러
- */
-function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null) {
-  const env = readEnvFile();
-  const hasToken = hasRefreshToken();
-  const isStorageMode = env.STORAGE_MODE === 'true';
-
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers.host || `${config.host}:${config.port}`;
-  const currentServerUrl = `${protocol}://${host}`;
-
-  const readerUrl = config.security.readerUrl || '/';
-  const clientId = env.GOOGLE_CLIENT_ID || '';
-  const redirectUri = env.GOOGLE_REDIRECT_URI || `${currentServerUrl}/auth/google/callback`;
-  const allowedOrigin = env.ALLOWED_ORIGIN || '*';
-  const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
-  const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
-
-  let alertBanner = '';
-  if (successMessage) {
-    alertBanner = `<div class="alert alert-success">✔ ${successMessage}</div>`;
-  } else if (errorMessage) {
-    alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
-  }
-
-  return `<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>⚙️ EPUB Server 제어 센터</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 24px 16px;
-      display: flex;
-      justify-content: center;
-      min-height: 100vh;
-      box-sizing: border-box;
-    }
-    .container {
-      max-width: 640px;
-      width: 100%;
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 24px;
-    }
-    .header h1 {
-      font-size: 22px;
-      margin: 0 0 4px 0;
-      font-weight: 700;
-    }
-    .header p {
-      color: var(--text-muted);
-      font-size: 13px;
-      margin: 0;
-    }
-    .btn-logout {
-      background: #334155;
-      color: #f1f5f9;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 6px 12px;
-      font-size: 13px;
-      text-decoration: none;
-      transition: background 0.2s;
-    }
-    .btn-logout:hover {
-      background: var(--danger);
-      border-color: var(--danger);
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 24px;
-      margin-bottom: 20px;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
-    }
-    .section-title {
-      font-size: 16px;
-      font-weight: 600;
-      margin: 0 0 16px 0;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .badge {
-      font-size: 12px;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-weight: 500;
-    }
-    .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
-    .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .badge-info { background: rgba(59, 130, 246, 0.15); color: var(--primary); border: 1px solid rgba(59, 130, 246, 0.3); }
-
-    .copy-box {
-      display: flex;
-      align-items: center;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 6px 10px;
-      margin-top: 6px;
-    }
-    .copy-text {
-      flex: 1;
-      font-family: monospace;
-      font-size: 13px;
-      color: #38bdf8;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .btn-copy {
-      background: #334155;
-      color: var(--text);
-      border: none;
-      border-radius: 6px;
-      padding: 6px 12px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      margin-left: 8px;
-      transition: background 0.2s;
-      flex-shrink: 0;
-    }
-    .btn-copy:hover {
-      background: #475569;
-    }
-    .btn-copy.copied {
-      background: var(--success);
-      color: white;
-    }
-
-    .form-group {
-      margin-bottom: 16px;
-    }
-    .form-group:last-child {
-      margin-bottom: 0;
-    }
-    label {
-      display: block;
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-    }
-    input[type="text"], input[type="password"] {
-      width: 100%;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
-      padding: 10px 12px;
-      font-size: 14px;
-      box-sizing: border-box;
-      outline: none;
-      transition: border-color 0.2s;
-    }
-    input[type="text"]:focus, input[type="password"]:focus {
-      border-color: var(--primary);
-    }
-
-    .toggle-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 14px;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-    }
-    .toggle-info h4 {
-      margin: 0 0 4px 0;
-      font-size: 14px;
-    }
-    .toggle-info p {
-      margin: 0;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .switch {
-      position: relative;
-      display: inline-block;
-      width: 48px;
-      height: 26px;
-      flex-shrink: 0;
-    }
-    .switch input {
-      opacity: 0;
-      width: 0;
-      height: 0;
-    }
-    .slider {
-      position: absolute;
-      cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background-color: #334155;
-      transition: .3s;
-      border-radius: 34px;
-    }
-    .slider:before {
-      position: absolute;
-      content: "";
-      height: 18px;
-      width: 18px;
-      left: 4px;
-      bottom: 4px;
-      background-color: white;
-      transition: .3s;
-      border-radius: 50%;
-    }
-    input:checked + .slider {
-      background-color: var(--success);
-    }
-    input:checked + .slider:before {
-      transform: translateX(22px);
-    }
-
-    .btn-submit {
-      width: 100%;
-      background: var(--primary);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 12px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-    .btn-submit:hover {
-      background: var(--primary-hover);
-    }
-
-    .btn-return {
-      display: block;
-      text-align: center;
-      background: transparent;
-      color: var(--text-muted);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px;
-      font-size: 14px;
-      text-decoration: none;
-      margin-top: 12px;
-      transition: all 0.2s;
-    }
-    .btn-return:hover {
-      background: rgba(255,255,255,0.05);
-      color: var(--text);
-    }
-
-    .alert {
-      padding: 12px 16px;
-      border-radius: 8px;
-      font-size: 14px;
-      margin-bottom: 20px;
-    }
-    .alert-success {
-      background: rgba(16, 185, 129, 0.15);
-      color: var(--success);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-    }
-    .alert-error {
-      background: rgba(239, 68, 68, 0.15);
-      color: var(--danger);
-      border: 1px solid rgba(239, 68, 68, 0.3);
-    }
-    .oauth-btn {
-      display: inline-block;
-      background: #475569;
-      color: #fff;
-      padding: 8px 14px;
-      border-radius: 6px;
-      text-decoration: none;
-      font-size: 13px;
-      font-weight: 500;
-      margin-top: 10px;
-    }
-    .oauth-btn:hover { background: #64748b; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div>
-        <h1>⚙️ EPUB Server 제어 센터</h1>
-        <p>Google OAuth 갱신 프록시 및 로컬 동기화 스토리지 통합 제어</p>
-      </div>
-      <a href="/admin/logout" class="btn-logout">🔒 로그아웃</a>
-    </div>
-
-    ${alertBanner}
-
-    <!-- 🌟 원클릭 주요 주소 복사 카드 -->
-    <div class="card">
-      <div class="section-title">
-        <span>📋 주요 접속 정보 원클릭 복사</span>
-        <span class="badge badge-info">빠른 복사 지원</span>
-      </div>
-
-      <div class="form-group">
-        <label>🐙 프로젝트 공식 GitHub 저장소</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-github">${GITHUB_REPO_URL}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${GITHUB_REPO_URL}', this)">복사</button>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>🌐 현재 서버 주소 (웹 뷰어 설정창에 입력할 주소)</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-server">${currentServerUrl}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${currentServerUrl}', this)">복사</button>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>🔗 구글 콘솔에 등록할 리디렉션 URI (Redirect URI)</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-redirect">${redirectUri}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${redirectUri}', this)">복사</button>
-        </div>
-      </div>
-    </div>
-
-    <form method="POST" action="/admin/save">
-      <!-- 1. Google OAuth 인증 상태 및 재인증 -->
-      <div class="card">
-        <div class="section-title">
-          <span>🔑 Google OAuth 토큰 상태</span>
-          <span class="badge ${hasToken ? 'badge-success' : 'badge-warning'}">
-            ${hasToken ? '토큰 보유 (정상)' : '미인증 (연동 필요)'}
-          </span>
-        </div>
-        <p style="font-size: 13px; color: var(--text-muted); margin: 0 0 12px 0;">
-          Google Drive 연동용 Refresh Token이 서버에 암호화되어 안전하게 보관되고 있는지 나타냅니다.
-        </p>
-        <a href="/auth/google" class="oauth-btn">🔗 Google 계정 로그인 / 재인증 시작</a>
-      </div>
-
-      <!-- 2. 스토리지 모드 선택 (저장소 기능 토글) -->
-      <div class="card">
-        <div class="section-title">
-          <span>📁 개인 서버 저장소 모드 (Self-Hosted Storage)</span>
-          <span class="badge ${isStorageMode ? 'badge-success' : 'badge-info'}">
-            ${isStorageMode ? '로컬 저장소 활성' : '인증 프록시 모드'}
-          </span>
-        </div>
-
-        <div class="toggle-row">
-          <div class="toggle-info">
-            <h4>개인 서버에 책/설정 직접 저장</h4>
-            <p>체크 시 Google Drive 대신 이 서버의 디스크(./data/books)에 책과 진도율을 동기화합니다.</p>
-          </div>
-          <label class="switch">
-            <input type="checkbox" name="STORAGE_MODE" value="true" ${isStorageMode ? 'checked' : ''}>
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-
-      <!-- 3. 상세 환경변수 설정 (.env 연동) -->
-      <div class="card">
-        <div class="section-title">
-          <span>🛠️ 시스템 상세 설정 (.env)</span>
-        </div>
-
-        <div class="form-group">
-          <label>Google Client ID</label>
-          <input type="text" name="GOOGLE_CLIENT_ID" value="${clientId}" placeholder="your-client-id.apps.googleusercontent.com">
-        </div>
-
-        <div class="form-group">
-          <label>Google Client Secret ${hasSecret ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
-          <input type="password" name="GOOGLE_CLIENT_SECRET" placeholder="${hasSecret ? '•••••••• (변경 시에만 새로 입력)' : 'GOCSPX-...'}" autocomplete="new-password">
-        </div>
-
-        <div class="form-group">
-          <label>Google Redirect URI</label>
-          <input type="text" name="GOOGLE_REDIRECT_URI" value="${redirectUri}" placeholder="https://내서버도메인/auth/google/callback">
-        </div>
-
-        <div class="form-group">
-          <label>토큰 암호화 마스터 키 ${hasKey ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
-          <input type="password" name="TOKEN_ENCRYPTION_KEY" placeholder="${hasKey ? '•••••••• (변경 시에만 새로 입력)' : '32자 이상의 무작위 비밀키'}" autocomplete="new-password">
-        </div>
-
-        <div class="form-group">
-          <label>허용 웹 뷰어 Origin (CORS)</label>
-          <input type="text" name="ALLOWED_ORIGIN" value="${allowedOrigin}" placeholder="https://내뷰어주소.vercel.app 또는 *">
-        </div>
-
-        <div class="form-group">
-          <label>🔒 관리자 페이지 비밀번호 변경 (.env 자동 반영)</label>
-          <input type="password" name="NEW_ADMIN_PASSWORD" placeholder="•••••••• (비밀번호 변경 시에만 새 비밀번호 입력)" autocomplete="new-password">
-        </div>
-      </div>
-
-      <button type="submit" class="btn-submit">💾 설정 저장 및 환경 적용</button>
-      <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
-    </form>
-  </div>
-
-  <script>
-    function copyToClipboard(text, btnElement) {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => {
-          showCopiedEffect(btnElement);
-        });
+    req.on('data', chunk => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        req.destroy();
+        reject(new Error(`요청 크기가 한도(${maxBytes / 1024 / 1024}MB)를 초과했습니다.`));
       } else {
-        const tempInput = document.createElement('input');
-        tempInput.value = text;
-        document.body.appendChild(tempInput);
-        tempInput.select();
-        document.execCommand('copy');
-        document.body.removeChild(tempInput);
-        showCopiedEffect(btnElement);
+        chunks.push(chunk);
       }
-    }
+    });
 
-    function showCopiedEffect(btn) {
-      const originalText = btn.textContent;
-      btn.textContent = '✔ 복사됨!';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = originalText;
-        btn.classList.remove('copied');
-      }, 1800);
-    }
-  </script>
-</body>
-</html>`;
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', err => reject(err));
+  });
 }
 
 /**
- * HTTP 요청 라우터
+ * HTTP 요청 Router
  */
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -871,7 +220,9 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`[Request] ${req.method} ${pathname} (IP: ${getClientIp(req)})`);
 
+  // =========================================================================
   // 1. 서버 헬스체크
+  // =========================================================================
   if (req.method === 'GET' && pathname === '/api/health') {
     const env = readEnvFile();
     return sendJsonResponse(req, res, 200, {
@@ -883,7 +234,9 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 2. 🌟 관리자 로그인 처리 (POST /admin/login)
+  // =========================================================================
+  // 2. 관리자 인증 & 대시보드 라우트 (src/adminController 위임)
+  // =========================================================================
   if (req.method === 'POST' && pathname === '/admin/login') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
@@ -893,7 +246,6 @@ const server = http.createServer(async (req, res) => {
       const env = readEnvFile();
       const currentPass = env.ADMIN_PASSWORD;
 
-      // 1) 최초 설정인 경우: 입력된 비밀번호를 .env에 즉시 저장하고 세션 발급
       if (!currentPass || currentPass.trim() === '') {
         if (!inputPass) {
           const html = renderLoginPageHtml('비밀번호를 입력해 주세요.', true);
@@ -905,9 +257,7 @@ const server = http.createServer(async (req, res) => {
         writeEnvFile({ ADMIN_PASSWORD: inputPass });
         console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
 
-        const sessionToken = crypto.randomBytes(32).toString('hex');
-        adminSessionTokens.add(sessionToken);
-
+        const sessionToken = createAdminSession();
         res.writeHead(302, {
           'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
           'Location': '/admin'
@@ -916,11 +266,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 2) 기존 비밀번호 검증
       if (inputPass === currentPass) {
-        const sessionToken = crypto.randomBytes(32).toString('hex');
-        adminSessionTokens.add(sessionToken);
-
+        const sessionToken = createAdminSession();
         res.writeHead(302, {
           'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
           'Location': '/admin'
@@ -935,13 +282,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 3. 🌟 관리자 로그아웃 처리 (GET /admin/logout)
   if (req.method === 'GET' && pathname === '/admin/logout') {
     const cookies = parseCookies(req);
-    const sessionToken = cookies['admin_session'];
-    if (sessionToken) {
-      adminSessionTokens.delete(sessionToken);
-    }
+    destroyAdminSession(cookies['admin_session']);
     res.writeHead(302, {
       'Set-Cookie': 'admin_session=; Path=/; HttpOnly; Max-Age=0',
       'Location': '/admin'
@@ -950,12 +293,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. 🌟 관리자 제어 대시보드 화면 서빙 (GET /admin 및 GET /settings)
   if (req.method === 'GET' && (pathname === '/admin' || pathname === '/settings')) {
     const env = readEnvFile();
     const isInitialSetup = !env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.trim() === '';
 
-    // 인증되지 않았으면 로그인(또는 최초 설정) 화면 표시
     if (!isAuthenticated(req)) {
       const html = renderLoginPageHtml(null, isInitialSetup);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -969,7 +310,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 5. 🌟 웹 관리자 설정 저장 처리 (POST /admin/save - 인증 필수)
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -1005,7 +345,7 @@ const server = http.createServer(async (req, res) => {
         const newAdminPassword = params.get('NEW_ADMIN_PASSWORD')?.trim();
         if (newAdminPassword) {
           updates.ADMIN_PASSWORD = newAdminPassword;
-          console.log('🔒 [Admin] 관리자 비밀번호가 새 비밀번호로 갱신되었습니다.');
+          console.log('🔒 [Admin] 관리자 비밀번호가 갱신되었습니다.');
         }
 
         writeEnvFile(updates);
@@ -1015,7 +355,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const successMsg = isStorageMode
-          ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 자동으로 활성화되었습니다.'
+          ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 활성화되었습니다.'
           : '설정이 성공적으로 저장되었습니다. (인증 프록시 모드)';
 
         const html = renderAdminSettingsHtml(req, successMsg);
@@ -1023,7 +363,7 @@ const server = http.createServer(async (req, res) => {
         res.end(html);
       } catch (err) {
         console.error('[Admin Save Error]', err);
-        const html = renderAdminSettingsHtml(req, null, '설정 저장 중 오류가 발생했습니다: ' + err.message);
+        const html = renderAdminSettingsHtml(req, null, '설정 저장 오류: ' + err.message);
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
       }
@@ -1031,7 +371,129 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 6. Google OAuth 로그인 시작
+  // =========================================================================
+  // 3. 🌟 자체 스토리지 모드 REST API 엔드포인트 (src/storageService 위임)
+  // =========================================================================
+
+  // ⚡ [올인원 통합 스냅샷 단일 쿼리] GET /api/storage/snapshot
+  if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
+    try {
+      const snapshot = await storageService.getUnifiedSnapshot();
+      return sendJsonResponse(req, res, 200, snapshot);
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // 📖 [도서 메타데이터 JSON 저장] POST /api/storage/books/:id
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
+    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      const bookData = JSON.parse(buffer.toString('utf-8'));
+      storageService.saveBookMetadata(bookId, bookData);
+      return sendJsonResponse(req, res, 200, { ok: true, bookId });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // 📖 [도서 메타데이터 JSON 조회] GET /api/storage/books/:id
+  if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
+    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
+    const meta = storageService.getBookMetadata(bookId);
+    if (!meta) return sendJsonResponse(req, res, 404, { error: '도서를 찾을 수 없습니다.' });
+    return sendJsonResponse(req, res, 200, meta);
+  }
+
+  // 📦 [EPUB 바이너리 파일 업로드] POST /api/storage/books/:id/epub
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
+    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      storageService.saveBookEpub(bookId, buffer);
+      return sendJsonResponse(req, res, 200, { ok: true, bookId, size: buffer.length });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // 📦 [EPUB 바이너리 파일 스트리밍 다운로드] GET /api/storage/books/:id/epub
+  if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
+    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
+    const info = storageService.getBookEpubPath(bookId);
+    if (!info) return sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
+
+    setCorsHeaders(req, res);
+    res.writeHead(200, {
+      'Content-Type': 'application/epub+zip',
+      'Content-Length': info.size,
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(bookId)}.epub"`
+    });
+    const readStream = fs.createReadStream(info.filePath);
+    readStream.pipe(res);
+    return;
+  }
+
+  // 🖼️ [표지 이미지 업로드] POST /api/storage/covers/:fileName
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/covers/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      storageService.saveCoverImage(fileName, buffer);
+      return sendJsonResponse(req, res, 200, { ok: true, fileName });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // 🖼️ [표지 이미지 다운로드] GET /api/storage/covers/:fileName
+  if (req.method === 'GET' && pathname.startsWith('/api/storage/covers/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
+    const info = storageService.getCoverImagePath(fileName);
+    if (!info) return sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
+
+    setCorsHeaders(req, res);
+    res.writeHead(200, {
+      'Content-Type': 'image/webp',
+      'Content-Length': info.size
+    });
+    const readStream = fs.createReadStream(info.filePath);
+    readStream.pipe(res);
+    return;
+  }
+
+  // 🗑️ [도서 완전 삭제 트랜잭션] DELETE /api/storage/books/:id
+  if (req.method === 'DELETE' && pathname.startsWith('/api/storage/books/')) {
+    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
+    const count = storageService.deleteBookAll(bookId);
+    return sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
+  }
+
+  // ⚙️ [설정/통계/업적/묘비 JSON 저장] POST /api/storage/settings/:fileName
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/settings/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      const data = JSON.parse(buffer.toString('utf-8'));
+      storageService.saveSettingsFile(fileName, data);
+      return sendJsonResponse(req, res, 200, { ok: true, fileName });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // ⚙️ [설정/통계/업적/묘비 JSON 조회] GET /api/storage/settings/:fileName
+  if (req.method === 'GET' && pathname.startsWith('/api/storage/settings/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
+    const data = storageService.getSettingsFile(fileName);
+    if (!data) return sendJsonResponse(req, res, 404, { error: '설정 파일을 찾을 수 없습니다.' });
+    return sendJsonResponse(req, res, 200, data);
+  }
+
+  // =========================================================================
+  // 4. 기존 Google OAuth 인증 라우트 (하위 호환 100% 보존)
+  // =========================================================================
   if (req.method === 'GET' && pathname === '/auth/google') {
     try {
       const authUrl = generateAuthUrl();
@@ -1044,7 +506,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 7. Google OAuth 콜백 처리
   if (req.method === 'GET' && pathname === '/auth/google/callback') {
     const code = reqUrl.searchParams.get('code');
     const state = reqUrl.searchParams.get('state');
@@ -1080,7 +541,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 8. Access Token 발급 요청
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req)) {
       return sendJsonResponse(req, res, 429, {
