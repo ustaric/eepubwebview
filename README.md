@@ -3,7 +3,7 @@
 EPUB Web Viewer 사용자를 위한 초경량 전용 Google OAuth Refresh Token 및 자체 스토리지(Self-Hosted Storage) 서버입니다.
 
 사용자의 개인 서버(Oracle Linux, Ubuntu, Synology, NAS 등)에서 직접 구동되며, Google Drive 연동에 필요한 Refresh Token을 서버에 안전하게 보관하고 Access Token을 필요할 때 자동으로 갱신하는 것을 목적으로 합니다. 
-또한 선택에 따라 Google Drive를 거치지 않고 **개인 서버 디스크에 도서와 독서 진도율을 0.05초 만에 직접 동기화하는 올인원 스토리지 모드**를 지원합니다.
+또한 선택에 따라 Google Drive를 거치지 않고 **개인 서버 디스크에 도서와 독서 진도율을 빠르게 직접 동기화 하도록 구현한 올인원 스토리지 모드**를 지원합니다.
 
 이 프로젝트는 **개인 서버에서 개인이 직접 사용하는 것을 주된 목적으로 합니다.**
 
@@ -20,7 +20,7 @@ EPUB Web Viewer를 사용하면서 발견한 버그나 개선 의견을 남겨 �
 3. 버그의 경우 발생 상황과 재현 방법을 함께 적어 주세요.
 4. GitHub 로그인이 필요합니다.
 
-[EPUB Web Viewer Issues](https://github.com/ustaric/eepubwebview/issues)
+[EPUB Web Viewer Issues](https://github.com/ustaric/epubwebview/issues)
 
 > ⚠️ 개인정보, 비밀번호, 인증 토큰, Google Client Secret, Refresh Token, EPUB 원본 파일 등 민감한 정보를 Issue에 작성하지 마세요.
 >
@@ -38,7 +38,7 @@ Google OAuth 인증 과정에서 발급된 Refresh Token은 서버에 암호화�
 
 브라우저가 Access Token을 필요로 할 때 서버가 Google OAuth 서버와 통신하여 새로운 Access Token을 발급받아 반환합니다.
 
-아울러 설정에 따라 Google Drive 대신 **내 개인 서버 디스크(./data/books, ./data/settings)를 클라우드 저장소로 직접 사용**하여 초고속 동기화와 영구 무제한 스토리지를 운영할 수 있습니다.
+아울러 설정에 따라 Google Drive 대신 **내 개인 서버 디스크(./data/books, ./data/settings)를 클라우드 저장소로 직접 사용**할 수 있습니다.
 
 ### 기본 구조
 
@@ -64,7 +64,7 @@ Google OAuth 인증 과정에서 발급된 Refresh Token은 서버에 암호화�
 - **웹 관리자 제어 센터 (/admin)**: 브라우저에서 편리하게 시스템 설정, 토큰 상태 확인 및 스토리지 모드 ON/OFF 제어
 - **보안 인증 관문**: ADMIN_PASSWORD 기반 잠금 화면 및 24시간 쿠키 세션 인증 탑재
 - **자체 스토리지 모드 (Self-Hosted Storage)**: Google Drive 없이 개인 서버에 도서 및 진도율 0.05초 직통 동기화
-- **0.05초 올인원 통합 스냅샷 (/api/storage/snapshot)**: 단 1번의 쿼리로 도서, 설정, 업적, 통계를 일괄 수집
+- **빠른 올인원 통합 스냅샷 (/api/storage/snapshot)**: 단 1번의 쿼리로 도서, 설정, 업적, 통계를 일괄 수집
 - **원클릭 주소 복사**: 웹 제어 센터에서 GitHub 주소, 서버 접속 URL, 구글 Redirect URI 1초 클립보드 복사
 - **원클릭 대화형 설치 스크립트 (setup.sh)**: Caddy 자동 감지 및 리눅스 내부 방화벽(iptables) 자동 개방 지원
 - Google OAuth 2.0 Authorization Code Flow 사용
@@ -78,6 +78,20 @@ Google OAuth 인증 과정에서 발급된 Refresh Token은 서버에 암호화�
 - 환경변수를 통한 Client ID / Client Secret 관리
 - HTTPS Reverse Proxy 환경 지원
 - PM2 등을 이용한 프로세스 자동 재시작 지원
+
+---
+
+## 📁 자체 스토리지 동작 방식
+
+자체 스토리지 모드는 Google Drive API를 거치지 않고 개인 서버의 디스크를 직접 저장소로 사용합니다.
+
+- 도서 메타데이터, EPUB 원본, 표지 이미지 및 독서 관련 설정을 개인 서버에 저장
+- 통합 스냅샷 API를 통한 도서 목록 및 설정 데이터 일괄 조회
+- 기존 EPUB Web Viewer의 동기화 및 정합성 대사 엔진과 연동
+- 여러 기기에서 동일한 개인 서버 저장소를 공유
+- Google Drive OAuth 인증 없이 자체 스토리지 사용 가능
+
+저장소 데이터는 운영자가 관리하는 개인 서버의 디스크에 보관되며, 실제 저장 용량과 가용성은 서버 환경에 따라 달라집니다.
 
 ---
 
@@ -293,7 +307,7 @@ Google Refresh Token은 서버 측에서만 보관하며 암호화하여 저장�
 | `POST` | `/admin/login` | 관리자 로그인 및 세션 쿠키 발급 |
 | `GET` | `/admin/logout` | 관리자 세션 파기 및 로그아웃 |
 | `POST` | `/admin/save` | 관리자 환경설정(.env) 저장 및 스토리지 모드 반영 |
-| `GET` | `/api/storage/snapshot` | ⚡ 올인원 통합 스냅샷 0초 조회 (도서, 설정, 통계, 업적) |
+| `GET` | `/api/storage/snapshot` | ⚡ 올인원 통합 스냅샷 빠르게 조회 하도록 설계 (도서, 설정, 통계, 업적) |
 | `POST` | `/api/storage/books/:id` | 도서 메타데이터(JSON) 저장 |
 | `GET` | `/api/storage/books/:id` | 도서 메타데이터(JSON) 조회 |
 | `POST` | `/api/storage/books/:id/epub` | 도서 원본 EPUB 바이너리 업로드 |
