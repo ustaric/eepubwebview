@@ -63,8 +63,8 @@ Google OAuth 인증 과정에서 발급된 Refresh Token은 서버에 암호화�
 - 개인 서버에서 직접 운영
 - **웹 관리자 제어 센터 (/admin)**: 브라우저에서 편리하게 시스템 설정, 토큰 상태 확인 및 스토리지 모드 ON/OFF 제어
 - **보안 인증 관문**: ADMIN_PASSWORD 기반 잠금 화면 및 24시간 쿠키 세션 인증 탑재
-- **자체 스토리지 모드 (Self-Hosted Storage)**: Google Drive 없이 개인 서버에 도서 및 진도율 0.05초 직통 동기화
-- **빠른 올인원 통합 스냅샷 (/api/storage/snapshot)**: 단 1번의 쿼리로 도서, 설정, 업적, 통계를 일괄 수집
+- **자체 스토리지 모드 (Self-Hosted Storage)**: Google Drive 없이 개인 서버 디스크 기반 자체 스토리지 및 빠른 동기화 지원
+- **빠른 올인원 통합 스냅샷 (/api/storage/snapshot)**: 단 1회의 API 요청으로 도서, 설정, 업적, 통계 데이터를 일괄 조회
 - **원클릭 주소 복사**: 웹 제어 센터에서 GitHub 주소, 서버 접속 URL, 구글 Redirect URI 1초 클립보드 복사
 - **원클릭 대화형 설치 스크립트 (setup.sh)**: Caddy 자동 감지 및 리눅스 내부 방화벽(iptables) 자동 개방 지원
 - Google OAuth 2.0 Authorization Code Flow 사용
@@ -307,14 +307,14 @@ Google Refresh Token은 서버 측에서만 보관하며 암호화하여 저장�
 | `POST` | `/admin/login` | 관리자 로그인 및 세션 쿠키 발급 |
 | `GET` | `/admin/logout` | 관리자 세션 파기 및 로그아웃 |
 | `POST` | `/admin/save` | 관리자 환경설정(.env) 저장 및 스토리지 모드 반영 |
-| `GET` | `/api/storage/snapshot` | ⚡ 올인원 통합 스냅샷 빠르게 조회 하도록 설계 (도서, 설정, 통계, 업적) |
+| `GET` | `/api/storage/snapshot` | 도서, 설정, 통계, 업적 및 묘비 데이터 통합 조회 |
 | `POST` | `/api/storage/books/:id` | 도서 메타데이터(JSON) 저장 |
 | `GET` | `/api/storage/books/:id` | 도서 메타데이터(JSON) 조회 |
 | `POST` | `/api/storage/books/:id/epub` | 도서 원본 EPUB 바이너리 업로드 |
 | `GET` | `/api/storage/books/:id/epub` | 도서 원본 EPUB 스트리밍 다운로드 |
 | `POST` | `/api/storage/covers/:fileName` | 도서 표지 이미지(WebP) 업로드 |
 | `GET` | `/api/storage/covers/:fileName` | 도서 표지 이미지(WebP) 다운로드 |
-| `DELETE` | `/api/storage/books/:id` | 도서 메타, EPUB, 표지 일괄 영구 파쇄 |
+| `DELETE` | `/api/storage/books/:id` | 도서 메타데이터, EPUB 원본 및 표지 파일 삭제 |
 | `POST` | `/api/storage/settings/:fileName` | 전역 설정/통계/업적/묘비 JSON 저장 |
 | `GET` | `/api/storage/settings/:fileName` | 전역 설정/통계/업적/묘비 JSON 조회 |
 | `GET` | `/auth/google` | Google OAuth 로그인 시작 |
