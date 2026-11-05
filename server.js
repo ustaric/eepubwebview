@@ -2,6 +2,8 @@
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
  * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js 조립
+ * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용 (비활성 시 403 차단)
+ * - 🔬 [크래시 리포트 수신 & 웹 다운로드 센터] 클라이언트 진단 JSON 수신 및 어드민 웹 원클릭 다운로드/삭제 완비
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
@@ -310,6 +312,60 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 🔬 [관리자 전용] 크래시 리포트 다운로드 라우트
+  if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return;
+    }
+
+    const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/download/', ''));
+    const info = storageService.getCrashReportPath(fileName);
+    if (!info) {
+      return sendJsonResponse(req, res, 404, { error: '크래시 리포트 파일을 찾을 수 없습니다.' });
+    }
+
+    setCorsHeaders(req, res);
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': info.size,
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`
+    });
+    const readStream = fs.createReadStream(info.filePath);
+    readStream.pipe(res);
+    return;
+  }
+
+  // 🔬 [관리자 전용] 크래시 리포트 단일 삭제 라우트
+  if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/delete/')) {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return;
+    }
+
+    const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/delete/', ''));
+    storageService.deleteCrashReport(fileName);
+    res.writeHead(302, { Location: '/admin' });
+    res.end();
+    return;
+  }
+
+  // 🔬 [관리자 전용] 크래시 리포트 전체 비우기 라우트
+  if (req.method === 'GET' && pathname === '/admin/crash-reports/clear') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return;
+    }
+
+    storageService.clearAllCrashReports();
+    res.writeHead(302, { Location: '/admin' });
+    res.end();
+    return;
+  }
+
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -374,6 +430,30 @@ const server = http.createServer(async (req, res) => {
   // =========================================================================
   // 3. 🌟 자체 스토리지 모드 REST API 엔드포인트 (src/storageService 위임)
   // =========================================================================
+
+  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (STORAGE_MODE와 무관하게 결함 수집 항상 허용)
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      const reportData = JSON.parse(buffer.toString('utf-8'));
+      storageService.saveCrashReport(fileName, reportData);
+      return sendJsonResponse(req, res, 200, { ok: true, fileName, status: 'saved' });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // 🛡️ [STORAGE_MODE 검증 가드] 도서 및 설정 저장소 엔드포인트는 어드민에서 켜져 있을 때만 통과
+  if (pathname.startsWith('/api/storage/')) {
+    const env = readEnvFile();
+    if (env.STORAGE_MODE !== 'true') {
+      console.warn(`⛔ [Storage Blocked] 개인 서버 저장소 모드가 비활성화되어 요청이 거부되었습니다. Path: ${pathname}`);
+      return sendJsonResponse(req, res, 403, {
+        error: 'STORAGE_MODE_DISABLED: 개인 서버 저장소 모드가 비활성화되어 있습니다. 관리자 대시보드(/admin)에서 활성화해 주세요.'
+      });
+    }
+  }
 
   // ⚡ [올인원 통합 스냅샷 단일 쿼리] GET /api/storage/snapshot
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {

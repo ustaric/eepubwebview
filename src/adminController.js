@@ -1,12 +1,13 @@
 /**
  * @file src/adminController.js
- * @description 관리자 웹 대시보드 HTML 렌더링, 쿠키 인증 및 설정 저장 처리 전담 컨트롤러
+ * @description 관리자 웹 대시보드 HTML 렌더링, 쿠키 인증, 설정 저장 및 크래시 리포트 다운로드/관리 전담 컨트롤러
  */
 
 import crypto from 'crypto';
 import { config } from '../config.js';
 import { hasRefreshToken } from '../tokenStore.js';
 import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './envManager.js';
+import { storageService } from './storageService.js';
 
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
@@ -201,7 +202,7 @@ export function renderLoginPageHtml(errorMessage = null, isInitialSetup = false)
 }
 
 /**
- * 🎨 웹 설정 대시보드 본문 HTML 렌더러
+ * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (크래시 리포트 다운로드 패널 탑재)
  * @param {import('http').IncomingMessage} req 
  * @param {string|null} [successMessage=null] 
  * @param {string|null} [errorMessage=null] 
@@ -223,11 +224,69 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
   const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
 
+  // 🔬 크래시 리포트 목록 조회
+  const crashReports = storageService.getCrashReportsList();
+
   let alertBanner = '';
   if (successMessage) {
     alertBanner = `<div class="alert alert-success">✔ ${successMessage}</div>`;
   } else if (errorMessage) {
     alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
+  }
+
+  // 크래시 리포트 테이블 HTML 생성
+  let crashReportsHtml = '';
+  if (crashReports.length === 0) {
+    crashReportsHtml = `
+      <div style="text-align: center; padding: 24px 12px; color: var(--text-muted); font-size: 13px;">
+        <span style="font-size: 24px; display: block; margin-bottom: 6px;">✨</span>
+        수집된 조판 결함 리포트가 없습니다. (정상 상태)
+      </div>
+    `;
+  } else {
+    const rows = crashReports.map(r => {
+      const dateStr = new Date(r.createdAt).toLocaleString('ko-KR', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+      const encodedName = encodeURIComponent(r.fileName);
+
+      return `
+        <tr style="border-bottom: 1px solid rgba(255,255,255,0.06);">
+          <td style="padding: 10px 8px; font-family: monospace; font-size: 11.5px; color: #38bdf8;">${r.fileName}</td>
+          <td style="padding: 10px 8px; font-size: 12px; color: var(--text-muted);">${dateStr}</td>
+          <td style="padding: 10px 8px; text-align: center;">
+            <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
+              ${r.totalAnomalies}건
+            </span>
+          </td>
+          <td style="padding: 10px 8px; font-size: 11.5px; color: var(--text-muted); text-align: right;">${r.sizeKb}</td>
+          <td style="padding: 10px 8px; text-align: right; white-space: nowrap;">
+            <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
+            <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    crashReportsHtml = `
+      <div style="overflow-x: auto; margin-top: 10px;">
+        <table style="width: 100%; border-collapse: collapse; text-align: left;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--text-muted); text-transform: uppercase;">
+              <th style="padding: 8px;">파일명</th>
+              <th style="padding: 8px;">발생 시각</th>
+              <th style="padding: 8px; text-align: center;">결함 수</th>
+              <th style="padding: 8px; text-align: right;">크기</th>
+              <th style="padding: 8px; text-align: right;">작업</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+          </tbody>
+        </table>
+      </div>
+    `;
   }
 
   return `<!DOCTYPE html>
@@ -477,6 +536,39 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       color: var(--text);
     }
 
+    .btn-action {
+      display: inline-block;
+      text-decoration: none;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 5px;
+      transition: background 0.2s;
+    }
+    .btn-download {
+      background: #0284c7;
+      color: #ffffff;
+    }
+    .btn-download:hover { background: #0369a1; }
+    .btn-delete {
+      background: rgba(239,68,68,0.2);
+      color: #f87171;
+      border: 1px solid rgba(239,68,68,0.3);
+    }
+    .btn-delete:hover { background: #ef4444; color: white; }
+    .btn-clear-all {
+      background: rgba(239,68,68,0.15);
+      color: #f87171;
+      border: 1px solid rgba(239,68,68,0.3);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+    .btn-clear-all:hover { background: #ef4444; color: white; }
+
     .alert {
       padding: 12px 16px;
       border-radius: 8px;
@@ -549,6 +641,18 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
           <button type="button" class="btn-copy" onclick="copyToClipboard('${redirectUri}', this)">복사</button>
         </div>
       </div>
+    </div>
+
+    <!-- 🔬 [신규] 조판 결함 및 크래시 리포트 원클릭 다운로드 센터 -->
+    <div class="card">
+      <div class="section-title">
+        <span>🔬 조판 결함 및 크래시 리포트 (${crashReports.length}건)</span>
+        ${crashReports.length > 0 ? `<a href="/admin/crash-reports/clear" class="btn-clear-all" onclick="return confirm('수집된 모든 크래시 리포트를 일괄 삭제하시겠습니까?');">🧹 전체 비우기</a>` : ''}
+      </div>
+      <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
+        웹 뷰어에서 자동 전송된 줄 잘림, 텍스트 중복, 챕터 마지막 유령 빈 페이지 결함 진단 JSON 목록입니다.
+      </p>
+      ${crashReportsHtml}
     </div>
 
     <form method="POST" action="/admin/save">

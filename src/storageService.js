@@ -1,6 +1,6 @@
 /**
  * @file src/storageService.js
- * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON 및 올인원 스냅샷 디스크 I/O 전담 엔진
+ * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트 및 올인원 스냅샷 디스크 I/O 전담 엔진
  */
 
 import fs from 'fs';
@@ -14,6 +14,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const BOOKS_DIR = path.resolve(ROOT_DIR, 'data/books');
 const SETTINGS_DIR = path.resolve(ROOT_DIR, 'data/settings');
 const ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
+const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
 
 /**
  * 🛡️ [경로 소독 헬퍼] Path Traversal 공격을 방어하기 위해 안전한 파일명만 추출
@@ -322,5 +323,117 @@ export const storageService = {
 
     const targetFile = path.join(SETTINGS_DIR, safeName);
     return readJsonSafely(targetFile);
+  },
+
+  // =========================================================================
+  // 🔬 4. 크래시 리포트 (Crash Reports) 전용 I/O
+  // =========================================================================
+  /**
+   * 크래시 리포트 JSON 파일 저장
+   * @param {string} fileName 
+   * @param {any} data 
+   * @returns {boolean}
+   */
+  saveCrashReport(fileName, data) {
+    const safeName = sanitizeFileName(fileName);
+    if (!safeName) throw new Error('유효하지 않은 크래시 리포트 파일명입니다.');
+
+    ensureDir(CRASH_REPORTS_DIR);
+    const targetFile = path.join(CRASH_REPORTS_DIR, safeName);
+    writeJsonSafely(targetFile, data);
+    console.log(`🔬 [StorageService] 크래시 리포트 저장 완료: '${safeName}'`);
+    return true;
+  },
+
+  /**
+   * 저장된 크래시 리포트 파일 목록 조회 (최신순 정렬)
+   * @returns {Array<{ fileName: string, sizeBytes: number, sizeKb: string, createdAt: string, totalAnomalies: number, reportType: string }>}
+   */
+  getCrashReportsList() {
+    ensureDir(CRASH_REPORTS_DIR);
+    const files = fs.readdirSync(CRASH_REPORTS_DIR);
+    const reports = [];
+
+    for (const f of files) {
+      if (f.endsWith('.json')) {
+        const fullPath = path.join(CRASH_REPORTS_DIR, f);
+        try {
+          const stat = fs.statSync(fullPath);
+          const data = readJsonSafely(fullPath);
+          reports.push({
+            fileName: f,
+            sizeBytes: stat.size,
+            sizeKb: (stat.size / 1024).toFixed(1) + ' KB',
+            createdAt: stat.mtime.toISOString(),
+            totalAnomalies: data?.totalAnomaliesCount || (Array.isArray(data?.anomalies) ? data.anomalies.length : 1),
+            reportType: data?.reportType || 'crash_report'
+          });
+        } catch (e) {}
+      }
+    }
+
+    // 최신 생성순 정렬 (역순)
+    reports.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return reports;
+  },
+
+  /**
+   * 특정 크래시 리포트 파일 경로 및 크기 반환 (다운로드 스트리밍용)
+   * @param {string} fileName 
+   * @returns {{ filePath: string, size: number } | null}
+   */
+  getCrashReportPath(fileName) {
+    const safeName = sanitizeFileName(fileName);
+    if (!safeName) return null;
+
+    const fullPath = path.join(CRASH_REPORTS_DIR, safeName);
+    if (fs.existsSync(fullPath)) {
+      const stat = fs.statSync(fullPath);
+      return { filePath: fullPath, size: stat.size };
+    }
+    return null;
+  },
+
+  /**
+   * 특정 크래시 리포트 파일 삭제
+   * @param {string} fileName 
+   * @returns {boolean}
+   */
+  deleteCrashReport(fileName) {
+    const safeName = sanitizeFileName(fileName);
+    if (!safeName) return false;
+
+    const fullPath = path.join(CRASH_REPORTS_DIR, safeName);
+    if (fs.existsSync(fullPath)) {
+      try {
+        fs.unlinkSync(fullPath);
+        console.log(`🗑️ [StorageService] 크래시 리포트 삭제 완료: '${safeName}'`);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+    return false;
+  },
+
+  /**
+   * 모든 크래시 리포트 일괄 비우기
+   * @returns {number} 삭제된 리포트 수
+   */
+  clearAllCrashReports() {
+    ensureDir(CRASH_REPORTS_DIR);
+    const files = fs.readdirSync(CRASH_REPORTS_DIR);
+    let count = 0;
+
+    for (const f of files) {
+      if (f.endsWith('.json')) {
+        try {
+          fs.unlinkSync(path.join(CRASH_REPORTS_DIR, f));
+          count++;
+        } catch (e) {}
+      }
+    }
+    console.log(`🧹 [StorageService] 크래시 리포트 전체 비우기 완료: 총 ${count}개 파일 삭제`);
+    return count;
   }
 };

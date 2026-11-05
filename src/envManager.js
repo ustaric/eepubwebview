@@ -1,6 +1,6 @@
 /**
  * @file src/envManager.js
- * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리 생성 전담 모듈
+ * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports) 생성 전담 모듈
  */
 
 import fs from 'fs';
@@ -60,14 +60,15 @@ export function writeEnvFile(newValues) {
 }
 
 /**
- * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅
+ * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅 (크래시 리포트 폴더 포함)
  */
 export function ensureStorageDirectories() {
   const dirs = [
     path.resolve(ROOT_DIR, 'data'),
     path.resolve(ROOT_DIR, 'data/books'),
     path.resolve(ROOT_DIR, 'data/settings'),
-    path.resolve(ROOT_DIR, 'data/archive')
+    path.resolve(ROOT_DIR, 'data/archive'),
+    path.resolve(ROOT_DIR, 'data/crash-reports')
   ];
 
   dirs.forEach((dir) => {
@@ -75,5 +76,5 @@ export function ensureStorageDirectories() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     }
   });
-  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings, ./data/archive)');
+  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings, ./data/archive, ./data/crash-reports)');
 }
