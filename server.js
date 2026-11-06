@@ -3,7 +3,8 @@
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
  * - 🔒 [Google 로그인 비밀번호 관문 탑재] /auth/google 진입 시 관리자 비밀번호 검증으로 타인의 구글 계정 덮어쓰기 원천 차단
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
- * - 📚 [공유 라이브러리 도서 목록 및 다운로드 API 완비] GET /api/storage/remote-library 및 download 엔드포인트 탑재
+ * - ⚡ [서버 내부 도서 직통 복사 API 완비] POST /api/storage/remote-library/import 제공으로 2중 트래픽 원천 차단
+ * - 📚 [공유 라이브러리 도서 목록 및 다운로드 API] GET /api/storage/remote-library 및 download 엔드포인트 탑재
  * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
  * - 🚦 [지능형 Rate Limit] 스토리지 API 1분 120회 폭주 방어
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
@@ -358,7 +359,53 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 📚 [신규 1] 공유 라이브러리 도서 목록 조회 (GET /api/storage/remote-library)
+  // ⚡ [신규] 공유 도서 서버 내부 0초 직통 복사 및 정식 등록 (POST /api/storage/remote-library/import)
+  // =========================================================================
+  if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
+    const env = readEnvFile();
+    const sharedDir = env.SHARED_BOOKS_DIR;
+
+    if (!sharedDir || !fs.existsSync(sharedDir)) {
+      return sendJsonResponse(req, res, 404, {
+        ok: false,
+        error: 'SHARED_BOOKS_DIR_NOT_FOUND',
+        message: '공유 도서 폴더가 설정되지 않았거나 존재하지 않습니다.'
+      });
+    }
+
+    try {
+      const buffer = await readRequestBodyBuffer(req);
+      const payload = JSON.parse(buffer.toString('utf-8') || '{}');
+      const relativePath = payload.relativePath;
+
+      if (!relativePath) {
+        return sendJsonResponse(req, res, 400, { error: 'relativePath 필드가 누락되었습니다.' });
+      }
+
+      const importResult = storageService.importRemoteBookToLibrary(sharedDir, relativePath);
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '⚡ 공유 도서 내부 복사',
+        target: `${importResult.fileName} ➔ ${importResult.bookId}`,
+        status: 200
+      });
+
+      return sendJsonResponse(req, res, 200, importResult);
+    } catch (err) {
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '공유 도서 복사 실패',
+        target: err.message,
+        status: 500
+      });
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
+  }
+
+  // =========================================================================
+  // 📚 공유 라이브러리 도서 목록 조회 (GET /api/storage/remote-library)
   // =========================================================================
   if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
     const env = readEnvFile();
@@ -392,7 +439,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 📖 [신규 2] 공유 도서 원본 실시간 스트리밍 다운로드 (GET /api/storage/remote-library/download)
+  // 📖 공유 도서 원본 실시간 스트리밍 다운로드 (GET /api/storage/remote-library/download)
   // =========================================================================
   if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
     const env = readEnvFile();
