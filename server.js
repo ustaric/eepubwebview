@@ -6,6 +6,7 @@
  * - 🚦 [지능형 Rate Limit] 관리자 로그인 1분 5회 락 & 스토리지 API 1분 120회 폭주 방어
  * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
  * - 🔬 [크래시 리포트 수신 & 웹 다운로드 센터] 클라이언트 진단 JSON 수신 및 어드민 웹 다운로드/삭제 완비
+ * - 🖼️ [표지 단일 삭제 라우트 완비] DELETE /api/storage/covers/:fileName 지원으로 404 에러 원천 차단
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
@@ -692,6 +693,13 @@ const server = http.createServer(async (req, res) => {
     const readStream = fs.createReadStream(info.filePath);
     readStream.pipe(res);
     return;
+  }
+
+  // 🖼️ [🌟 신규 추가] 표지 이미지 단일 삭제: DELETE /api/storage/covers/:fileName (404 완벽 해결)
+  if (req.method === 'DELETE' && pathname.startsWith('/api/storage/covers/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
+    storageService.deleteCoverImage(fileName);
+    return sendJsonResponse(req, res, 200, { ok: true, fileName });
   }
 
   // 🗑️ [도서 완전 삭제 트랜잭션] DELETE /api/storage/books/:id

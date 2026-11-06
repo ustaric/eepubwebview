@@ -2,6 +2,7 @@
  * @file src/storageService.js
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트 및 올인원 스냅샷 디스크 I/O 전담 엔진
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
+ * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
  * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName 기반 디렉터리 이탈 공격 원천 차단
  * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
  */
@@ -171,12 +172,11 @@ export const storageService = {
       }
     }
 
-    // 2. 🌟 [핵심] 반대쪽 폴더에 실물 파일(.epub 원본 및 .cover_*.webp 표지들)이 있다면 목적지 폴더로 원자적 일괄 이동
+    // 2. 반대쪽 폴더에 실물 파일(.epub 원본 및 .cover_*.webp 표지들)이 있다면 목적지 폴더로 원자적 일괄 이동
     if (fs.existsSync(oppositeDir)) {
       try {
         const oppositeFiles = fs.readdirSync(oppositeDir);
         for (const file of oppositeFiles) {
-          // 해당 도서의 .epub 또는 .cover_*.webp 파일 매칭
           const isMatchingEpub = file === `${safeId}.epub`;
           const isMatchingCover = file.startsWith(`${safeId}.cover_`) && file.endsWith('.webp');
 
@@ -303,6 +303,35 @@ export const storageService = {
   },
 
   /**
+   * 🌟 [신규 추가] 단일 표지 이미지 파일 삭제 (DELETE /api/storage/covers/:fileName 대응)
+   * - books/ 및 archive/ 폴더를 모두 검사하여 해당 표지 파일 안전 삭제
+   * @param {string} fileName - 삭제할 표지 파일명 (예: '도서ID.cover_xxx.webp')
+   * @returns {boolean} 삭제 성공 여부 (파일이 원래 없어도 true 반환)
+   */
+  deleteCoverImage(fileName) {
+    const safeName = sanitizeFileName(fileName);
+    if (!safeName) return false;
+
+    let deleted = false;
+    const targetDirs = [BOOKS_DIR, ARCHIVE_DIR];
+
+    targetDirs.forEach((dir) => {
+      const targetFile = path.join(dir, safeName);
+      if (fs.existsSync(targetFile)) {
+        try {
+          fs.unlinkSync(targetFile);
+          deleted = true;
+          console.log(`🗑️ [StorageService] 단일 표지 파일 삭제 완료: '${safeName}' (경로: ${dir})`);
+        } catch (e) {
+          console.warn(`⚠️ [StorageService] 표지 파일 삭제 실패 ('${safeName}'):`, e.message);
+        }
+      }
+    });
+
+    return true;
+  },
+
+  /**
    * 도서 완전 삭제 (메타, EPUB, 표지 파일 일괄 파쇄)
    * @param {string} bookId 
    * @returns {number} 삭제된 파일 수
@@ -318,7 +347,6 @@ export const storageService = {
       if (!fs.existsSync(dir)) return;
       const files = fs.readdirSync(dir);
       files.forEach(f => {
-        // 도서ID.json, 도서ID.epub, 도서ID.cover_*.webp 일치 확인
         if (f === `${safeId}.json` || f === `${safeId}.epub` || f.startsWith(`${safeId}.cover_`)) {
           try {
             fs.unlinkSync(path.join(dir, f));
@@ -411,7 +439,6 @@ export const storageService = {
       }
     }
 
-    // 최신 생성순 정렬 (역순)
     reports.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     return reports;
   },
