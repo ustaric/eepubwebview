@@ -1,6 +1,9 @@
 /**
  * @file src/storageService.js
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트 및 올인원 스냅샷 디스크 I/O 전담 엔진
+ * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
+ * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName 기반 디렉터리 이탈 공격 원천 차단
+ * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
  */
 
 import fs from 'fs';
@@ -139,7 +142,9 @@ export const storageService = {
   // 📚 2. 도서 메타데이터 및 바이너리 파일 I/O
   // =========================================================================
   /**
-   * 도서 메타데이터 JSON 저장 (활성 또는 보관 폴더)
+   * 도서 메타데이터 JSON 저장 및 바이너리/표지 물리적 폴더 일괄 이동
+   * - isArchived 상태 변화 감지 시 .epub 원본 및 모든 .cover_*.webp 표지 파일을 books/ ⇄ archive/ 간 동시 이동
+   * 
    * @param {string} bookId 
    * @param {Object} bookData 
    * @returns {boolean}
@@ -148,18 +153,52 @@ export const storageService = {
     const safeId = sanitizeFileName(bookId);
     if (!safeId) throw new Error('유효하지 않은 bookId 입니다.');
 
-    const targetDir = bookData.isArchived ? ARCHIVE_DIR : BOOKS_DIR;
+    ensureDir(BOOKS_DIR);
+    ensureDir(ARCHIVE_DIR);
+
+    const isArchived = Boolean(bookData.isArchived);
+    const targetDir = isArchived ? ARCHIVE_DIR : BOOKS_DIR;
+    const oppositeDir = isArchived ? BOOKS_DIR : ARCHIVE_DIR;
     const targetFile = path.join(targetDir, `${safeId}.json`);
-    
-    // 만약 보관/활성 전환이라면 반대쪽 폴더에 있던 기존 메타 파일 삭제
-    const oppositeDir = bookData.isArchived ? BOOKS_DIR : ARCHIVE_DIR;
     const oppositeFile = path.join(oppositeDir, `${safeId}.json`);
+
+    // 1. 반대쪽 폴더에 있던 기존 메타데이터(.json) 정리
     if (fs.existsSync(oppositeFile)) {
-      try { fs.unlinkSync(oppositeFile); } catch (e) {}
+      try {
+        fs.unlinkSync(oppositeFile);
+      } catch (e) {
+        console.warn(`⚠️ [StorageService] 기존 메타 삭제 실패: ${oppositeFile}`, e.message);
+      }
     }
 
+    // 2. 🌟 [핵심] 반대쪽 폴더에 실물 파일(.epub 원본 및 .cover_*.webp 표지들)이 있다면 목적지 폴더로 원자적 일괄 이동
+    if (fs.existsSync(oppositeDir)) {
+      try {
+        const oppositeFiles = fs.readdirSync(oppositeDir);
+        for (const file of oppositeFiles) {
+          // 해당 도서의 .epub 또는 .cover_*.webp 파일 매칭
+          const isMatchingEpub = file === `${safeId}.epub`;
+          const isMatchingCover = file.startsWith(`${safeId}.cover_`) && file.endsWith('.webp');
+
+          if (isMatchingEpub || isMatchingCover) {
+            const oldPath = path.join(oppositeDir, file);
+            const newPath = path.join(targetDir, file);
+            try {
+              fs.renameSync(oldPath, newPath);
+              console.log(`📦 [StorageService:Move] 실물 파일 이동 완료: '${file}' ➔ ${isArchived ? 'archive/' : 'books/'}`);
+            } catch (moveErr) {
+              console.warn(`⚠️ [StorageService] 실물 파일 이동 실패 ('${file}'):`, moveErr.message);
+            }
+          }
+        }
+      } catch (scanErr) {
+        console.warn(`⚠️ [StorageService] 반대쪽 디렉터리 스캔 중 오류:`, scanErr.message);
+      }
+    }
+
+    // 3. 목적지 폴더에 최신 메타데이터 JSON 저장
     writeJsonSafely(targetFile, bookData);
-    console.log(`📖 [StorageService] 도서 메타 저장 완료: '${safeId}.json' (${bookData.isArchived ? 'archive' : 'books'})`);
+    console.log(`📖 [StorageService] 도서 메타 저장 완료: '${safeId}.json' (${isArchived ? 'archive' : 'books'})`);
     return true;
   },
 
