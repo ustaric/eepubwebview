@@ -1,12 +1,11 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
- * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js 조립
+ * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js, src/auditLogger.js 조립
  * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
  * - 🚦 [지능형 Rate Limit] 관리자 로그인 1분 5회 락 & 스토리지 API 1분 120회 폭주 방어
- * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
- * - 🔬 [크래시 리포트 수신 & 웹 다운로드 센터] 클라이언트 진단 JSON 수신 및 어드민 웹 다운로드/삭제 완비
- * - 🖼️ [표지 단일 삭제 라우트 완비] DELETE /api/storage/covers/:fileName 지원으로 404 에러 원천 차단
+ * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
+ * - 🛠️ [환경변수 전 항목 완비] PORT, HOST, READER_URL, TOKEN_FILE 포함 전 11대 설정값 실시간 파싱 및 보존
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
@@ -17,7 +16,7 @@ import { config } from './config.js';
 import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToken } from './googleAuth.js';
 import { hasRefreshToken } from './tokenStore.js';
 
-// 🌟 분리된 3대 전담 모듈 import
+// 🌟 분리된 4대 전담 모듈 import
 import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './src/envManager.js';
 import {
   isAuthenticated,
@@ -28,6 +27,7 @@ import {
   renderAdminSettingsHtml
 } from './src/adminController.js';
 import { storageService } from './src/storageService.js';
+import { auditLogger } from './src/auditLogger.js';
 
 /**
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
@@ -338,6 +338,7 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = new URL(req.url, `${protocol}://${host}`);
   const pathname = reqUrl.pathname;
   const clientIp = getClientIp(req);
+  const userAgent = req.headers['user-agent'] || '';
 
   console.log(`[Request] ${req.method} ${pathname} (IP: ${clientIp})`);
 
@@ -362,6 +363,7 @@ const server = http.createServer(async (req, res) => {
     const loginGuard = checkLoginRateLimit(clientIp);
     if (!loginGuard.allowed) {
       console.warn(`⛔ [Login Lock] 무차별 대입 방어로 IP ${clientIp} 차단 중 (${loginGuard.waitMinutes}분 남음)`);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 시도', target: '차단 잠금', status: 429 });
       const html = renderLoginPageHtml(`로그인 시도 횟수가 초과되었습니다. ${loginGuard.waitMinutes}분 후에 다시 시도해 주세요.`, false);
       res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html);
@@ -387,6 +389,7 @@ const server = http.createServer(async (req, res) => {
         writeEnvFile({ ADMIN_PASSWORD: inputPass });
         console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
         clearLoginFailure(clientIp);
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200 });
 
         const sessionToken = createAdminSession();
         res.writeHead(302, {
@@ -399,6 +402,7 @@ const server = http.createServer(async (req, res) => {
 
       if (inputPass === currentPass) {
         clearLoginFailure(clientIp);
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200 });
         const sessionToken = createAdminSession();
         res.writeHead(302, {
           'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
@@ -409,6 +413,7 @@ const server = http.createServer(async (req, res) => {
         recordLoginFailure(clientIp);
         const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
         console.warn(`⚠️ [Login Failed] 관리자 비밀번호 불일치 (IP: ${clientIp}, 잔여 시도: ${Math.max(0, remaining)}회)`);
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401 });
         const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
@@ -420,6 +425,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/admin/logout') {
     const cookies = parseCookies(req);
     destroyAdminSession(cookies['admin_session']);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그아웃', target: '세션 파기', status: 200 });
     res.writeHead(302, {
       'Set-Cookie': 'admin_session=; Path=/; HttpOnly; Max-Age=0',
       'Location': '/admin'
@@ -459,6 +465,7 @@ const server = http.createServer(async (req, res) => {
       return sendJsonResponse(req, res, 404, { error: '크래시 리포트 파일을 찾을 수 없습니다.' });
     }
 
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 다운로드', target: fileName, status: 200 });
     setCorsHeaders(req, res);
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
@@ -480,6 +487,7 @@ const server = http.createServer(async (req, res) => {
 
     const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/delete/', ''));
     storageService.deleteCrashReport(fileName);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 삭제', target: fileName, status: 200 });
     res.writeHead(302, { Location: '/admin' });
     res.end();
     return;
@@ -494,11 +502,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     storageService.clearAllCrashReports();
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 전체 삭제', target: 'all', status: 200 });
     res.writeHead(302, { Location: '/admin' });
     res.end();
     return;
   }
 
+  // 🛠️ [환경변수 전체 파싱 및 저장] POST /admin/save
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -513,6 +523,20 @@ const server = http.createServer(async (req, res) => {
         const params = new URLSearchParams(body);
         const updates = {};
 
+        // 🌟 [추가 1] 네트워크 및 파일 경로 4대 기본 설정
+        const port = params.get('PORT')?.trim();
+        if (port) updates.PORT = port;
+
+        const host = params.get('HOST')?.trim();
+        if (host) updates.HOST = host;
+
+        const tokenFile = params.get('TOKEN_FILE')?.trim();
+        if (tokenFile) updates.TOKEN_FILE = tokenFile;
+
+        const readerUrl = params.get('READER_URL')?.trim();
+        if (readerUrl) updates.READER_URL = readerUrl;
+
+        // 🌟 [기존 6대 설정]
         const isStorageMode = params.get('STORAGE_MODE') === 'true';
         updates.STORAGE_MODE = isStorageMode ? 'true' : 'false';
 
@@ -543,6 +567,8 @@ const server = http.createServer(async (req, res) => {
           ensureStorageDirectories();
         }
 
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200 });
+
         const successMsg = isStorageMode
           ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 활성화되었습니다.'
           : '설정이 성공적으로 저장되었습니다. (인증 프록시 모드)';
@@ -564,15 +590,17 @@ const server = http.createServer(async (req, res) => {
   // 3. 🌟 자체 스토리지 모드 REST API 엔드포인트 (src/storageService 위임)
   // =========================================================================
 
-  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (STORAGE_MODE 및 Origin 검증과 무관하게 결함 수집 항상 허용)
+  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (항상 수신 보장)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
       const buffer = await readRequestBodyBuffer(req);
       const reportData = JSON.parse(buffer.toString('utf-8'));
       storageService.saveCrashReport(fileName, reportData);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 수신', target: fileName, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, fileName, status: 'saved' });
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 저장 실패', target: fileName, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -580,6 +608,7 @@ const server = http.createServer(async (req, res) => {
   // 🛡️ [스토리지 엔드포인트 보안 가드 1] 속도 제한 (Rate Limiting: 1분 120회)
   if (pathname.startsWith('/api/storage/')) {
     if (!checkRateLimit(req, 120)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '요청 횟수 초과 차단', target: pathname, status: 429 });
       return sendJsonResponse(req, res, 429, {
         error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.'
       });
@@ -590,6 +619,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname.startsWith('/api/storage/')) {
     if (!isAllowedClientOrigin(req)) {
       console.warn(`⛔ [Origin Blocked] 비인가 클라이언트의 스토리지 접근 차단됨 (IP: ${clientIp}, Origin: ${req.headers.origin}, Referer: ${req.headers.referer})`);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
       return sendJsonResponse(req, res, 403, {
         error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인에서의 스토리지 접근입니다.'
       });
@@ -601,6 +631,7 @@ const server = http.createServer(async (req, res) => {
     const env = readEnvFile();
     if (env.STORAGE_MODE !== 'true') {
       console.warn(`⛔ [Storage Blocked] 개인 서버 저장소 모드가 비활성화되어 요청이 거부되었습니다. Path: ${pathname}`);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '스토리지 모드 비활성 거절', target: pathname, status: 403 });
       return sendJsonResponse(req, res, 403, {
         error: 'STORAGE_MODE_DISABLED: 개인 서버 저장소 모드가 비활성화되어 있습니다. 관리자 대시보드(/admin)에서 활성화해 주세요.'
       });
@@ -611,8 +642,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
     try {
       const snapshot = await storageService.getUnifiedSnapshot();
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📚 서재 스냅샷 조회', target: `활성 ${snapshot.cloudBooks.length}권 / 보관 ${snapshot.cloudArchivedBooks.length}권`, status: 200 });
       return sendJsonResponse(req, res, 200, snapshot);
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '서재 스냅샷 실패', target: err.message, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -624,8 +657,11 @@ const server = http.createServer(async (req, res) => {
       const buffer = await readRequestBodyBuffer(req);
       const bookData = JSON.parse(buffer.toString('utf-8'));
       storageService.saveBookMetadata(bookId, bookData);
+      const actionName = bookData.isArchived ? '📁 도서 보관 처리' : '📖 도서 메타 저장';
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: actionName, target: bookData.title || bookId, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, bookId });
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 저장 실패', target: bookId, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -634,7 +670,11 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     const meta = storageService.getBookMetadata(bookId);
-    if (!meta) return sendJsonResponse(req, res, 404, { error: '도서를 찾을 수 없습니다.' });
+    if (!meta) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회 실패', target: bookId, status: 404 });
+      return sendJsonResponse(req, res, 404, { error: '도서를 찾을 수 없습니다.' });
+    }
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회', target: meta.title || bookId, status: 200 });
     return sendJsonResponse(req, res, 200, meta);
   }
 
@@ -644,8 +684,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const buffer = await readRequestBodyBuffer(req);
       storageService.saveBookEpub(bookId, buffer);
+      const sizeMb = (buffer.length / 1024 / 1024).toFixed(1);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📦 EPUB 업로드', target: `${bookId} (${sizeMb}MB)`, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, bookId, size: buffer.length });
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 업로드 실패', target: bookId, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -654,7 +697,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
     const info = storageService.getBookEpubPath(bookId);
-    if (!info) return sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
+    if (!info) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 다운로드 실패', target: bookId, status: 404 });
+      return sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
+    }
+
+    const sizeMb = (info.size / 1024 / 1024).toFixed(1);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📖 EPUB 다운로드', target: `${bookId} (${sizeMb}MB)`, status: 200 });
 
     setCorsHeaders(req, res);
     res.writeHead(200, {
@@ -673,8 +722,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const buffer = await readRequestBodyBuffer(req);
       storageService.saveCoverImage(fileName, buffer);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 업로드', target: fileName, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, fileName });
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '표지 업로드 실패', target: fileName, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -683,7 +734,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     const info = storageService.getCoverImagePath(fileName);
-    if (!info) return sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
+    if (!info) {
+      return sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
+    }
 
     setCorsHeaders(req, res);
     res.writeHead(200, {
@@ -695,10 +748,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🖼️ [🌟 신규 추가] 표지 이미지 단일 삭제: DELETE /api/storage/covers/:fileName (404 완벽 해결)
+  // 🖼️ [표지 이미지 단일 삭제] DELETE /api/storage/covers/:fileName
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     storageService.deleteCoverImage(fileName);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 단일 삭제', target: fileName, status: 200 });
     return sendJsonResponse(req, res, 200, { ok: true, fileName });
   }
 
@@ -706,6 +760,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/books/')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     const count = storageService.deleteBookAll(bookId);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🗑️ 도서 완전 삭제', target: `${bookId} (${count}개 파일 파쇄)`, status: 200 });
     return sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
   }
 
@@ -716,8 +771,10 @@ const server = http.createServer(async (req, res) => {
       const buffer = await readRequestBodyBuffer(req);
       const data = JSON.parse(buffer.toString('utf-8'));
       storageService.saveSettingsFile(fileName, data);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '⚙️ 시스템 데이터 동기화', target: fileName, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, fileName });
     } catch (err) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 동기화 실패', target: fileName, status: 500 });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -766,6 +823,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       await exchangeCodeForTokens(code);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'Google OAuth 토큰 교환 성공', target: '토큰 암호화 저장', status: 200 });
       return sendHtmlResponse(
         req,
         res,
@@ -782,6 +840,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req, 60)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 횟수 초과', target: '/api/access-token', status: 429 });
       return sendJsonResponse(req, res, 429, {
         error: '요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.'
       });
@@ -796,6 +855,7 @@ const server = http.createServer(async (req, res) => {
         ? 'Google 계정 연동이 필요합니다. 먼저 /auth/google 을 통해 인증해 주세요.'
         : 'Access Token 발급에 실패했습니다.';
 
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 실패', target: clientMessage, status: statusCode });
       return sendJsonResponse(req, res, statusCode, {
         error: clientMessage
       });

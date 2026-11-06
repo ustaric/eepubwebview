@@ -1,6 +1,11 @@
 /**
  * @file src/adminController.js
- * @description 관리자 웹 대시보드 HTML 렌더링, 쿠키 인증, 설정 저장 및 크래시 리포트 다운로드/관리 전담 컨트롤러
+ * @description 관리자 웹 제어 센터 HTML 렌더링, 쿠키 인증, 설정 저장 및 관제 대시보드 전담 컨트롤러
+ * - 📑 [상단 2단 탭 UI 탑재] '📊 관제 대시보드'와 '⚙️ 시스템 설정'으로 분리하여 세로 스크롤 피로도 0% 실현 (새로고침 시 탭 상태 유지)
+ * - 🛠️ [시스템 상세 설정 전 11대 항목 완비] PORT, HOST, READER_URL, TOKEN_FILE을 포함한 전 항목 1:1 시각화 및 편집 지원
+ * - 💾 [실시간 디스크/도서 현황 카드] auditLogger 연동으로 활성/보관 권수 및 실제 디스크 점유량(MB) 실시간 시각화
+ * - 📋 [최근 기기/IP 활동 로그 위젯] IP, 기기(Windows Chrome, Galaxy 등), 동작 유형, 상태 코드(200/403/429) 실시간 표출
+ * - 🔬 [크래시 리포트 다운로드 센터] 조판 결함 진단 JSON 목록 조회 및 원클릭 다운로드/삭제 연동
  */
 
 import crypto from 'crypto';
@@ -8,6 +13,7 @@ import { config } from '../config.js';
 import { hasRefreshToken } from '../tokenStore.js';
 import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './envManager.js';
 import { storageService } from './storageService.js';
+import { auditLogger } from './auditLogger.js';
 
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
@@ -202,7 +208,7 @@ export function renderLoginPageHtml(errorMessage = null, isInitialSetup = false)
 }
 
 /**
- * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (크래시 리포트 다운로드 패널 탑재)
+ * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (상단 2단 탭 & 전 11대 환경변수 폼 탑재)
  * @param {import('http').IncomingMessage} req 
  * @param {string|null} [successMessage=null] 
  * @param {string|null} [errorMessage=null] 
@@ -217,14 +223,20 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const host = req.headers.host || `${config.host}:${config.port}`;
   const currentServerUrl = `${protocol}://${host}`;
 
-  const readerUrl = config.security.readerUrl || '/';
+  // 전 11대 환경변수 값 매핑
+  const port = env.PORT || String(config.port || '3001');
+  const serverHost = env.HOST || config.host || '127.0.0.1';
+  const tokenFile = env.TOKEN_FILE || './data/token.enc';
+  const readerUrl = env.READER_URL || config.security.readerUrl || 'https://epubwebview.vercel.app';
   const clientId = env.GOOGLE_CLIENT_ID || '';
   const redirectUri = env.GOOGLE_REDIRECT_URI || `${currentServerUrl}/auth/google/callback`;
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
   const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
   const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
 
-  // 🔬 크래시 리포트 목록 조회
+  // 📊 실시간 스토리지 현황 및 최근 30건 로그 수집
+  const metrics = auditLogger.getStorageMetrics();
+  const recentLogs = auditLogger.getRecentLogs();
   const crashReports = storageService.getCrashReportsList();
 
   let alertBanner = '';
@@ -234,12 +246,62 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
   }
 
-  // 크래시 리포트 테이블 HTML 생성
+  // 1. 최근 동기화 및 접근 활동 로그 테이블 HTML 생성
+  let activityLogsHtml = '';
+  if (recentLogs.length === 0) {
+    activityLogsHtml = `
+      <div style="text-align: center; padding: 24px 12px; color: var(--text-muted); font-size: 13px;">
+        <span style="font-size: 20px; display: block; margin-bottom: 4px;">📡</span>
+        아직 기록된 서버 활동 로그가 없습니다. (대기 중)
+      </div>
+    `;
+  } else {
+    const logRows = recentLogs.map((l) => {
+      let statusBadge = '<span class="status-pill status-200">200 OK</span>';
+      if (l.status === 403) statusBadge = '<span class="status-pill status-403">403 차단</span>';
+      else if (l.status === 429) statusBadge = '<span class="status-pill status-429">429 락</span>';
+      else if (l.status === 404) statusBadge = '<span class="status-pill status-404">404 없음</span>';
+      else if (l.status >= 500) statusBadge = `<span class="status-pill status-500">${l.status} 에러</span>`;
+
+      return `
+        <tr>
+          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted);">${l.timestamp}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8;">${l.ip}</td>
+          <td style="font-size: 12px; color: #e2e8f0;">${l.device}</td>
+          <td style="font-size: 12px; font-weight: 600;">${l.action}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${l.target}</td>
+          <td style="text-align: right;">${statusBadge}</td>
+        </tr>
+      `;
+    }).join('');
+
+    activityLogsHtml = `
+      <div style="overflow-x: auto; margin-top: 8px;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>시각</th>
+              <th>IP</th>
+              <th>기기 / 환경</th>
+              <th>동작</th>
+              <th>대상</th>
+              <th style="text-align: right;">상태</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${logRows}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  // 2. 크래시 리포트 테이블 HTML 생성
   let crashReportsHtml = '';
   if (crashReports.length === 0) {
     crashReportsHtml = `
       <div style="text-align: center; padding: 24px 12px; color: var(--text-muted); font-size: 13px;">
-        <span style="font-size: 24px; display: block; margin-bottom: 6px;">✨</span>
+        <span style="font-size: 20px; display: block; margin-bottom: 4px;">✨</span>
         수집된 조판 결함 리포트가 없습니다. (정상 상태)
       </div>
     `;
@@ -252,16 +314,16 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       const encodedName = encodeURIComponent(r.fileName);
 
       return `
-        <tr style="border-bottom: 1px solid rgba(255,255,255,0.06);">
-          <td style="padding: 10px 8px; font-family: monospace; font-size: 11.5px; color: #38bdf8;">${r.fileName}</td>
-          <td style="padding: 10px 8px; font-size: 12px; color: var(--text-muted);">${dateStr}</td>
-          <td style="padding: 10px 8px; text-align: center;">
+        <tr>
+          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8;">${r.fileName}</td>
+          <td style="font-size: 12px; color: var(--text-muted);">${dateStr}</td>
+          <td style="text-align: center;">
             <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
               ${r.totalAnomalies}건
             </span>
           </td>
-          <td style="padding: 10px 8px; font-size: 11.5px; color: var(--text-muted); text-align: right;">${r.sizeKb}</td>
-          <td style="padding: 10px 8px; text-align: right; white-space: nowrap;">
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right;">${r.sizeKb}</td>
+          <td style="text-align: right; white-space: nowrap;">
             <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
             <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
           </td>
@@ -270,15 +332,15 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     }).join('');
 
     crashReportsHtml = `
-      <div style="overflow-x: auto; margin-top: 10px;">
-        <table style="width: 100%; border-collapse: collapse; text-align: left;">
+      <div style="overflow-x: auto; margin-top: 8px;">
+        <table class="data-table">
           <thead>
-            <tr style="border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--text-muted); text-transform: uppercase;">
-              <th style="padding: 8px;">파일명</th>
-              <th style="padding: 8px;">발생 시각</th>
-              <th style="padding: 8px; text-align: center;">결함 수</th>
-              <th style="padding: 8px; text-align: right;">크기</th>
-              <th style="padding: 8px; text-align: right;">작업</th>
+            <tr>
+              <th>파일명</th>
+              <th>발생 시각</th>
+              <th style="text-align: center;">결함 수</th>
+              <th style="text-align: right;">크기</th>
+              <th style="text-align: right;">작업</th>
             </tr>
           </thead>
           <tbody>
@@ -320,14 +382,14 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       box-sizing: border-box;
     }
     .container {
-      max-width: 640px;
+      max-width: 680px;
       width: 100%;
     }
     .header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 24px;
+      margin-bottom: 20px;
     }
     .header h1 {
       font-size: 22px;
@@ -353,18 +415,62 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       background: var(--danger);
       border-color: var(--danger);
     }
+
+    /* 🌟 상단 2단 네비게이션 탭 바 */
+    .tab-nav {
+      display: flex;
+      gap: 6px;
+      background: #090d16;
+      padding: 6px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      margin-bottom: 20px;
+    }
+    .tab-btn {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .tab-btn:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .tab-btn.active {
+      background: var(--card-bg);
+      color: #38bdf8;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+
     .card {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 14px;
-      padding: 24px;
+      padding: 22px;
       margin-bottom: 20px;
       box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
     }
     .section-title {
-      font-size: 16px;
+      font-size: 15.5px;
       font-weight: 600;
-      margin: 0 0 16px 0;
+      margin: 0 0 14px 0;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -378,6 +484,62 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
     .badge-info { background: rgba(59, 130, 246, 0.15); color: var(--primary); border: 1px solid rgba(59, 130, 246, 0.3); }
+
+    /* 📊 실시간 현황 통계 그리드 */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .stat-card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 12px;
+      text-align: center;
+    }
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .stat-value {
+      font-size: 18px;
+      font-weight: 800;
+      color: #38bdf8;
+    }
+
+    /* 데이터 테이블 공통 스타일 */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+    .data-table th {
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .data-table td {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      padding: 10px 8px;
+    }
+    .status-pill {
+      display: inline-block;
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .status-200 { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .status-403 { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .status-429 { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .status-404 { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.3); }
+    .status-500 { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
 
     .copy-box {
       display: flex;
@@ -423,6 +585,13 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     }
     .form-group:last-child {
       margin-bottom: 0;
+    }
+    .form-row {
+      display: flex;
+      gap: 12px;
+    }
+    .form-row .form-group {
+      flex: 1;
     }
     label {
       display: block;
@@ -528,7 +697,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       padding: 10px;
       font-size: 14px;
       text-decoration: none;
-      margin-top: 12px;
+      margin-top: 14px;
       transition: all 0.2s;
     }
     .btn-return:hover {
@@ -604,136 +773,242 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     <div class="header">
       <div>
         <h1>⚙️ EPUB Server 제어 센터</h1>
-        <p>Google OAuth 갱신 프록시 및 로컬 동기화 스토리지 통합 제어</p>
+        <p>Google OAuth 프록시 및 로컬 동기화 스토리지 통합 관제</p>
       </div>
       <a href="/admin/logout" class="btn-logout">🔒 로그아웃</a>
     </div>
 
     ${alertBanner}
 
-    <!-- 🌟 원클릭 주요 접속 정보 복사 카드 -->
-    <div class="card">
-      <div class="section-title">
-        <span>📋 주요 접속 정보 원클릭 복사</span>
-        <span class="badge badge-info">빠른 복사 지원</span>
-      </div>
-
-      <div class="form-group">
-        <label>🐙 프로젝트 공식 GitHub 저장소</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-github">${GITHUB_REPO_URL}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${GITHUB_REPO_URL}', this)">복사</button>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>🌐 현재 서버 주소 (웹 뷰어 설정창에 입력할 주소)</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-server">${currentServerUrl}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${currentServerUrl}', this)">복사</button>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>🔗 구글 콘솔에 등록할 리디렉션 URI (Redirect URI)</label>
-        <div class="copy-box">
-          <span class="copy-text" id="text-redirect">${redirectUri}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${redirectUri}', this)">복사</button>
-        </div>
-      </div>
+    <!-- 🌟 상단 2단 네비게이션 탭 바 -->
+    <div class="tab-nav">
+      <button type="button" class="tab-btn active" id="tab-btn-dashboard" onclick="switchAdminTab('dashboard')">
+        <span>📊</span> 관제 대시보드
+      </button>
+      <button type="button" class="tab-btn" id="tab-btn-settings" onclick="switchAdminTab('settings')">
+        <span>⚙️</span> 시스템 설정
+      </button>
     </div>
 
-    <!-- 🔬 [신규] 조판 결함 및 크래시 리포트 원클릭 다운로드 센터 -->
-    <div class="card">
-      <div class="section-title">
-        <span>🔬 조판 결함 및 크래시 리포트 (${crashReports.length}건)</span>
-        ${crashReports.length > 0 ? `<a href="/admin/crash-reports/clear" class="btn-clear-all" onclick="return confirm('수집된 모든 크래시 리포트를 일괄 삭제하시겠습니까?');">🧹 전체 비우기</a>` : ''}
-      </div>
-      <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        웹 뷰어에서 자동 전송된 줄 잘림, 텍스트 중복, 챕터 마지막 유령 빈 페이지 결함 진단 JSON 목록입니다.
-      </p>
-      ${crashReportsHtml}
-    </div>
-
-    <form method="POST" action="/admin/save">
-      <!-- 1. Google OAuth 인증 상태 및 재인증 -->
+    <!-- ================================================================= -->
+    <!-- 📊 [탭 1] 관제 대시보드 (현황 카드 + 실시간 활동 로그 + 크래시 리포트) -->
+    <!-- ================================================================= -->
+    <div id="tab-content-dashboard" class="tab-content active">
+      <!-- 1. 실시간 디스크 & 도서 현황 카드 -->
       <div class="card">
         <div class="section-title">
-          <span>🔑 Google OAuth 토큰 상태</span>
-          <span class="badge ${hasToken ? 'badge-success' : 'badge-warning'}">
-            ${hasToken ? '토큰 보유 (정상)' : '미인증 (연동 필요)'}
-          </span>
+          <span>💾 실시간 저장소 및 도서 현황</span>
+          <span class="badge badge-info">60초 자동 갱신</span>
         </div>
-        <p style="font-size: 13px; color: var(--text-muted); margin: 0 0 12px 0;">
-          Google Drive 연동용 Refresh Token이 서버에 암호화되어 안전하게 보관되고 있는지 나타냅니다.
-        </p>
-        <a href="/auth/google" class="oauth-btn">🔗 Google 계정 로그인 / 재인증 시작</a>
-      </div>
-
-      <!-- 2. 스토리지 모드 선택 (저장소 기능 토글) -->
-      <div class="card">
-        <div class="section-title">
-          <span>📁 개인 서버 저장소 모드 (Self-Hosted Storage)</span>
-          <span class="badge ${isStorageMode ? 'badge-success' : 'badge-info'}">
-            ${isStorageMode ? '로컬 저장소 활성' : '인증 프록시 모드'}
-          </span>
-        </div>
-
-        <div class="toggle-row">
-          <div class="toggle-info">
-            <h4>개인 서버에 책/설정 직접 저장</h4>
-            <p>체크 시 Google Drive 대신 이 서버의 디스크(./data/books)에 책과 진도율을 동기화합니다.</p>
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="stat-label">활성 도서 (books)</div>
+            <div class="stat-value">${metrics.activeBooksCount} <span style="font-size: 12px; font-weight: normal; color: var(--text-muted);">권</span></div>
           </div>
-          <label class="switch">
-            <input type="checkbox" name="STORAGE_MODE" value="true" ${isStorageMode ? 'checked' : ''}>
-            <span class="slider"></span>
-          </label>
+          <div class="stat-card">
+            <div class="stat-label">보관 도서 (archive)</div>
+            <div class="stat-value" style="color: #a78bfa;">${metrics.archivedBooksCount} <span style="font-size: 12px; font-weight: normal; color: var(--text-muted);">권</span></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">데이터 총 용량</div>
+            <div class="stat-value" style="color: #34d399;">${metrics.totalDataSizeMb}</div>
+          </div>
         </div>
+        <p style="font-size: 12px; color: var(--text-muted); margin: 0; text-align: right;">
+          최근 산출 시각: ${metrics.lastCalculatedAt}
+        </p>
       </div>
 
-      <!-- 3. 상세 환경변수 설정 (.env 연동) -->
+      <!-- 2. 최근 20건 실시간 기기/IP 활동 로그 위젯 -->
       <div class="card">
         <div class="section-title">
-          <span>🛠️ 시스템 상세 설정 (.env)</span>
+          <span>📋 최근 동기화 및 접근 활동 로그 (최근 30건 FIFO)</span>
+          <span class="badge badge-success">실시간 관제 중</span>
+        </div>
+        <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
+          웹 뷰어의 도서 동기화, 다운로드 및 비인가 접근 차단 이력이 서버 RAM 링 버퍼에 기록됩니다.
+        </p>
+        ${activityLogsHtml}
+      </div>
+
+      <!-- 3. 조판 결함 및 크래시 리포트 다운로드 센터 -->
+      <div class="card">
+        <div class="section-title">
+          <span>🔬 조판 결함 및 크래시 리포트 (${crashReports.length}건)</span>
+          ${crashReports.length > 0 ? `<a href="/admin/crash-reports/clear" class="btn-clear-all" onclick="return confirm('수집된 모든 크래시 리포트를 일괄 삭제하시겠습니까?');">🧹 전체 비우기</a>` : ''}
+        </div>
+        <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
+          웹 뷰어에서 자동 전송된 줄 잘림, 텍스트 중복, 챕터 마지막 유령 빈 페이지 결함 진단 JSON 목록입니다.
+        </p>
+        ${crashReportsHtml}
+      </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- ⚙️ [탭 2] 시스템 설정 (접속 정보 + 구글 연동 + 스토리지 토글 + 전 11대 .env 폼) -->
+    <!-- ================================================================= -->
+    <div id="tab-content-settings" class="tab-content">
+      <!-- 1. 주요 접속 정보 원클릭 복사 카드 -->
+      <div class="card">
+        <div class="section-title">
+          <span>📋 주요 접속 정보 원클릭 복사</span>
+          <span class="badge badge-info">빠른 복사 지원</span>
         </div>
 
         <div class="form-group">
-          <label>Google Client ID</label>
-          <input type="text" name="GOOGLE_CLIENT_ID" value="${clientId}" placeholder="your-client-id.apps.googleusercontent.com">
+          <label>🐙 프로젝트 공식 GitHub 저장소</label>
+          <div class="copy-box">
+            <span class="copy-text" id="text-github">${GITHUB_REPO_URL}</span>
+            <button type="button" class="btn-copy" onclick="copyToClipboard('${GITHUB_REPO_URL}', this)">복사</button>
+          </div>
         </div>
 
         <div class="form-group">
-          <label>Google Client Secret ${hasSecret ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
-          <input type="password" name="GOOGLE_CLIENT_SECRET" placeholder="${hasSecret ? '•••••••• (변경 시에만 새로 입력)' : 'GOCSPX-...'}" autocomplete="new-password">
+          <label>🌐 현재 서버 주소 (웹 뷰어 설정창에 입력할 주소)</label>
+          <div class="copy-box">
+            <span class="copy-text" id="text-server">${currentServerUrl}</span>
+            <button type="button" class="btn-copy" onclick="copyToClipboard('${currentServerUrl}', this)">복사</button>
+          </div>
         </div>
 
         <div class="form-group">
-          <label>Google Redirect URI</label>
-          <input type="text" name="GOOGLE_REDIRECT_URI" value="${redirectUri}" placeholder="https://내서버도메인/auth/google/callback">
-        </div>
-
-        <div class="form-group">
-          <label>토큰 암호화 마스터 키 ${hasKey ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
-          <input type="password" name="TOKEN_ENCRYPTION_KEY" placeholder="${hasKey ? '•••••••• (변경 시에만 새로 입력)' : '32자 이상의 무작위 비밀키'}" autocomplete="new-password">
-        </div>
-
-        <div class="form-group">
-          <label>허용 웹 뷰어 Origin (CORS)</label>
-          <input type="text" name="ALLOWED_ORIGIN" value="${allowedOrigin}" placeholder="https://내뷰어주소.vercel.app 또는 *">
-        </div>
-
-        <div class="form-group">
-          <label>🔒 관리자 페이지 비밀번호 변경 (.env 자동 반영)</label>
-          <input type="password" name="NEW_ADMIN_PASSWORD" placeholder="•••••••• (비밀번호 변경 시에만 새 비밀번호 입력)" autocomplete="new-password">
+          <label>🔗 구글 콘솔에 등록할 리디렉션 URI (Redirect URI)</label>
+          <div class="copy-box">
+            <span class="copy-text" id="text-redirect">${redirectUri}</span>
+            <button type="button" class="btn-copy" onclick="copyToClipboard('${redirectUri}', this)">복사</button>
+          </div>
         </div>
       </div>
 
-      <button type="submit" class="btn-submit">💾 설정 저장 및 환경 적용</button>
-      <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
-    </form>
+      <form method="POST" action="/admin/save">
+        <!-- 2. Google OAuth 토큰 상태 및 재인증 -->
+        <div class="card">
+          <div class="section-title">
+            <span>🔑 Google OAuth 토큰 상태</span>
+            <span class="badge ${hasToken ? 'badge-success' : 'badge-warning'}">
+              ${hasToken ? '토큰 보유 (정상)' : '미인증 (연동 필요)'}
+            </span>
+          </div>
+          <p style="font-size: 13px; color: var(--text-muted); margin: 0 0 12px 0;">
+            Google Drive 연동용 Refresh Token이 서버에 암호화되어 안전하게 보관되고 있는지 나타냅니다.
+          </p>
+          <a href="/auth/google" class="oauth-btn">🔗 Google 계정 로그인 / 재인증 시작</a>
+        </div>
+
+        <!-- 3. 개인 서버 저장소 모드 스위치 -->
+        <div class="card">
+          <div class="section-title">
+            <span>📁 개인 서버 저장소 모드 (Self-Hosted Storage)</span>
+            <span class="badge ${isStorageMode ? 'badge-success' : 'badge-info'}">
+              ${isStorageMode ? '로컬 저장소 활성' : '인증 프록시 모드'}
+            </span>
+          </div>
+
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <h4>개인 서버에 책/설정 직접 저장</h4>
+              <p>체크 시 Google Drive 대신 이 서버의 디스크(./data/books)에 책과 진도율을 동기화합니다.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" name="STORAGE_MODE" value="true" ${isStorageMode ? 'checked' : ''}>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- 4. 상세 환경변수 설정 (전 11대 항목 1:1 완비) -->
+        <div class="card">
+          <div class="section-title">
+            <span>🛠️ 시스템 상세 설정 (.env 전 11대 항목)</span>
+          </div>
+
+          <!-- 포트 & 호스트 바인딩 -->
+          <div class="form-row">
+            <div class="form-group">
+              <label>포트 (PORT)</label>
+              <input type="text" name="PORT" value="${port}" placeholder="3001">
+            </div>
+            <div class="form-group">
+              <label>바인딩 호스트 (HOST)</label>
+              <input type="text" name="HOST" value="${serverHost}" placeholder="127.0.0.1">
+            </div>
+          </div>
+
+          <!-- 리더 URL & 토큰 파일 경로 -->
+          <div class="form-group">
+            <label>웹 서재 주소 (READER_URL - 서재로 돌아가기 버튼 대상)</label>
+            <input type="text" name="READER_URL" value="${readerUrl}" placeholder="https://epubwebview.vercel.app">
+          </div>
+
+          <div class="form-group">
+            <label>암호화 토큰 파일 경로 (TOKEN_FILE)</label>
+            <input type="text" name="TOKEN_FILE" value="${tokenFile}" placeholder="./data/token.enc">
+          </div>
+
+          <div class="form-group">
+            <label>허용 웹 뷰어 Origin (ALLOWED_ORIGIN - CORS 및 방화벽 화이트리스트)</label>
+            <input type="text" name="ALLOWED_ORIGIN" value="${allowedOrigin}" placeholder="https://내뷰어주소.vercel.app,http://localhost:5173">
+          </div>
+
+          <div class="form-group">
+            <label>Google Client ID</label>
+            <input type="text" name="GOOGLE_CLIENT_ID" value="${clientId}" placeholder="your-client-id.apps.googleusercontent.com">
+          </div>
+
+          <div class="form-group">
+            <label>Google Client Secret ${hasSecret ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
+            <input type="password" name="GOOGLE_CLIENT_SECRET" placeholder="${hasSecret ? '•••••••• (변경 시에만 새로 입력)' : 'GOCSPX-...'}" autocomplete="new-password">
+          </div>
+
+          <div class="form-group">
+            <label>Google Redirect URI</label>
+            <input type="text" name="GOOGLE_REDIRECT_URI" value="${redirectUri}" placeholder="https://내서버도메인/auth/google/callback">
+          </div>
+
+          <div class="form-group">
+            <label>토큰 암호화 마스터 키 (TOKEN_ENCRYPTION_KEY) ${hasKey ? '<span style="color:var(--success); font-size:11px;">(현재 등록됨)</span>' : ''}</label>
+            <input type="password" name="TOKEN_ENCRYPTION_KEY" placeholder="${hasKey ? '•••••••• (변경 시에만 새로 입력)' : '32자 이상의 무작위 비밀키'}" autocomplete="new-password">
+          </div>
+
+          <div class="form-group">
+            <label>🔒 관리자 페이지 비밀번호 변경 (ADMIN_PASSWORD)</label>
+            <input type="password" name="NEW_ADMIN_PASSWORD" placeholder="•••••••• (비밀번호 변경 시에만 새 비밀번호 입력)" autocomplete="new-password">
+          </div>
+        </div>
+
+        <button type="submit" class="btn-submit">💾 설정 저장 및 환경 적용</button>
+      </form>
+    </div>
+
+    <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
   </div>
 
   <script>
+    // 🌟 상단 2단 탭 전환 함수 (localStorage 연동으로 새로고침 후에도 보고 있던 탭 유지)
+    function switchAdminTab(tabName) {
+      const isDashboard = tabName === 'dashboard';
+      
+      document.getElementById('tab-btn-dashboard').classList.toggle('active', isDashboard);
+      document.getElementById('tab-btn-settings').classList.toggle('active', !isDashboard);
+      
+      document.getElementById('tab-content-dashboard').classList.toggle('active', isDashboard);
+      document.getElementById('tab-content-settings').classList.toggle('active', !isDashboard);
+
+      try {
+        localStorage.setItem('admin_active_tab', tabName);
+      } catch (e) {}
+    }
+
+    // 초기 로딩 시 마지막 보던 탭 복원
+    (function initTabState() {
+      try {
+        const savedTab = localStorage.getItem('admin_active_tab');
+        if (savedTab === 'settings') {
+          switchAdminTab('settings');
+        }
+      } catch (e) {}
+    })();
+
     function copyToClipboard(text, btnElement) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(() => {
