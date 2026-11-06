@@ -9,6 +9,7 @@
  * - 🔍 [서버 디렉터리 탐색 및 권한 실측] getDirectoryTree & testDirectoryPermissions 탑재로 관리자 간이 탐색기 완벽 지원
  * - 📚 [공유 폴더 도서 스캔] getRemoteBooks 탑재로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집 및 스트리밍 경로 반환
  * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
+ * - 🔬 [404 핀포인트 정밀 추적 로그] getBookEpubPath 및 importRemoteBookToLibrary에 유니코드(NFC/NFD) 및 실물 파일명 1:1 대조 로그 탑재
  */
 
 import fs from 'fs';
@@ -261,28 +262,68 @@ export const storageService = {
   },
 
   /**
-   * 🎯 [핵심 교정] EPUB 원본 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
+   * 🎯 [핵심 교정 및 정밀 진단] EPUB 원본 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
    * @param {string} bookId 
    * @returns {{ filePath: string, size: number } | null}
    */
   getBookEpubPath(bookId) {
-    if (!bookId) return null;
+    if (!bookId) {
+      console.warn('⚠️ [StorageService:GetEpub] bookId가 비어 있습니다.');
+      return null;
+    }
+
     const candidates = generateFilenameCandidates(bookId);
+    console.log(`🔍 [StorageService:GetEpub] 도서 EPUB 파일 탐색 착수:`, {
+      originalBookId: bookId,
+      candidatesCount: candidates.length,
+      candidates: candidates,
+      targetBooksDir: BOOKS_DIR
+    });
 
     // books/ (1순위) ➔ archive/ (2순위) 탐색
     for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
-      if (!fs.existsSync(dir)) continue;
+      if (!fs.existsSync(dir)) {
+        console.warn(`⚠️ [StorageService:GetEpub] 디렉터리가 존재하지 않음: ${dir}`);
+        continue;
+      }
 
       for (const cand of candidates) {
         const filePath = path.join(dir, `${cand}.epub`);
-        if (fs.existsSync(filePath)) {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile()) {
-            return { filePath, size: stat.size };
+        const exists = fs.existsSync(filePath);
+
+        if (exists) {
+          try {
+            const stat = fs.statSync(filePath);
+            if (stat.isFile()) {
+              console.log(`✅ [StorageService:GetEpub] EPUB 파일 적중 성공!`, {
+                matchedCandidate: cand,
+                filePath,
+                sizeBytes: stat.size,
+                sizeMb: (stat.size / 1024 / 1024).toFixed(2) + ' MB'
+              });
+              return { filePath, size: stat.size };
+            }
+          } catch (statErr) {
+            console.warn(`⚠️ [StorageService:GetEpub] 파일 stat 확인 실패 ('${filePath}'):`, statErr.message);
           }
         }
       }
     }
+
+    // 🚨 [404 실패 원인 전수 덤프] 실물 파일이 왜 없는지 디스크 상태 출력
+    let existingFilesInBooks = [];
+    try {
+      if (fs.existsSync(BOOKS_DIR)) {
+        existingFilesInBooks = fs.readdirSync(BOOKS_DIR).slice(0, 15);
+      }
+    } catch (e) {}
+
+    console.error(`❌ [StorageService:GetEpub:404] EPUB 파일을 찾을 수 없습니다!`, {
+      requestedBookId: bookId,
+      triedCandidates: candidates.map(c => `${c}.epub`),
+      searchedDirs: [BOOKS_DIR, ARCHIVE_DIR],
+      booksDirSampleFiles: existingFilesInBooks
+    });
 
     return null;
   },
@@ -669,7 +710,18 @@ export const storageService = {
     // 1. 공백 보존 파일명으로 실물 파일 직접 복사
     const targetEpubPath = path.join(BOOKS_DIR, `${bookId}.epub`);
     fs.copyFileSync(safeSourcePath, targetEpubPath);
-    console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료: '${fileName}' ➔ '${bookId}.epub' (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
+
+    // 🔬 [실측 검증 로그 추가] 복사 직후 실존 여부 및 실제 바이트 확인
+    const copyVerifyExists = fs.existsSync(targetEpubPath);
+    const copyVerifySize = copyVerifyExists ? fs.statSync(targetEpubPath).size : 0;
+
+    console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료:`, {
+      originalSource: safeSourcePath,
+      targetDestination: targetEpubPath,
+      existsOnDisk: copyVerifyExists,
+      savedSizeBytes: copyVerifySize,
+      bookId: bookId
+    });
 
     // 2. 정규 도서 메타데이터 JSON 생성 및 저장
     const bookData = {
