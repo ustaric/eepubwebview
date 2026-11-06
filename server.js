@@ -2,8 +2,10 @@
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
  * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js 조립
- * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용 (비활성 시 403 차단)
- * - 🔬 [크래시 리포트 수신 & 웹 다운로드 센터] 클라이언트 진단 JSON 수신 및 어드민 웹 원클릭 다운로드/삭제 완비
+ * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
+ * - 🚦 [지능형 Rate Limit] 관리자 로그인 1분 5회 락 & 스토리지 API 1분 120회 폭주 방어
+ * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
+ * - 🔬 [크래시 리포트 수신 & 웹 다운로드 센터] 클라이언트 진단 JSON 수신 및 어드민 웹 다운로드/삭제 완비
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
@@ -30,18 +32,24 @@ import { storageService } from './src/storageService.js';
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
  */
 const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 60;
+const loginAttemptMap = new Map();
 
+// 주기적 메모리 청소 (5분 간격)
 setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of rateLimitMap.entries()) {
-    if (now > data.resetTime) {
-      rateLimitMap.delete(ip);
-    }
+    if (now > data.resetTime) rateLimitMap.delete(ip);
+  }
+  for (const [ip, data] of loginAttemptMap.entries()) {
+    if (now > data.resetTime) loginAttemptMap.delete(ip);
   }
 }, 5 * 60 * 1000);
 
+/**
+ * 클라이언트 실제 IP 추출
+ * @param {http.IncomingMessage} req 
+ * @returns {string}
+ */
 function getClientIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
   if (forwarded) {
@@ -50,19 +58,26 @@ function getClientIp(req) {
   return req.socket.remoteAddress || '127.0.0.1';
 }
 
-function checkRateLimit(req) {
+/**
+ * 일반 엔드포인트 및 스토리지 API 요청 속도 제한 (1분당 120회)
+ * @param {http.IncomingMessage} req 
+ * @param {number} [maxRequests=120]
+ * @returns {boolean} 허용 여부
+ */
+function checkRateLimit(req, maxRequests = 120) {
   const ip = getClientIp(req);
   const now = Date.now();
+  const windowMs = 60 * 1000;
 
   let record = rateLimitMap.get(ip);
   if (!record || now > record.resetTime) {
-    record = { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS };
+    record = { count: 1, resetTime: now + windowMs };
     rateLimitMap.set(ip, record);
     return true;
   }
 
   record.count += 1;
-  if (record.count > RATE_LIMIT_MAX_REQUESTS) {
+  if (record.count > maxRequests) {
     console.warn(`⚠️ [RateLimit Blocked] 과도한 요청 차단됨: IP ${ip} (요청 수: ${record.count})`);
     return false;
   }
@@ -70,9 +85,105 @@ function checkRateLimit(req) {
   return true;
 }
 
+/**
+ * 🔒 [관리자 로그인 전용 브루트포스 차단] 1분 내 5회 실패 시 15분간 차단
+ * @param {string} ip 
+ * @returns {{ allowed: boolean, remainingAttempts: number, waitMinutes?: number }}
+ */
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  const record = loginAttemptMap.get(ip);
+
+  if (!record) return { allowed: true, remainingAttempts: 5 };
+
+  if (record.blockedUntil && now < record.blockedUntil) {
+    const waitMinutes = Math.ceil((record.blockedUntil - now) / (60 * 1000));
+    return { allowed: false, remainingAttempts: 0, waitMinutes };
+  }
+
+  if (now > record.resetTime) {
+    loginAttemptMap.delete(ip);
+    return { allowed: true, remainingAttempts: 5 };
+  }
+
+  if (record.failCount >= 5) {
+    record.blockedUntil = now + (15 * 60 * 1000); // 15분 차단
+    return { allowed: false, remainingAttempts: 0, waitMinutes: 15 };
+  }
+
+  return { allowed: true, remainingAttempts: 5 - record.failCount };
+}
+
+/**
+ * 관리자 로그인 실패 횟수 기록
+ * @param {string} ip 
+ */
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  let record = loginAttemptMap.get(ip);
+  if (!record || now > record.resetTime) {
+    record = { failCount: 1, resetTime: now + (60 * 1000), blockedUntil: 0 };
+  } else {
+    record.failCount += 1;
+  }
+  loginAttemptMap.set(ip, record);
+}
+
+/**
+ * 관리자 로그인 성공 시 실패 기록 초기화
+ * @param {string} ip 
+ */
+function clearLoginFailure(ip) {
+  loginAttemptMap.delete(ip);
+}
+
+/**
+ * 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 웹 뷰어 Origin / Referer 검증
+ * @param {http.IncomingMessage} req 
+ * @returns {boolean}
+ */
+function isAllowedClientOrigin(req) {
+  const env = readEnvFile();
+  const allowedConfig = env.ALLOWED_ORIGIN || config.security.allowedOrigin;
+
+  if (!allowedConfig || allowedConfig === '*') return true;
+
+  const allowedList = allowedConfig.split(',').map((s) => s.trim().toLowerCase());
+
+  // 1. Origin 헤더 검사
+  const origin = req.headers.origin;
+  if (origin) {
+    return allowedList.includes(origin.toLowerCase());
+  }
+
+  // 2. Referer 헤더 검사 (GET 다운로드 또는 직접 탐색 시)
+  const referer = req.headers.referer;
+  if (referer) {
+    try {
+      const refererUrl = new URL(referer);
+      const refererOrigin = refererUrl.origin.toLowerCase();
+      return allowedList.includes(refererOrigin);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Origin과 Referer가 둘 다 없는 경우 (동일 서버 직접 호출이 아니면 차단)
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (secFetchSite === 'same-origin') return true;
+
+  return false;
+}
+
+/**
+ * CORS 응답 헤더 세팅
+ * @param {http.IncomingMessage} req 
+ * @param {http.ServerResponse} res 
+ */
 function setCorsHeaders(req, res) {
   const requestOrigin = req.headers.origin;
-  const configuredOrigin = config.security.allowedOrigin;
+  const env = readEnvFile();
+  const configuredOrigin = env.ALLOWED_ORIGIN || config.security.allowedOrigin;
 
   if (configuredOrigin === '*' || !configuredOrigin) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin || '*');
@@ -90,12 +201,18 @@ function setCorsHeaders(req, res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
+/**
+ * JSON 응답 전송 헬퍼
+ */
 function sendJsonResponse(req, res, statusCode, payload) {
   setCorsHeaders(req, res);
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload, null, 2));
 }
 
+/**
+ * 안내 HTML 응답 전송 헬퍼
+ */
 function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true) {
   setCorsHeaders(req, res);
   res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -219,8 +336,9 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || `${config.host}:${config.port}`;
   const reqUrl = new URL(req.url, `${protocol}://${host}`);
   const pathname = reqUrl.pathname;
+  const clientIp = getClientIp(req);
 
-  console.log(`[Request] ${req.method} ${pathname} (IP: ${getClientIp(req)})`);
+  console.log(`[Request] ${req.method} ${pathname} (IP: ${clientIp})`);
 
   // =========================================================================
   // 1. 서버 헬스체크
@@ -240,6 +358,15 @@ const server = http.createServer(async (req, res) => {
   // 2. 관리자 인증 & 대시보드 라우트 (src/adminController 위임)
   // =========================================================================
   if (req.method === 'POST' && pathname === '/admin/login') {
+    const loginGuard = checkLoginRateLimit(clientIp);
+    if (!loginGuard.allowed) {
+      console.warn(`⛔ [Login Lock] 무차별 대입 방어로 IP ${clientIp} 차단 중 (${loginGuard.waitMinutes}분 남음)`);
+      const html = renderLoginPageHtml(`로그인 시도 횟수가 초과되었습니다. ${loginGuard.waitMinutes}분 후에 다시 시도해 주세요.`, false);
+      res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
@@ -258,6 +385,7 @@ const server = http.createServer(async (req, res) => {
 
         writeEnvFile({ ADMIN_PASSWORD: inputPass });
         console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
+        clearLoginFailure(clientIp);
 
         const sessionToken = createAdminSession();
         res.writeHead(302, {
@@ -269,6 +397,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (inputPass === currentPass) {
+        clearLoginFailure(clientIp);
         const sessionToken = createAdminSession();
         res.writeHead(302, {
           'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
@@ -276,7 +405,10 @@ const server = http.createServer(async (req, res) => {
         });
         res.end();
       } else {
-        const html = renderLoginPageHtml('비밀번호가 올바르지 않습니다.', false);
+        recordLoginFailure(clientIp);
+        const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
+        console.warn(`⚠️ [Login Failed] 관리자 비밀번호 불일치 (IP: ${clientIp}, 잔여 시도: ${Math.max(0, remaining)}회)`);
+        const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
       }
@@ -431,7 +563,7 @@ const server = http.createServer(async (req, res) => {
   // 3. 🌟 자체 스토리지 모드 REST API 엔드포인트 (src/storageService 위임)
   // =========================================================================
 
-  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (STORAGE_MODE와 무관하게 결함 수집 항상 허용)
+  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (STORAGE_MODE 및 Origin 검증과 무관하게 결함 수집 항상 허용)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
@@ -444,7 +576,26 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [STORAGE_MODE 검증 가드] 도서 및 설정 저장소 엔드포인트는 어드민에서 켜져 있을 때만 통과
+  // 🛡️ [스토리지 엔드포인트 보안 가드 1] 속도 제한 (Rate Limiting: 1분 120회)
+  if (pathname.startsWith('/api/storage/')) {
+    if (!checkRateLimit(req, 120)) {
+      return sendJsonResponse(req, res, 429, {
+        error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.'
+      });
+    }
+  }
+
+  // 🛡️ [스토리지 엔드포인트 보안 가드 2] 허용된 웹 뷰어 Origin / Referer 검증
+  if (pathname.startsWith('/api/storage/')) {
+    if (!isAllowedClientOrigin(req)) {
+      console.warn(`⛔ [Origin Blocked] 비인가 클라이언트의 스토리지 접근 차단됨 (IP: ${clientIp}, Origin: ${req.headers.origin}, Referer: ${req.headers.referer})`);
+      return sendJsonResponse(req, res, 403, {
+        error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인에서의 스토리지 접근입니다.'
+      });
+    }
+  }
+
+  // 🛡️ [스토리지 엔드포인트 보안 가드 3] STORAGE_MODE 검증 가드
   if (pathname.startsWith('/api/storage/')) {
     const env = readEnvFile();
     if (env.STORAGE_MODE !== 'true') {
@@ -622,7 +773,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && pathname === '/api/access-token') {
-    if (!checkRateLimit(req)) {
+    if (!checkRateLimit(req, 60)) {
       return sendJsonResponse(req, res, 429, {
         error: '요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.'
       });
@@ -658,6 +809,7 @@ server.listen(config.port, config.host, () => {
   console.log(`🚀 Personal EPUB Server 가 구동되었습니다.`);
   console.log(`   - 바인딩: http://${config.host}:${config.port}`);
   console.log(`   - 제어 센터: http://${config.host}:${config.port}/admin`);
+  console.log(`   - 허용 출처: ${config.security.allowedOrigin}`);
   console.log(`   - 토큰 상태: ${hasRefreshToken() ? '저장됨 ✅' : '미등록 (로그인 필요 ⚠️)'}`);
   console.log('====================================================');
 });
