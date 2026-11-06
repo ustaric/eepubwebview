@@ -1,7 +1,8 @@
 /**
  * @file src/adminViews.js
  * @description 관리자 제어 센터 순수 HTML/CSS/JS 화면 템플릿 전담 뷰 렌더러 모듈 (View)
- * - 🎨 [MVC 패턴 완전 분리] adminController.js로부터 600줄에 달하는 거대 HTML 마크업을 독립 분리
+ * - 🔒 [구글 계정 연동 본인 확인 게이트 탑재] renderAuthGateHtml 제공으로 타인의 구글 계정 덮어쓰기 원천 차단
+ * - 🎨 [MVC 패턴 완전 분리] adminController.js로부터 거대 HTML 마크업을 독립 분리
  * - 📑 [상단 2단 탭 UI 탑재] '📊 관제 대시보드'와 '⚙️ 시스템 설정' 화면 템플릿 및 localStorage 상태 복원 스크립트 전담
  * - 💾 [실시간 현황 & 최근 로그 표출] auditLogger 연동 실시간 저장소 그리드 및 최근 30건 활동 로그 테이블 마크업
  * - 🛠️ [전 11대 환경변수 폼 렌더링] PORT, HOST, READER_URL, TOKEN_FILE 포함 1:1 완벽 배치
@@ -15,6 +16,138 @@ import { auditLogger } from './auditLogger.js';
 
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
+
+/**
+ * 🔒 [신규] 구글 계정 연동 전 관리자 본인 확인 게이트 HTML 렌더러
+ * - 타인이 임의로 구글 계정 로그인 화면에 진입하여 토큰을 덮어쓰는 사고를 100% 방지
+ * @param {string|null} [errorMessage=null]
+ * @returns {string} HTML 문자열
+ */
+export function renderAuthGateHtml(errorMessage = null) {
+  let errorBanner = '';
+  if (errorMessage) {
+    errorBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🔒 Google 연동 본인 확인 - EPUB Server</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --danger: #ef4444;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px 24px;
+      max-width: 400px;
+      width: 100%;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+      text-align: center;
+    }
+    .icon {
+      font-size: 40px;
+      margin-bottom: 12px;
+    }
+    h2 {
+      margin: 0 0 8px 0;
+      font-size: 19px;
+      color: #38bdf8;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin: 0 0 18px 0;
+      line-height: 1.5;
+    }
+    .alert {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--danger);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      text-align: left;
+    }
+    input[type="password"] {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 12px;
+      font-size: 15px;
+      box-sizing: border-box;
+      outline: none;
+      margin-bottom: 16px;
+      transition: border-color 0.2s;
+    }
+    input[type="password"]:focus {
+      border-color: var(--primary);
+    }
+    button {
+      width: 100%;
+      background: var(--primary);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: var(--primary-hover);
+    }
+    .btn-cancel {
+      display: inline-block;
+      margin-top: 14px;
+      color: var(--text-muted);
+      font-size: 12.5px;
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🔗</div>
+    <h2>Google 계정 연동 본인 확인</h2>
+    <p>서버에 저장된 클라우드 토큰을 보호하기 위해<br><strong>관리자 비밀번호</strong>를 입력해 주세요.</p>
+    ${errorBanner}
+    <form method="POST" action="/auth/google">
+      <input type="password" name="password" placeholder="관리자 비밀번호 입력" required autofocus autocomplete="current-password">
+      <button type="submit">확인 및 Google 로그인 진행 ➔</button>
+      <a href="/admin" class="btn-cancel">취소하고 관리자 홈으로</a>
+    </form>
+  </div>
+</body>
+</html>`;
+}
 
 /**
  * 🔑 관리자 로그인 화면 HTML 렌더러
@@ -160,7 +293,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const host = req.headers.host || `${config.host}:${config.port}`;
   const currentServerUrl = `${protocol}://${host}`;
 
-  // 전 11대 환경변수 값 매핑
   const port = env.PORT || String(config.port || '3001');
   const serverHost = env.HOST || config.host || '127.0.0.1';
   const tokenFile = env.TOKEN_FILE || './data/token.enc';
@@ -171,7 +303,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
   const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
 
-  // 📊 실시간 스토리지 현황 및 최근 30건 로그 수집
   const metrics = auditLogger.getStorageMetrics();
   const recentLogs = auditLogger.getRecentLogs();
   const crashReports = storageService.getCrashReportsList();
@@ -183,7 +314,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
   }
 
-  // 1. 최근 동기화 및 접근 활동 로그 테이블 HTML 생성
   let activityLogsHtml = '';
   if (recentLogs.length === 0) {
     activityLogsHtml = `
@@ -233,7 +363,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     `;
   }
 
-  // 2. 크래시 리포트 테이블 HTML 생성
   let crashReportsHtml = '';
   if (crashReports.length === 0) {
     crashReportsHtml = `

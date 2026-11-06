@@ -1,6 +1,7 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
+ * - 🔒 [Google 로그인 비밀번호 관문 탑재] /auth/google 진입 시 관리자 비밀번호 검증으로 타인의 구글 계정 덮어쓰기 원천 차단
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
  * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
  * - 🚦 [지능형 Rate Limit] 스토리지 API 1분 120회 폭주 방어
@@ -16,9 +17,10 @@ import { config } from './config.js';
 import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToken } from './googleAuth.js';
 import { hasRefreshToken } from './tokenStore.js';
 
-// 🌟 분리된 4대 전담 모듈 import
+// 🌟 분리된 전담 모듈 import
 import { readEnvFile } from './src/envManager.js';
-import { handleAdminRoute } from './src/adminController.js';
+import { handleAdminRoute, isAuthenticated, createAdminSession } from './src/adminController.js';
+import { renderAuthGateHtml } from './src/adminViews.js';
 import { storageService } from './src/storageService.js';
 import { auditLogger } from './src/auditLogger.js';
 
@@ -294,7 +296,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 2. 🌟 관리자 인증 & 대시보드 라우트 (src/adminController로 100% 위임)
+  // 2. 관리자 인증 & 대시보드 라우트 (src/adminController 위임)
   // =========================================================================
   if (pathname.startsWith('/admin') || pathname === '/settings') {
     const handled = await handleAdminRoute(req, res, pathname, clientIp, userAgent);
@@ -503,20 +505,69 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 4. 기존 Google OAuth 인증 라우트 (하위 호환 100% 보존)
+  // 4. 🌟 Google OAuth 인증 라우트 (비밀번호 게이트웨이 탑재로 타인 계정 덮어쓰기 원천 차단)
   // =========================================================================
+
+  // 1) [GET /auth/google] 로그인 시작 링크: 이미 로그인되어 있으면 바로 구글로 점프, 미인증 시 비밀번호 확인 게이트 렌더링
   if (req.method === 'GET' && pathname === '/auth/google') {
-    try {
-      const authUrl = generateAuthUrl();
-      res.writeHead(302, { Location: authUrl });
-      res.end();
-      return;
-    } catch (err) {
-      console.error('[OAuth Init Error]', err.message);
-      return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다. 설정 값을 확인해 주세요.', false);
+    if (isAuthenticated(req)) {
+      try {
+        const authUrl = generateAuthUrl();
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 계정 연동 시작', target: '관리자 인증 통과 ➔ 구글 이동', status: 302 });
+        res.writeHead(302, { Location: authUrl });
+        res.end();
+        return;
+      } catch (err) {
+        console.error('[OAuth Init Error]', err.message);
+        return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다. 설정 값을 확인해 주세요.', false);
+      }
     }
+
+    // 미인증 상태 시 본인 확인 게이트 폼 표출
+    const html = renderAuthGateHtml();
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
   }
 
+  // 2) [POST /auth/google] 게이트웨이 비밀번호 제출: 일치 시 즉시 구글 계정 선택 화면으로 302 리디렉션 점프!
+  if (req.method === 'POST' && pathname === '/auth/google') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      const params = new URLSearchParams(body);
+      const inputPass = params.get('password')?.trim() || '';
+      const env = readEnvFile();
+      const currentPass = env.ADMIN_PASSWORD;
+
+      if (currentPass && inputPass === currentPass) {
+        // 비밀번호 일치: 관리자 세션 쿠키 발급 + 즉시 구글 계정 선택 화면으로 리디렉션 점프!
+        const sessionToken = createAdminSession();
+        try {
+          const authUrl = generateAuthUrl();
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 인증 성공', target: '구글 로그인 화면 점프', status: 302 });
+          res.writeHead(302, {
+            'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
+            'Location': authUrl
+          });
+          res.end();
+          return;
+        } catch (err) {
+          return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다.', false);
+        }
+      } else {
+        // 비밀번호 불일치: 접근 차단 및 에러 화면 표출
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 오류', target: '접근 차단', status: 401 });
+        const html = renderAuthGateHtml('관리자 비밀번호가 올바르지 않습니다.');
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+      }
+    });
+    return;
+  }
+
+  // 3) [GET /auth/google/callback] Google 승인 후 돌아오는 콜백 라우트
   if (req.method === 'GET' && pathname === '/auth/google/callback') {
     const code = reqUrl.searchParams.get('code');
     const state = reqUrl.searchParams.get('state');
@@ -538,7 +589,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       await exchangeCodeForTokens(code);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'Google OAuth 토큰 교환 성공', target: '토큰 암호화 저장', status: 200 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'Google OAuth 토큰 교환 성공', target: '토큰 암호화 저장 완료', status: 200 });
       return sendHtmlResponse(
         req,
         res,
@@ -553,6 +604,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 4) [GET /api/access-token] 평소 독서 중 백그라운드 자동 갱신 엔드포인트 (0초 자동 통과)
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req, 60)) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 횟수 초과', target: '/api/access-token', status: 429 });
@@ -567,7 +619,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       const statusCode = err.status || 500;
       const clientMessage = statusCode === 401
-        ? 'Google 계정 연동이 필요합니다. 먼저 /auth/google 을 통해 인증해 주세요.'
+        ? 'Google 계정 연동이 필요합니다. 먼저 /auth/google 을 통해 Google 계정을 연동해 주세요.'
         : 'Access Token 발급에 실패했습니다.';
 
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 실패', target: clientMessage, status: statusCode });
