@@ -10,6 +10,7 @@
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
  * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
+ * - 🖼️ [HEAD 메서드 지원 탑재] 표지 이미지 선조회(HEAD) 요청 정식 수용으로 가짜 404 및 중복 업로드 원천 차단
  */
 
 import http from 'http';
@@ -138,7 +139,7 @@ function setCorsHeaders(req, res) {
     }
   }
 
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
@@ -382,6 +383,8 @@ const server = http.createServer(async (req, res) => {
         return sendJsonResponse(req, res, 400, { error: 'relativePath 필드가 누락되었습니다.' });
       }
 
+      console.log(`⚡ [API:Import] 공유 도서 내부 복사 요청 수신: relativePath='${relativePath}'`);
+
       const importResult = storageService.importRemoteBookToLibrary(sharedDir, relativePath);
       auditLogger.recordAccessLog({
         ip: clientIp,
@@ -391,8 +394,10 @@ const server = http.createServer(async (req, res) => {
         status: 200
       });
 
+      console.log(`✅ [API:Import] 복사 완료 응답 전송: bookId='${importResult.bookId}'`);
       return sendJsonResponse(req, res, 200, importResult);
     } catch (err) {
+      console.error(`❌ [API:Import] 공유 도서 복사 중 예외 발생:`, err.message);
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
@@ -536,14 +541,24 @@ const server = http.createServer(async (req, res) => {
 
   // 📦 [EPUB 바이너리 파일 스트리밍 다운로드] GET /api/storage/books/:id/epub
   if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
-    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
+    const rawSegment = pathname.replace('/api/storage/books/', '').replace(/\/epub$/, '');
+    const bookId = decodeURIComponent(rawSegment);
+
+    console.log(`📦 [API:Download] EPUB 스트리밍 다운로드 요청 수신:`, {
+      rawPathname: pathname,
+      rawSegment: rawSegment,
+      decodedBookId: bookId
+    });
+
     const info = storageService.getBookEpubPath(bookId);
     if (!info) {
+      console.warn(`❌ [API:Download:404] getBookEpubPath 결과 없음 ➔ 404 응답 전송 (bookId: '${bookId}')`);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 다운로드 실패', target: bookId, status: 404 });
       return sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
     }
 
     const sizeMb = (info.size / 1024 / 1024).toFixed(1);
+    console.log(`✅ [API:Download] 파일 송신 시작: '${info.filePath}' (${sizeMb}MB)`);
     auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📖 EPUB 다운로드', target: `${bookId} (${sizeMb}MB)`, status: 200 });
 
     setCorsHeaders(req, res);
@@ -571,8 +586,9 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🖼️ [표지 이미지 다운로드] GET /api/storage/covers/:fileName
-  if (req.method === 'GET' && pathname.startsWith('/api/storage/covers/')) {
+  // 🖼️ [표지 이미지 다운로드 및 선조회] GET / HEAD /api/storage/covers/:fileName
+  // 🌟 [핵심 개선] HEAD 메서드를 정식 수용하여 브라우저의 표지 존재 확인 시 200 OK 헤더 즉시 응답
+  if ((req.method === 'GET' || req.method === 'HEAD') && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     const info = storageService.getCoverImagePath(fileName);
     if (!info) {
@@ -582,8 +598,16 @@ const server = http.createServer(async (req, res) => {
     setCorsHeaders(req, res);
     res.writeHead(200, {
       'Content-Type': 'image/webp',
-      'Content-Length': info.size
+      'Content-Length': info.size,
+      'Cache-Control': 'public, max-age=86400'
     });
+
+    // 🌟 HEAD 요청인 경우 바디 스트림 없이 헤더만 전송하고 즉시 종료!
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+
     const readStream = fs.createReadStream(info.filePath);
     readStream.pipe(res);
     return;

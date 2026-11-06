@@ -3,13 +3,12 @@
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
- * - 🛡️ [공백/언더바 3단계 지능형 교차 탐색] getBookEpubPath, getCoverImagePath, getBookMetadata에 3단계 폴백을 탑재하여 파일명 엇갈림 404 원천 박멸
+ * - 🛡️ [공백/언더바/유니코드 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 공백/언더바 폴백을 탑재하여 404 원천 박멸
  * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
  * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName(공백 보존) 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
  * - 🔍 [서버 디렉터리 탐색 및 권한 실측] getDirectoryTree & testDirectoryPermissions 탑재로 관리자 간이 탐색기 완벽 지원
  * - 📚 [공유 폴더 도서 스캔] getRemoteBooks 탑재로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집 및 스트리밍 경로 반환
  * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
- * - 🔬 [404 핀포인트 정밀 추적 로그] getBookEpubPath 및 importRemoteBookToLibrary에 유니코드(NFC/NFD) 및 실물 파일명 1:1 대조 로그 탑재
  */
 
 import fs from 'fs';
@@ -37,9 +36,9 @@ function sanitizeFileName(rawName = '') {
 }
 
 /**
- * 🎯 [공백 & 언더바 3대 후보 생성기] 파일명 엇갈림 404를 박멸하기 위해 3가지 변형 후보 반환
+ * 🎯 [공백 & 언더바 & 유니코드 6대 후보 생성기] 파일명 엇갈림 및 리눅스 NFD 자모 분리 404를 박멸하기 위해 교차 후보 반환
  * @param {string} baseName 
- * @returns {Array<string>} [원본, 언더바 치환본, 공백 치환본]
+ * @returns {Array<string>} [원본, 언더바본, 공백본, NFC본, NFD본]
  */
 function generateFilenameCandidates(baseName = '') {
   if (!baseName) return [];
@@ -47,7 +46,18 @@ function generateFilenameCandidates(baseName = '') {
   const withUnderscores = sanitized.replace(/\s+/g, '_');
   const withSpaces = sanitized.replace(/_+/g, ' ');
 
-  const set = new Set([sanitized, withUnderscores, withSpaces, baseName]);
+  const set = new Set([
+    sanitized,
+    withUnderscores,
+    withSpaces,
+    baseName,
+    sanitized.normalize('NFC'),
+    sanitized.normalize('NFD'),
+    withUnderscores.normalize('NFC'),
+    withUnderscores.normalize('NFD'),
+    withSpaces.normalize('NFC'),
+    withSpaces.normalize('NFD')
+  ]);
   return Array.from(set).filter(Boolean);
 }
 
@@ -273,19 +283,10 @@ export const storageService = {
     }
 
     const candidates = generateFilenameCandidates(bookId);
-    console.log(`🔍 [StorageService:GetEpub] 도서 EPUB 파일 탐색 착수:`, {
-      originalBookId: bookId,
-      candidatesCount: candidates.length,
-      candidates: candidates,
-      targetBooksDir: BOOKS_DIR
-    });
 
     // books/ (1순위) ➔ archive/ (2순위) 탐색
     for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
-      if (!fs.existsSync(dir)) {
-        console.warn(`⚠️ [StorageService:GetEpub] 디렉터리가 존재하지 않음: ${dir}`);
-        continue;
-      }
+      if (!fs.existsSync(dir)) continue;
 
       for (const cand of candidates) {
         const filePath = path.join(dir, `${cand}.epub`);
@@ -295,35 +296,12 @@ export const storageService = {
           try {
             const stat = fs.statSync(filePath);
             if (stat.isFile()) {
-              console.log(`✅ [StorageService:GetEpub] EPUB 파일 적중 성공!`, {
-                matchedCandidate: cand,
-                filePath,
-                sizeBytes: stat.size,
-                sizeMb: (stat.size / 1024 / 1024).toFixed(2) + ' MB'
-              });
               return { filePath, size: stat.size };
             }
-          } catch (statErr) {
-            console.warn(`⚠️ [StorageService:GetEpub] 파일 stat 확인 실패 ('${filePath}'):`, statErr.message);
-          }
+          } catch (statErr) {}
         }
       }
     }
-
-    // 🚨 [404 실패 원인 전수 덤프] 실물 파일이 왜 없는지 디스크 상태 출력
-    let existingFilesInBooks = [];
-    try {
-      if (fs.existsSync(BOOKS_DIR)) {
-        existingFilesInBooks = fs.readdirSync(BOOKS_DIR).slice(0, 15);
-      }
-    } catch (e) {}
-
-    console.error(`❌ [StorageService:GetEpub:404] EPUB 파일을 찾을 수 없습니다!`, {
-      requestedBookId: bookId,
-      triedCandidates: candidates.map(c => `${c}.epub`),
-      searchedDirs: [BOOKS_DIR, ARCHIVE_DIR],
-      booksDirSampleFiles: existingFilesInBooks
-    });
 
     return null;
   },
@@ -341,12 +319,12 @@ export const storageService = {
     ensureDir(BOOKS_DIR);
     const targetFile = path.join(BOOKS_DIR, safeName);
     fs.writeFileSync(targetFile, buffer);
-    console.log(`🖼️ [StorageService] 표지 저장 완료: '${safeName}'`);
+    console.log(`🖼️ [StorageService] 표지 저장 완료: '${safeName}' (${(buffer.length / 1024).toFixed(1)} KB)`);
     return true;
   },
 
   /**
-   * 🎯 [핵심 교정] 표지 이미지 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
+   * 🎯 [핵심 교정] 표지 이미지 파일 경로 반환 (NFC/NFD 유니코드 및 공백/언더바 교차 탐색 ➔ 404 박멸)
    * @param {string} fileName 
    * @returns {{ filePath: string, size: number } | null}
    */
@@ -360,10 +338,12 @@ export const storageService = {
       for (const cand of candidates) {
         const filePath = path.join(dir, cand);
         if (fs.existsSync(filePath)) {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile()) {
-            return { filePath, size: stat.size };
-          }
+          try {
+            const stat = fs.statSync(filePath);
+            if (stat.isFile()) {
+              return { filePath, size: stat.size };
+            }
+          } catch (e) {}
         }
       }
     }
@@ -700,9 +680,15 @@ export const storageService = {
       throw new Error('유효하지 않은 도서 파일이거나 0바이트 빈 파일입니다.');
     }
 
-    const fileName = path.basename(safeSourcePath);
+    const rawFileName = path.basename(safeSourcePath);
+    const cleanBaseName = rawFileName.replace(/\.(epub|txt)$/i, '').replace(/_\d+$/, '').trim();
+    const ext = path.extname(rawFileName).toLowerCase();
+    const isTxt = ext === '.txt';
+
+    // 🌟 [핵심] 중복 크기 및 이중 확장자 방어: 순수 파일명_실제바이트
+    const fileName = `${cleanBaseName}${ext}`;
     const bookId = `${fileName}_${stat.size}`;
-    const cleanTitle = fileName.replace(/\.[^/.]+$/, '').trim();
+    const cleanTitle = cleanBaseName;
     const nowIso = new Date().toISOString();
 
     ensureDir(BOOKS_DIR);
@@ -711,15 +697,11 @@ export const storageService = {
     const targetEpubPath = path.join(BOOKS_DIR, `${bookId}.epub`);
     fs.copyFileSync(safeSourcePath, targetEpubPath);
 
-    // 🔬 [실측 검증 로그 추가] 복사 직후 실존 여부 및 실제 바이트 확인
-    const copyVerifyExists = fs.existsSync(targetEpubPath);
-    const copyVerifySize = copyVerifyExists ? fs.statSync(targetEpubPath).size : 0;
-
     console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료:`, {
       originalSource: safeSourcePath,
       targetDestination: targetEpubPath,
-      existsOnDisk: copyVerifyExists,
-      savedSizeBytes: copyVerifySize,
+      existsOnDisk: fs.existsSync(targetEpubPath),
+      savedSizeBytes: stat.size,
       bookId: bookId
     });
 
@@ -736,7 +718,7 @@ export const storageService = {
       isArchived: false,
       hasLocalFile: true,
       isRecordOnly: false,
-      isConvertedTxt: fileName.toLowerCase().endsWith('.txt'),
+      isConvertedTxt: isTxt,
       lastReadDate: nowIso,
       lastModified: nowIso
     };
