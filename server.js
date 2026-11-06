@@ -1,11 +1,11 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
- * - 📁 모듈 분리: src/envManager.js, src/adminController.js, src/storageService.js, src/auditLogger.js 조립
+ * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
  * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
- * - 🚦 [지능형 Rate Limit] 관리자 로그인 1분 5회 락 & 스토리지 API 1분 120회 폭주 방어
+ * - 🚦 [지능형 Rate Limit] 스토리지 API 1분 120회 폭주 방어
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
- * - 🛠️ [환경변수 전 항목 완비] PORT, HOST, READER_URL, TOKEN_FILE 포함 전 11대 설정값 실시간 파싱 및 보존
+ * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
  * - ⚡ 자체 스토리지 모드 REST API 엔드포인트 완비 (/api/storage/...)
  */
 
@@ -17,15 +17,8 @@ import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToke
 import { hasRefreshToken } from './tokenStore.js';
 
 // 🌟 분리된 4대 전담 모듈 import
-import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './src/envManager.js';
-import {
-  isAuthenticated,
-  createAdminSession,
-  destroyAdminSession,
-  parseCookies,
-  renderLoginPageHtml,
-  renderAdminSettingsHtml
-} from './src/adminController.js';
+import { readEnvFile } from './src/envManager.js';
+import { handleAdminRoute } from './src/adminController.js';
 import { storageService } from './src/storageService.js';
 import { auditLogger } from './src/auditLogger.js';
 
@@ -33,16 +26,12 @@ import { auditLogger } from './src/auditLogger.js';
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
  */
 const rateLimitMap = new Map();
-const loginAttemptMap = new Map();
 
 // 주기적 메모리 청소 (5분 간격)
 setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of rateLimitMap.entries()) {
     if (now > data.resetTime) rateLimitMap.delete(ip);
-  }
-  for (const [ip, data] of loginAttemptMap.entries()) {
-    if (now > data.resetTime) loginAttemptMap.delete(ip);
   }
 }, 5 * 60 * 1000);
 
@@ -84,58 +73,6 @@ function checkRateLimit(req, maxRequests = 120) {
   }
 
   return true;
-}
-
-/**
- * 🔒 [관리자 로그인 전용 브루트포스 차단] 1분 내 5회 실패 시 15분간 차단
- * @param {string} ip 
- * @returns {{ allowed: boolean, remainingAttempts: number, waitMinutes?: number }}
- */
-function checkLoginRateLimit(ip) {
-  const now = Date.now();
-  const record = loginAttemptMap.get(ip);
-
-  if (!record) return { allowed: true, remainingAttempts: 5 };
-
-  if (record.blockedUntil && now < record.blockedUntil) {
-    const waitMinutes = Math.ceil((record.blockedUntil - now) / (60 * 1000));
-    return { allowed: false, remainingAttempts: 0, waitMinutes };
-  }
-
-  if (now > record.resetTime) {
-    loginAttemptMap.delete(ip);
-    return { allowed: true, remainingAttempts: 5 };
-  }
-
-  if (record.failCount >= 5) {
-    record.blockedUntil = now + (15 * 60 * 1000); // 15분 차단
-    return { allowed: false, remainingAttempts: 0, waitMinutes: 15 };
-  }
-
-  return { allowed: true, remainingAttempts: 5 - record.failCount };
-}
-
-/**
- * 관리자 로그인 실패 횟수 기록
- * @param {string} ip 
- */
-function recordLoginFailure(ip) {
-  const now = Date.now();
-  let record = loginAttemptMap.get(ip);
-  if (!record || now > record.resetTime) {
-    record = { failCount: 1, resetTime: now + (60 * 1000), blockedUntil: 0 };
-  } else {
-    record.failCount += 1;
-  }
-  loginAttemptMap.set(ip, record);
-}
-
-/**
- * 관리자 로그인 성공 시 실패 기록 초기화
- * @param {string} ip 
- */
-function clearLoginFailure(ip) {
-  loginAttemptMap.delete(ip);
 }
 
 /**
@@ -357,233 +294,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 2. 관리자 인증 & 대시보드 라우트 (src/adminController 위임)
+  // 2. 🌟 관리자 인증 & 대시보드 라우트 (src/adminController로 100% 위임)
   // =========================================================================
-  if (req.method === 'POST' && pathname === '/admin/login') {
-    const loginGuard = checkLoginRateLimit(clientIp);
-    if (!loginGuard.allowed) {
-      console.warn(`⛔ [Login Lock] 무차별 대입 방어로 IP ${clientIp} 차단 중 (${loginGuard.waitMinutes}분 남음)`);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 시도', target: '차단 잠금', status: 429 });
-      const html = renderLoginPageHtml(`로그인 시도 횟수가 초과되었습니다. ${loginGuard.waitMinutes}분 후에 다시 시도해 주세요.`, false);
-      res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
-
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const inputPass = params.get('password')?.trim() || '';
-      const env = readEnvFile();
-      const currentPass = env.ADMIN_PASSWORD;
-
-      if (!currentPass || currentPass.trim() === '') {
-        if (!inputPass) {
-          const html = renderLoginPageHtml('비밀번호를 입력해 주세요.', true);
-          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(html);
-          return;
-        }
-
-        writeEnvFile({ ADMIN_PASSWORD: inputPass });
-        console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
-        clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200 });
-
-        const sessionToken = createAdminSession();
-        res.writeHead(302, {
-          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
-          'Location': '/admin'
-        });
-        res.end();
-        return;
-      }
-
-      if (inputPass === currentPass) {
-        clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200 });
-        const sessionToken = createAdminSession();
-        res.writeHead(302, {
-          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
-          'Location': '/admin'
-        });
-        res.end();
-      } else {
-        recordLoginFailure(clientIp);
-        const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
-        console.warn(`⚠️ [Login Failed] 관리자 비밀번호 불일치 (IP: ${clientIp}, 잔여 시도: ${Math.max(0, remaining)}회)`);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401 });
-        const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'GET' && pathname === '/admin/logout') {
-    const cookies = parseCookies(req);
-    destroyAdminSession(cookies['admin_session']);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그아웃', target: '세션 파기', status: 200 });
-    res.writeHead(302, {
-      'Set-Cookie': 'admin_session=; Path=/; HttpOnly; Max-Age=0',
-      'Location': '/admin'
-    });
-    res.end();
-    return;
-  }
-
-  if (req.method === 'GET' && (pathname === '/admin' || pathname === '/settings')) {
-    const env = readEnvFile();
-    const isInitialSetup = !env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.trim() === '';
-
-    if (!isAuthenticated(req)) {
-      const html = renderLoginPageHtml(null, isInitialSetup);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
-
-    const html = renderAdminSettingsHtml(req);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
-    return;
-  }
-
-  // 🔬 [관리자 전용] 크래시 리포트 다운로드 라우트
-  if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
-    if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
-      return;
-    }
-
-    const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/download/', ''));
-    const info = storageService.getCrashReportPath(fileName);
-    if (!info) {
-      return sendJsonResponse(req, res, 404, { error: '크래시 리포트 파일을 찾을 수 없습니다.' });
-    }
-
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 다운로드', target: fileName, status: 200 });
-    setCorsHeaders(req, res);
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Content-Length': info.size,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`
-    });
-    const readStream = fs.createReadStream(info.filePath);
-    readStream.pipe(res);
-    return;
-  }
-
-  // 🔬 [관리자 전용] 크래시 리포트 단일 삭제 라우트
-  if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/delete/')) {
-    if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
-      return;
-    }
-
-    const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/delete/', ''));
-    storageService.deleteCrashReport(fileName);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 삭제', target: fileName, status: 200 });
-    res.writeHead(302, { Location: '/admin' });
-    res.end();
-    return;
-  }
-
-  // 🔬 [관리자 전용] 크래시 리포트 전체 비우기 라우트
-  if (req.method === 'GET' && pathname === '/admin/crash-reports/clear') {
-    if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
-      return;
-    }
-
-    storageService.clearAllCrashReports();
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 전체 삭제', target: 'all', status: 200 });
-    res.writeHead(302, { Location: '/admin' });
-    res.end();
-    return;
-  }
-
-  // 🛠️ [환경변수 전체 파싱 및 저장] POST /admin/save
-  if (req.method === 'POST' && pathname === '/admin/save') {
-    if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
-      return;
-    }
-
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const params = new URLSearchParams(body);
-        const updates = {};
-
-        // 🌟 [추가 1] 네트워크 및 파일 경로 4대 기본 설정
-        const port = params.get('PORT')?.trim();
-        if (port) updates.PORT = port;
-
-        const host = params.get('HOST')?.trim();
-        if (host) updates.HOST = host;
-
-        const tokenFile = params.get('TOKEN_FILE')?.trim();
-        if (tokenFile) updates.TOKEN_FILE = tokenFile;
-
-        const readerUrl = params.get('READER_URL')?.trim();
-        if (readerUrl) updates.READER_URL = readerUrl;
-
-        // 🌟 [기존 6대 설정]
-        const isStorageMode = params.get('STORAGE_MODE') === 'true';
-        updates.STORAGE_MODE = isStorageMode ? 'true' : 'false';
-
-        const clientId = params.get('GOOGLE_CLIENT_ID')?.trim();
-        if (clientId) updates.GOOGLE_CLIENT_ID = clientId;
-
-        const clientSecret = params.get('GOOGLE_CLIENT_SECRET')?.trim();
-        if (clientSecret) updates.GOOGLE_CLIENT_SECRET = clientSecret;
-
-        const redirectUri = params.get('GOOGLE_REDIRECT_URI')?.trim();
-        if (redirectUri) updates.GOOGLE_REDIRECT_URI = redirectUri;
-
-        const encKey = params.get('TOKEN_ENCRYPTION_KEY')?.trim();
-        if (encKey) updates.TOKEN_ENCRYPTION_KEY = encKey;
-
-        const origin = params.get('ALLOWED_ORIGIN')?.trim();
-        if (origin) updates.ALLOWED_ORIGIN = origin;
-
-        const newAdminPassword = params.get('NEW_ADMIN_PASSWORD')?.trim();
-        if (newAdminPassword) {
-          updates.ADMIN_PASSWORD = newAdminPassword;
-          console.log('🔒 [Admin] 관리자 비밀번호가 갱신되었습니다.');
-        }
-
-        writeEnvFile(updates);
-
-        if (isStorageMode) {
-          ensureStorageDirectories();
-        }
-
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200 });
-
-        const successMsg = isStorageMode
-          ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 활성화되었습니다.'
-          : '설정이 성공적으로 저장되었습니다. (인증 프록시 모드)';
-
-        const html = renderAdminSettingsHtml(req, successMsg);
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-      } catch (err) {
-        console.error('[Admin Save Error]', err);
-        const html = renderAdminSettingsHtml(req, null, '설정 저장 오류: ' + err.message);
-        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-      }
-    });
-    return;
+  if (pathname.startsWith('/admin') || pathname === '/settings') {
+    const handled = await handleAdminRoute(req, res, pathname, clientIp, userAgent);
+    if (handled) return;
   }
 
   // =========================================================================
