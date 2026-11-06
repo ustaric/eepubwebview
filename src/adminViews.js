@@ -2,10 +2,11 @@
  * @file src/adminViews.js
  * @description 관리자 제어 센터 순수 HTML/CSS/JS 화면 템플릿 전담 뷰 렌더러 모듈 (View)
  * - 🔒 [구글 계정 연동 본인 확인 게이트 탑재] renderAuthGateHtml 제공으로 타인의 구글 계정 덮어쓰기 원천 차단
+ * - 📁 [간이 파일 탐색기 모달 탑재] 최상위 루트부터 자유롭게 폴더를 탐색하고 읽기 권한을 실측 검증하는 팝업 UI 완비
+ * - 📚 [공유 도서 라이브러리(SHARED_BOOKS_DIR) 설정 필드] 웹뷰에 도서를 공유할 폴더 지정 UI 연동
  * - 🎨 [MVC 패턴 완전 분리] adminController.js로부터 거대 HTML 마크업을 독립 분리
- * - 📑 [상단 2단 탭 UI 탑재] '📊 관제 대시보드'와 '⚙️ 시스템 설정' 화면 템플릿 및 localStorage 상태 복원 스크립트 전담
+ * - 📑 [상단 2단 탭 UI 탑재] '📊 관제 대시보드'와 '⚙️ 시스템 설정' 화면 템플릿 및 상태 복원 스크립트 전담
  * - 💾 [실시간 현황 & 최근 로그 표출] auditLogger 연동 실시간 저장소 그리드 및 최근 30건 활동 로그 테이블 마크업
- * - 🛠️ [전 11대 환경변수 폼 렌더링] PORT, HOST, READER_URL, TOKEN_FILE 포함 1:1 완벽 배치
  */
 
 import { config } from '../config.js';
@@ -278,7 +279,7 @@ export function renderLoginPageHtml(errorMessage = null, isInitialSetup = false)
 }
 
 /**
- * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (상단 2단 탭 & 전 11대 환경변수 폼 탑재)
+ * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (상단 2단 탭 & 간이 폴더 탐색기 모달 탑재)
  * @param {import('http').IncomingMessage} req 
  * @param {string|null} [successMessage=null] 
  * @param {string|null} [errorMessage=null] 
@@ -288,6 +289,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const env = readEnvFile();
   const hasToken = hasRefreshToken();
   const isStorageMode = env.STORAGE_MODE === 'true';
+  const sharedBooksDir = env.SHARED_BOOKS_DIR || '';
 
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host || `${config.host}:${config.port}`;
@@ -306,6 +308,17 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const metrics = auditLogger.getStorageMetrics();
   const recentLogs = auditLogger.getRecentLogs();
   const crashReports = storageService.getCrashReportsList();
+
+  // 현재 공유 폴더 권한 상태 실측
+  let sharedDirBadge = '<span class="badge badge-warning">미설정</span>';
+  if (sharedBooksDir) {
+    const perm = storageService.testDirectoryPermissions(sharedBooksDir);
+    if (perm.readable) {
+      sharedDirBadge = '<span class="badge badge-success">읽기 가능 (정상)</span>';
+    } else {
+      sharedDirBadge = `<span class="badge badge-error" style="background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">접근 불가 (${perm.error || '권한 부족'})</span>`;
+    }
+  }
 
   let alertBanner = '';
   if (successMessage) {
@@ -678,6 +691,28 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       border-color: var(--primary);
     }
 
+    /* 🔍 폴더 선택기 입력 그룹 */
+    .input-btn-group {
+      display: flex;
+      gap: 8px;
+    }
+    .btn-browse {
+      background: #334155;
+      color: #38bdf8;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.2s;
+    }
+    .btn-browse:hover {
+      background: #475569;
+      color: white;
+    }
+
     .toggle-row {
       display: flex;
       align-items: center;
@@ -829,6 +864,153 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       margin-top: 10px;
     }
     .oauth-btn:hover { background: #64748b; }
+
+    /* =========================================================================
+       📁 간이 파일 탐색기 모달 팝업 스타일
+       ========================================================================= */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .modal-overlay.active {
+      display: flex;
+    }
+    .modal-box {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      width: 100%;
+      max-width: 540px;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      overflow: hidden;
+    }
+    .modal-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-header h3 {
+      margin: 0;
+      font-size: 16px;
+      color: #38bdf8;
+    }
+    .modal-close-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 20px;
+      cursor: pointer;
+    }
+    .modal-body {
+      padding: 16px 20px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .explorer-path-bar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      background: #0f172a;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      align-items: center;
+    }
+    .explorer-path-text {
+      flex: 1;
+      font-family: monospace;
+      font-size: 13px;
+      color: #38bdf8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .btn-up {
+      background: #334155;
+      color: var(--text);
+      border: none;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-up:hover { background: #475569; }
+    .folder-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-height: 280px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0f172a;
+      padding: 6px;
+    }
+    .folder-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    .folder-item:hover {
+      background: rgba(56, 189, 248, 0.12);
+      color: #38bdf8;
+    }
+    .folder-item.no-access {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .folder-name {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .modal-footer {
+      padding: 14px 20px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      background: #0b1120;
+    }
+    .btn-modal-cancel {
+      background: transparent;
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 16px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn-modal-select {
+      background: var(--primary);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-modal-select:hover { background: var(--primary-hover); }
   </style>
 </head>
 <body>
@@ -882,7 +1064,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
         </p>
       </div>
 
-      <!-- 2. 최근 20건 실시간 기기/IP 활동 로그 위젯 -->
+      <!-- 2. 최근 30건 실시간 기기/IP 활동 로그 위젯 -->
       <div class="card">
         <div class="section-title">
           <span>📋 최근 동기화 및 접근 활동 로그 (최근 30건 FIFO)</span>
@@ -908,7 +1090,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     </div>
 
     <!-- ================================================================= -->
-    <!-- ⚙️ [탭 2] 시스템 설정 (접속 정보 + 구글 연동 + 스토리지 토글 + 전 11대 .env 폼) -->
+    <!-- ⚙️ [탭 2] 시스템 설정 (접속 정보 + 공유 라이브러리 + 스토리지 토글 + 전 환경변수 폼) -->
     <!-- ================================================================= -->
     <div id="tab-content-settings" class="tab-content">
       <!-- 1. 주요 접속 정보 원클릭 복사 카드 -->
@@ -979,10 +1161,30 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
           </div>
         </div>
 
-        <!-- 4. 상세 환경변수 설정 (전 11대 항목 1:1 완비) -->
+        <!-- 4. 🌟 [신규] 공유 도서 라이브러리 폴더 지정 (간이 탐색기 연동) -->
         <div class="card">
           <div class="section-title">
-            <span>🛠️ 시스템 상세 설정 (.env 전 11대 항목)</span>
+            <span>📚 공유 도서 라이브러리 폴더 (SHARED_BOOKS_DIR)</span>
+            ${sharedDirBadge}
+          </div>
+          <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 12px 0;">
+            웹 뷰어 클라이언트가 바로 읽을 수 있는 오라클 서버 내의 실제 도서 폴더(.epub, .txt)를 지정합니다.<br>
+            [🔍 폴더 찾아보기]를 눌러 서버의 최상위 루트(/)부터 직접 탐색하여 선택할 수 있습니다.
+          </p>
+
+          <div class="form-group">
+            <label>공유 도서 폴더 절대 경로</label>
+            <div class="input-btn-group">
+              <input type="text" id="input-shared-books-dir" name="SHARED_BOOKS_DIR" value="${sharedBooksDir}" placeholder="/home/ubuntu/books 또는 /mnt/storage/books">
+              <button type="button" class="btn-browse" onclick="openFolderPicker()">🔍 폴더 찾아보기</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5. 상세 환경변수 설정 (전 항목 1:1 완비) -->
+        <div class="card">
+          <div class="section-title">
+            <span>🛠️ 시스템 상세 설정 (.env 환경변수)</span>
           </div>
 
           <!-- 포트 & 호스트 바인딩 -->
@@ -1046,6 +1248,32 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
   </div>
 
+  <!-- =========================================================================
+       📁 [신규] 간이 파일 탐색기 모달 다이얼로그 마크업
+       ========================================================================= -->
+  <div class="modal-overlay" id="folder-picker-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>📁 서버 도서 폴더 선택</h3>
+        <button type="button" class="modal-close-btn" onclick="closeFolderPicker()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="explorer-path-bar">
+          <button type="button" class="btn-up" id="btn-path-up" onclick="goUpDirectory()">⬆️ 상위</button>
+          <span class="explorer-path-text" id="explorer-current-path">/</span>
+        </div>
+        <div class="folder-list" id="explorer-folder-list">
+          <!-- 자바스크립트로 동적 렌더링 -->
+        </div>
+        <div id="explorer-status-msg" style="margin-top: 10px; font-size: 12px; min-height: 18px;"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn-modal-cancel" onclick="closeFolderPicker()">취소</button>
+        <button type="button" class="btn-modal-select" onclick="selectCurrentFolder()">✔ 현재 폴더로 지정</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     function switchAdminTab(tabName) {
       const isDashboard = tabName === 'dashboard';
@@ -1094,6 +1322,111 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
         btn.textContent = originalText;
         btn.classList.remove('copied');
       }, 1800);
+    }
+
+    // =========================================================================
+    // 📁 간이 파일 탐색기 모달 제어 및 권한 실측 스크립트
+    // =========================================================================
+    let currentNavPath = '/';
+    let currentParentPath = null;
+
+    function openFolderPicker() {
+      const inputVal = document.getElementById('input-shared-books-dir').value.trim();
+      const startPath = inputVal || '/home';
+      document.getElementById('folder-picker-modal').classList.add('active');
+      loadDirectoryTree(startPath);
+    }
+
+    function closeFolderPicker() {
+      document.getElementById('folder-picker-modal').classList.remove('active');
+    }
+
+    async function loadDirectoryTree(targetPath) {
+      const pathEl = document.getElementById('explorer-current-path');
+      const listEl = document.getElementById('explorer-folder-list');
+      const upBtn = document.getElementById('btn-path-up');
+      const msgEl = document.getElementById('explorer-status-msg');
+
+      pathEl.textContent = '조회 중...';
+      listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-muted);font-size:12px;">폴더 목록을 불러오는 중...</div>';
+      msgEl.textContent = '';
+
+      try {
+        const res = await fetch('/admin/fs-tree?path=' + encodeURIComponent(targetPath));
+        if (!res.ok) throw new Error('폴더 접근 실패 (HTTP ' + res.status + ')');
+        const data = await res.json();
+
+        currentNavPath = data.currentPath || '/';
+        currentParentPath = data.parentPath;
+        pathEl.textContent = currentNavPath;
+        upBtn.style.display = currentParentPath ? 'inline-block' : 'none';
+
+        if (!data.directories || data.directories.length === 0) {
+          listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-muted);font-size:12px;">하위 폴더가 없습니다.</div>';
+          return;
+        }
+
+        let html = '';
+        data.directories.forEach(d => {
+          const accessClass = d.readable ? '' : 'no-access';
+          const icon = d.readable ? '📁' : '🔒';
+          const badge = d.readable ? '' : '<span style="font-size:10px;color:var(--danger);margin-left:auto;">(권한 없음)</span>';
+
+          html += \`
+            <div class="folder-item \${accessClass}" onclick="handleFolderClick('\${d.path.replace(/\\\\/g, '/')}', \${d.readable})">
+              <span class="folder-name"><span>\${icon}</span> \${d.name}</span>
+              \${badge}
+            </div>
+          \`;
+        });
+        listEl.innerHTML = html;
+
+      } catch (err) {
+        pathEl.textContent = targetPath;
+        listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--danger);font-size:12px;">폴더를 읽을 수 없습니다: ' + err.message + '</div>';
+        if (targetPath !== '/') {
+          setTimeout(() => loadDirectoryTree('/'), 1200);
+        }
+      }
+    }
+
+    function handleFolderClick(folderPath, isReadable) {
+      if (!isReadable) {
+        const msgEl = document.getElementById('explorer-status-msg');
+        msgEl.innerHTML = '<span style="color:var(--danger);">⚠️ 이 폴더는 서버(Ubuntu) 읽기 권한이 없습니다.</span>';
+        return;
+      }
+      loadDirectoryTree(folderPath);
+    }
+
+    function goUpDirectory() {
+      if (currentParentPath) {
+        loadDirectoryTree(currentParentPath);
+      }
+    }
+
+    async function selectCurrentFolder() {
+      const msgEl = document.getElementById('explorer-status-msg');
+      msgEl.innerHTML = '<span style="color:#38bdf8;">🔄 서버 권한 실측 검증 중...</span>';
+
+      try {
+        const res = await fetch('/admin/test-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folderPath: currentNavPath })
+        });
+        const result = await res.json();
+
+        if (result.readable) {
+          document.getElementById('input-shared-books-dir').value = currentNavPath;
+          closeFolderPicker();
+          alert('✔ 폴더가 선택되었습니다: ' + currentNavPath + '\\n하단의 [💾 설정 저장]을 눌러 영구 반영해 주세요.');
+        } else {
+          msgEl.innerHTML = '<span style="color:var(--danger);">❌ 지정 불가: ' + (result.error || '읽기 권한이 없습니다.') + '</span>';
+        }
+      } catch (err) {
+        msgEl.innerHTML = '<span style="color:var(--danger);">❌ 검증 오류: ' + err.message + '</span>';
+      }
     }
   </script>
 </body>

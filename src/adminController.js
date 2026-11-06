@@ -1,10 +1,12 @@
 /**
  * @file src/adminController.js
- * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락 및 설정 저장 전담 컨트롤러 (Controller)
+ * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 공유 폴더 탐색 API 및 설정 저장 전담 컨트롤러 (Controller)
  * - 🎨 [MVC 패턴 완성] 거대 HTML 뷰 템플릿을 src/adminViews.js로 완전 분리하여 초경량 순수 컨트롤러로 슬림화
- * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 4줄 직통 위임 유지
+ * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 직통 위임 유지
+ * - 📁 [간이 파일 탐색기 API 탑재] GET /admin/fs-tree 제공으로 서버 최상위 루트부터 자유로운 디렉터리 브라우징 지원
+ * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 Node/PM2 프로세스의 읽기 권한 유무 즉각 검증
  * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 모듈 내 캡슐화
- * - 🛠️ [환경변수 전 11대 항목 영구 반영] PORT, HOST, READER_URL, TOKEN_FILE 파싱 및 .env 원자적 저장
+ * - 🛠️ [공유 도서 폴더(SHARED_BOOKS_DIR) 포함 전 환경변수 영구 반영] .env 파일 원자적 동기화
  */
 
 import fs from 'fs';
@@ -252,7 +254,54 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 4. 크래시 리포트 다운로드 (GET /admin/crash-reports/download/:fileName)
+  // =========================================================================
+  // 🔍 4. [신규] 관리자 간이 탐색기용 디렉터리 트리 조회 API (GET /admin/fs-tree)
+  // =========================================================================
+  if (req.method === 'GET' && pathname === '/admin/fs-tree') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'UNAUTHORIZED: 관리자 로그인이 필요합니다.' }));
+      return true;
+    }
+
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const targetPath = reqUrl.searchParams.get('path') || '/';
+
+    const treeData = storageService.getDirectoryTree(targetPath);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(treeData));
+    return true;
+  }
+
+  // =========================================================================
+  // 🛡️ 5. [신규] 폴더 권한 실측 검증 API (POST /admin/test-folder)
+  // =========================================================================
+  if (req.method === 'POST' && pathname === '/admin/test-folder') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const folderPath = payload.folderPath || '';
+        const testResult = storageService.testDirectoryPermissions(folderPath);
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(testResult));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return true;
+  }
+
+  // 6. 크래시 리포트 다운로드 (GET /admin/crash-reports/download/:fileName)
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -279,7 +328,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 5. 크래시 리포트 단일 삭제 (GET /admin/crash-reports/delete/:fileName)
+  // 7. 크래시 리포트 단일 삭제 (GET /admin/crash-reports/delete/:fileName)
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/delete/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -295,7 +344,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 6. 크래시 리포트 전체 비우기 (GET /admin/crash-reports/clear)
+  // 8. 크래시 리포트 전체 비우기 (GET /admin/crash-reports/clear)
   if (req.method === 'GET' && pathname === '/admin/crash-reports/clear') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -310,7 +359,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 7. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
+  // 9. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -339,6 +388,10 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
         const isStorageMode = params.get('STORAGE_MODE') === 'true';
         updates.STORAGE_MODE = isStorageMode ? 'true' : 'false';
+
+        // 🌟 [신규] 관리자 지정 공유 도서 폴더 경로 파싱 및 권한 실측 검증
+        const sharedBooksDir = params.get('SHARED_BOOKS_DIR')?.trim() || '';
+        updates.SHARED_BOOKS_DIR = sharedBooksDir;
 
         const clientId = params.get('GOOGLE_CLIENT_ID')?.trim();
         if (clientId) updates.GOOGLE_CLIENT_ID = clientId;
@@ -369,9 +422,13 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200 });
 
-        const successMsg = isStorageMode
+        let successMsg = isStorageMode
           ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 활성화되었습니다.'
           : '설정이 성공적으로 저장되었습니다. (인증 프록시 모드)';
+
+        if (sharedBooksDir) {
+          successMsg += ` [공유 서재: ${sharedBooksDir}]`;
+        }
 
         const html = renderAdminSettingsHtml(req, successMsg);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

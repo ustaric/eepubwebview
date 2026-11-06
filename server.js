@@ -3,6 +3,7 @@
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
  * - 🔒 [Google 로그인 비밀번호 관문 탑재] /auth/google 진입 시 관리자 비밀번호 검증으로 타인의 구글 계정 덮어쓰기 원천 차단
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
+ * - 📚 [공유 라이브러리 도서 목록 및 다운로드 API 완비] GET /api/storage/remote-library 및 download 엔드포인트 탑재
  * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
  * - 🚦 [지능형 Rate Limit] 스토리지 API 1분 120회 폭주 방어
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
@@ -291,6 +292,7 @@ const server = http.createServer(async (req, res) => {
       service: 'gdrive-refresh-server',
       hasToken: hasRefreshToken(),
       storageMode: env.STORAGE_MODE === 'true',
+      sharedBooksDir: env.SHARED_BOOKS_DIR || null,
       timestamp: new Date().toISOString()
     });
   }
@@ -353,6 +355,81 @@ const server = http.createServer(async (req, res) => {
         error: 'STORAGE_MODE_DISABLED: 개인 서버 저장소 모드가 비활성화되어 있습니다. 관리자 대시보드(/admin)에서 활성화해 주세요.'
       });
     }
+  }
+
+  // =========================================================================
+  // 📚 [신규 1] 공유 라이브러리 도서 목록 조회 (GET /api/storage/remote-library)
+  // =========================================================================
+  if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
+    const env = readEnvFile();
+    const sharedDir = env.SHARED_BOOKS_DIR;
+
+    if (!sharedDir || !fs.existsSync(sharedDir)) {
+      return sendJsonResponse(req, res, 404, {
+        ok: false,
+        error: 'SHARED_BOOKS_DIR_NOT_FOUND',
+        message: '공유 도서 폴더가 설정되지 않았거나 존재하지 않습니다. 관리자 페이지(/admin)에서 폴더를 지정해 주세요.'
+      });
+    }
+
+    const permCheck = storageService.testDirectoryPermissions(sharedDir);
+    if (!permCheck.readable) {
+      return sendJsonResponse(req, res, 403, {
+        ok: false,
+        error: 'PERMISSION_DENIED',
+        message: `공유 폴더 읽기 권한이 없습니다: ${permCheck.error || ''}`
+      });
+    }
+
+    const books = storageService.getRemoteBooks(sharedDir);
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📚 공유 서재 목록 조회', target: `${books.length}권`, status: 200 });
+    return sendJsonResponse(req, res, 200, {
+      ok: true,
+      sharedDir,
+      totalBooks: books.length,
+      books
+    });
+  }
+
+  // =========================================================================
+  // 📖 [신규 2] 공유 도서 원본 실시간 스트리밍 다운로드 (GET /api/storage/remote-library/download)
+  // =========================================================================
+  if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
+    const env = readEnvFile();
+    const sharedDir = env.SHARED_BOOKS_DIR;
+    const reqFile = reqUrl.searchParams.get('file');
+
+    if (!sharedDir || !reqFile) {
+      return sendJsonResponse(req, res, 400, { error: 'file 쿼리 파라미터가 누락되었습니다.' });
+    }
+
+    const fileInfo = storageService.getRemoteBookFilePath(sharedDir, reqFile);
+    if (!fileInfo) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: reqFile, status: 404 });
+      return sendJsonResponse(req, res, 404, { error: '도서 파일을 찾을 수 없거나 접근이 거부되었습니다.' });
+    }
+
+    const isTxt = fileInfo.fileName.toLowerCase().endsWith('.txt');
+    const contentType = isTxt ? 'text/plain; charset=utf-8' : 'application/epub+zip';
+
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: isTxt ? '📄 TXT 도서 스트리밍' : '📖 EPUB 도서 스트리밍',
+      target: fileInfo.fileName,
+      status: 200
+    });
+
+    setCorsHeaders(req, res);
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': fileInfo.size,
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(fileInfo.fileName)}"`
+    });
+
+    const readStream = fs.createReadStream(fileInfo.filePath);
+    readStream.pipe(res);
+    return;
   }
 
   // ⚡ [올인원 통합 스냅샷 단일 쿼리] GET /api/storage/snapshot
@@ -508,7 +585,7 @@ const server = http.createServer(async (req, res) => {
   // 4. 🌟 Google OAuth 인증 라우트 (비밀번호 게이트웨이 탑재로 타인 계정 덮어쓰기 원천 차단)
   // =========================================================================
 
-  // 1) [GET /auth/google] 로그인 시작 링크: 이미 로그인되어 있으면 바로 구글로 점프, 미인증 시 비밀번호 확인 게이트 렌더링
+  // 1) [GET /auth/google] 로그인 시작 링크
   if (req.method === 'GET' && pathname === '/auth/google') {
     if (isAuthenticated(req)) {
       try {
@@ -523,14 +600,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // 미인증 상태 시 본인 확인 게이트 폼 표출
     const html = renderAuthGateHtml();
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
     return;
   }
 
-  // 2) [POST /auth/google] 게이트웨이 비밀번호 제출: 일치 시 즉시 구글 계정 선택 화면으로 302 리디렉션 점프!
+  // 2) [POST /auth/google] 게이트웨이 비밀번호 제출
   if (req.method === 'POST' && pathname === '/auth/google') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
@@ -541,7 +617,6 @@ const server = http.createServer(async (req, res) => {
       const currentPass = env.ADMIN_PASSWORD;
 
       if (currentPass && inputPass === currentPass) {
-        // 비밀번호 일치: 관리자 세션 쿠키 발급 + 즉시 구글 계정 선택 화면으로 리디렉션 점프!
         const sessionToken = createAdminSession();
         try {
           const authUrl = generateAuthUrl();
@@ -556,7 +631,6 @@ const server = http.createServer(async (req, res) => {
           return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다.', false);
         }
       } else {
-        // 비밀번호 불일치: 접근 차단 및 에러 화면 표출
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 오류', target: '접근 차단', status: 401 });
         const html = renderAuthGateHtml('관리자 비밀번호가 올바르지 않습니다.');
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -604,7 +678,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 4) [GET /api/access-token] 평소 독서 중 백그라운드 자동 갱신 엔드포인트 (0초 자동 통과)
+  // 4) [GET /api/access-token] 평소 독서 중 백그라운드 자동 갱신 엔드포인트
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req, 60)) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 횟수 초과', target: '/api/access-token', status: 429 });
