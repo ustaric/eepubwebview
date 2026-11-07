@@ -3,10 +3,10 @@
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
- * - 🔤 [언더바(_) 통일 파일명 규격화] sanitizeFileName에서 공백(\s+)을 언더바(_)로 정규화하여 JSON/EPUB/표지 WebP 파일명 일관성 100% 확립
+ * - 🔤 [웹뷰 규격 100% 일치 파일명 표준화] sanitizeFileName에서 대괄호/소괄호를 안전 보존하고 공백(\s+)을 언더바(_)로 치환하여 웹뷰와 1:1 완벽 일치
  * - 🧹 [고아 표지 서버 메타데이터 자동 자가 소독] getUnifiedSnapshot 실행 시 디스크에 실물 파일이 없는 낡은 cloudCoverFileName을 서버 디스크 JSON에서 영구 소독하여 클라이언트 404 원천 차단
  * - ✨ [서버 스마트 표지 대체 폴백] getCoverImagePath에서 요청된 해시 표지가 없더라도 같은 도서의 실물 WebP 표지가 디스크에 존재하면 200 OK로 자동 매칭 반환
- * - 🛡️ [공백/언더바/유니코드 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 공백/언더바 폴백을 탑재하여 404 원천 박멸
+ * - 🛡️ [공백/언더바/유니코드/구버전 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 구버전 파일명 폴백을 탑재하여 404 원천 박멸
  * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
  * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
  * - 🔍 [서버 디렉터리 탐색 및 권한 실측] getDirectoryTree & testDirectoryPermissions 탑재로 관리자 간이 탐색기 완벽 지원
@@ -28,42 +28,54 @@ const ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
 const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
 
 /**
- * 🛡️ [경로 소독 및 언더바(_) 정규화 헬퍼]
- * Path Traversal 공격을 방어하면서, 파일명 내 모든 공백(\s+)을 언더바(_)로 치환하여 JSON/EPUB/표지 파일명을 통일합니다.
+ * 🛡️ [경로 소독 및 언더바(_) 웹뷰 규격 일치화 헬퍼]
+ * OS 파일시스템 금지 문자(< > : " / \ | ? *) 및 Path Traversal을 방어하면서,
+ * 대괄호([]) 및 소괄호(())를 보존하고 공백(\s+)만 언더바(_)로 치환하여 웹뷰 규격과 100% 일치시킵니다.
  * @param {string} rawName 
- * @returns {string} 소독 및 언더바 처리된 파일명
+ * @returns {string} 소독 및 언더바 처리된 표준 파일명
  */
 function sanitizeFileName(rawName = '') {
   if (!rawName || typeof rawName !== 'string') return '';
-  // 🌟 공백(\s+)을 언더바(_)로 변환하고 특수문자를 언더바로 치환하여 언더바 기반 표준 파일명 확립!
   return path.basename(rawName)
     .replace(/\s+/g, '_')
-    .replace(/[^a-zA-Z0-9가-힣._-]/g, '_')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
     .trim();
 }
 
 /**
- * 🎯 [공백 & 언더바 & 유니코드 6대 후보 생성기] 파일명 엇갈림 및 리눅스 NFD 자모 분리 404를 박멸하기 위해 교차 후보 반환
+ * 🎯 [지능형 다중 후보 생성기]
+ * 1. 신규 웹뷰 표준 규격 (대괄호 유지 + 공백만 언더바)
+ * 2. 원본 공백 규격
+ * 3. 과거 서버 구버전 규격 (대괄호가 _ 로 치환되어 남아있던 찌꺼기 파일 하위 호환)
+ * 4. Linux NFD / NFC 자모 분리 방어 후보
  * @param {string} baseName 
- * @returns {Array<string>} [원본, 언더바본, 공백본, NFC본, NFD본]
+ * @returns {Array<string>} 교차 탐색용 파일명 후보군
  */
 function generateFilenameCandidates(baseName = '') {
   if (!baseName) return [];
-  const sanitized = sanitizeFileName(baseName);
-  const withUnderscores = sanitized.replace(/\s+/g, '_');
+  const rawBase = baseName.trim();
+  const sanitized = sanitizeFileName(rawBase);
   const withSpaces = sanitized.replace(/_+/g, ' ');
+
+  // 🌟 과거 서버가 대괄호/특수문자를 전부 언더바로 치환했던 구버전 실물 파일 하위 호환 탐색 후보
+  const legacySanitized = path.basename(rawBase)
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9가-힣._-]/g, '_')
+    .trim();
 
   const set = new Set([
     sanitized,
-    withUnderscores,
+    rawBase,
     withSpaces,
-    baseName,
+    legacySanitized,
     sanitized.normalize('NFC'),
     sanitized.normalize('NFD'),
-    withUnderscores.normalize('NFC'),
-    withUnderscores.normalize('NFD'),
+    rawBase.normalize('NFC'),
+    rawBase.normalize('NFD'),
     withSpaces.normalize('NFC'),
-    withSpaces.normalize('NFD')
+    withSpaces.normalize('NFD'),
+    legacySanitized.normalize('NFC'),
+    legacySanitized.normalize('NFD')
   ]);
   return Array.from(set).filter(Boolean);
 }
@@ -463,17 +475,19 @@ export const storageService = {
       });
     });
 
-    return true;
+    return deleted;
   },
 
   /**
-   * 도서 완전 삭제 (메타, EPUB, 표지 파일 일괄 파쇄)
+   * 🗑️ 도서 완전 삭제 (메타데이터 JSON, EPUB 본문, 모든 WebP 표지 일괄 영구 파쇄)
    * @param {string} bookId 
-   * @returns {number}
+   * @returns {number} 실제 삭제된 파일 총 개수
    */
   deleteBookAll(bookId) {
     if (!bookId) return 0;
-    const candidates = generateFilenameCandidates(bookId);
+    // 확장자(.json/.epub)가 혹시 붙어있다면 순수 bookId로 정규화
+    const cleanId = String(bookId).replace(/\.(json|epub)$/i, '');
+    const candidates = generateFilenameCandidates(cleanId);
     let deletedCount = 0;
 
     [BOOKS_DIR, ARCHIVE_DIR].forEach((dir) => {
@@ -487,12 +501,15 @@ export const storageService = {
           try {
             fs.unlinkSync(path.join(dir, f));
             deletedCount++;
-            console.log(`🗑️ [StorageService] 파일 삭제 완료: '${f}'`);
-          } catch (e) {}
+            console.log(`🗑️ [StorageService] 파일 삭제 완료: '${f}' (폴더: ${path.basename(dir)})`);
+          } catch (e) {
+            console.warn(`⚠️ [StorageService] 파일 삭제 실패 ('${f}'):`, e.message);
+          }
         }
       });
     });
 
+    console.log(`🏁 [StorageService:DeleteAll] 도서('${cleanId}') 일괄 삭제 완료: 총 ${deletedCount}개 실물 파일 파쇄`);
     return deletedCount;
   },
 
