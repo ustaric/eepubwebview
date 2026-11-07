@@ -3,6 +3,8 @@
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
+ * - 🧹 [고아 표지 서버 메타데이터 자동 자가 소독] getUnifiedSnapshot 실행 시 디스크에 실물 파일이 없는 낡은 cloudCoverFileName을 서버 디스크 JSON에서 영구 소독하여 클라이언트 404 원천 차단
+ * - ✨ [서버 스마트 표지 대체 폴백] getCoverImagePath에서 요청된 해시 표지가 없더라도 같은 도서의 실물 WebP 표지가 디스크에 존재하면 200 OK로 자동 매칭 반환
  * - 🛡️ [공백/언더바/유니코드 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 공백/언더바 폴백을 탑재하여 404 원천 박멸
  * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
  * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName(공백 보존) 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
@@ -121,7 +123,7 @@ function writeJsonSafely(filePath, data) {
 
 export const storageService = {
   // =========================================================================
-  // ⚡ 1. 올인원 통합 스냅샷 수집 엔진 (fetchUnifiedSnapshot 호환 규격)
+  // ⚡ 1. 올인원 통합 스냅샷 수집 및 고아 표지 자가 소독 엔진
   // =========================================================================
   async getUnifiedSnapshot() {
     ensureDir(BOOKS_DIR);
@@ -139,9 +141,47 @@ export const storageService = {
     const bookFiles = fs.readdirSync(BOOKS_DIR);
     for (const file of bookFiles) {
       if (file.endsWith('.json')) {
-        const bookMeta = readJsonSafely(path.join(BOOKS_DIR, file));
+        const fullJsonPath = path.join(BOOKS_DIR, file);
+        const bookMeta = readJsonSafely(fullJsonPath);
         if (bookMeta && bookMeta.bookId) {
           bookMeta.isArchived = false;
+
+          // 🌟 [핵심 자가 소독] cloudCoverFileName이 지정되어 있는데 실제 디스크에 실물 표지 파일이 존재하는지 검증!
+          if (bookMeta.cloudCoverFileName) {
+            const coverCheck = this.getCoverImagePath(bookMeta.cloudCoverFileName);
+            if (!coverCheck) {
+              // 디스크에 실물 파일이 없는 고아 표지 감지 ➔ 실물 대체 표지 탐색
+              const candidates = generateFilenameCandidates(bookMeta.bookId);
+              let foundCoverName = null;
+
+              for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+                if (!fs.existsSync(dir)) continue;
+                try {
+                  const dirFiles = fs.readdirSync(dir);
+                  const matched = dirFiles.find(f => f.endsWith('.webp') && candidates.some(cand => f.startsWith(`${cand}.cover_`)));
+                  if (matched) {
+                    foundCoverName = matched;
+                    break;
+                  }
+                } catch (e) {}
+              }
+
+              if (foundCoverName) {
+                // 대체 실물 표지가 있으면 메타데이터를 실물 파일명으로 자동 연결
+                console.log(`✨ [StorageService:SelfHeal] 도서('${bookMeta.bookId}') 실물 표지('${foundCoverName}') 자동 연결 완료!`);
+                bookMeta.cloudCoverFileName = foundCoverName;
+                writeJsonSafely(fullJsonPath, bookMeta);
+              } else {
+                // 디스크에 실물 표지가 아예 없는 도서 ➔ 고아 파일명 태그 완전 소독!
+                console.warn(`🧹 [StorageService:Sanitize] 도서('${bookMeta.bookId}') 표지 실물 부재 ➔ 서버 메타데이터 JSON 완전 소독 완료`);
+                bookMeta.cloudCoverFileName = "";
+                bookMeta.coverHash = "";
+                bookMeta.covers = [];
+                writeJsonSafely(fullJsonPath, bookMeta);
+              }
+            }
+          }
+
           cloudBooks.push(bookMeta);
         }
       }
@@ -151,10 +191,23 @@ export const storageService = {
     const archiveFiles = fs.readdirSync(ARCHIVE_DIR);
     for (const file of archiveFiles) {
       if (file.endsWith('.json')) {
-        const archivedMeta = readJsonSafely(path.join(ARCHIVE_DIR, file));
+        const fullJsonPath = path.join(ARCHIVE_DIR, file);
+        const archivedMeta = readJsonSafely(fullJsonPath);
         if (archivedMeta && archivedMeta.bookId) {
           archivedMeta.isArchived = true;
           archivedMeta.archiveStatus = 'archived';
+
+          // 보관 도서도 고아 표지 실측 및 자동 소독
+          if (archivedMeta.cloudCoverFileName) {
+            const coverCheck = this.getCoverImagePath(archivedMeta.cloudCoverFileName);
+            if (!coverCheck) {
+              archivedMeta.cloudCoverFileName = "";
+              archivedMeta.coverHash = "";
+              archivedMeta.covers = [];
+              writeJsonSafely(fullJsonPath, archivedMeta);
+            }
+          }
+
           cloudArchivedBooks.push(archivedMeta);
         }
       }
@@ -324,7 +377,9 @@ export const storageService = {
   },
 
   /**
-   * 🎯 [핵심 교정] 표지 이미지 파일 경로 반환 (NFC/NFD 유니코드 및 공백/언더바 교차 탐색 ➔ 404 박멸)
+   * 🎯 [핵심 교정 & 스마트 대체 폴백] 표지 이미지 파일 경로 반환
+   * 1. 요청된 파일명(NFC/NFD/공백/언더바 6대 후보)을 1차 탐색합니다.
+   * 2. 요청된 특정 해시 파일이 없더라도, 해당 도서의 다른 실물 표지(*.cover_*.webp)가 디스크에 존재하면 실물 표지를 자동 반환하여 404를 원천 차단합니다.
    * @param {string} fileName 
    * @returns {{ filePath: string, size: number } | null}
    */
@@ -332,6 +387,7 @@ export const storageService = {
     if (!fileName) return null;
     const candidates = generateFilenameCandidates(fileName);
 
+    // 1차: 요청된 파일명 완전 일치 탐색
     for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
       if (!fs.existsSync(dir)) continue;
 
@@ -345,6 +401,33 @@ export const storageService = {
             }
           } catch (e) {}
         }
+      }
+    }
+
+    // 🌟 2차 스마트 폴백: 요청된 특정 해시 파일이 없더라도, 해당 도서(bookId)의 다른 실물 표지가 존재하면 자동 매칭 반환!
+    const coverMatch = fileName.match(/^(.*?)\.cover_[a-zA-Z0-9_-]+\.webp$/);
+    if (coverMatch) {
+      const bookPrefix = coverMatch[1];
+      const prefixCandidates = generateFilenameCandidates(bookPrefix);
+
+      for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+        if (!fs.existsSync(dir)) continue;
+        try {
+          const files = fs.readdirSync(dir);
+          const fallbackFile = files.find(f => 
+            f.endsWith('.webp') && 
+            prefixCandidates.some(cand => f.startsWith(`${cand}.cover_`))
+          );
+
+          if (fallbackFile) {
+            const fallbackPath = path.join(dir, fallbackFile);
+            const stat = fs.statSync(fallbackPath);
+            if (stat.isFile()) {
+              console.log(`✨ [StorageService:CoverFallback] 요청된 표지('${fileName}') 부재 ➔ 대체 실물 표지('${fallbackFile}') 200 OK 매칭 성공!`);
+              return { filePath: fallbackPath, size: stat.size };
+            }
+          }
+        } catch (e) {}
       }
     }
 
