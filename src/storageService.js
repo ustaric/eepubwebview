@@ -3,11 +3,12 @@
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
+ * - 🔤 [언더바(_) 통일 파일명 규격화] sanitizeFileName에서 공백(\s+)을 언더바(_)로 정규화하여 JSON/EPUB/표지 WebP 파일명 일관성 100% 확립
  * - 🧹 [고아 표지 서버 메타데이터 자동 자가 소독] getUnifiedSnapshot 실행 시 디스크에 실물 파일이 없는 낡은 cloudCoverFileName을 서버 디스크 JSON에서 영구 소독하여 클라이언트 404 원천 차단
  * - ✨ [서버 스마트 표지 대체 폴백] getCoverImagePath에서 요청된 해시 표지가 없더라도 같은 도서의 실물 WebP 표지가 디스크에 존재하면 200 OK로 자동 매칭 반환
  * - 🛡️ [공백/언더바/유니코드 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 공백/언더바 폴백을 탑재하여 404 원천 박멸
  * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
- * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName(공백 보존) 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
+ * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
  * - 🔍 [서버 디렉터리 탐색 및 권한 실측] getDirectoryTree & testDirectoryPermissions 탑재로 관리자 간이 탐색기 완벽 지원
  * - 📚 [공유 폴더 도서 스캔] getRemoteBooks 탑재로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집 및 스트리밍 경로 반환
  * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
@@ -27,14 +28,18 @@ const ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
 const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
 
 /**
- * 🛡️ [경로 소독 헬퍼] Path Traversal 공격을 방어하면서 한글과 공백(\s)을 온전히 보존
+ * 🛡️ [경로 소독 및 언더바(_) 정규화 헬퍼]
+ * Path Traversal 공격을 방어하면서, 파일명 내 모든 공백(\s+)을 언더바(_)로 치환하여 JSON/EPUB/표지 파일명을 통일합니다.
  * @param {string} rawName 
- * @returns {string} 소독된 파일명
+ * @returns {string} 소독 및 언더바 처리된 파일명
  */
 function sanitizeFileName(rawName = '') {
   if (!rawName || typeof rawName !== 'string') return '';
-  // 🌟 한글, 영문, 숫자, 마침표, 언더바, 하이픈 및 '공백(\s)'을 정상 보존!
-  return path.basename(rawName).replace(/[^a-zA-Z0-9가-힣._\s-]/g, '_').trim();
+  // 🌟 공백(\s+)을 언더바(_)로 변환하고 특수문자를 언더바로 치환하여 언더바 기반 표준 파일명 확립!
+  return path.basename(rawName)
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9가-힣._-]/g, '_')
+    .trim();
 }
 
 /**
@@ -308,7 +313,7 @@ export const storageService = {
   },
 
   /**
-   * EPUB 원본 파일 바이너리 저장
+   * EPUB 원본 파일 바이너리 저장 (언더바 파일명 규격 적용)
    * @param {string} bookId 
    * @param {Buffer} buffer 
    * @returns {boolean}
@@ -325,7 +330,7 @@ export const storageService = {
   },
 
   /**
-   * 🎯 [핵심 교정 및 정밀 진단] EPUB 원본 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
+   * 🎯 EPUB 원본 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
    * @param {string} bookId 
    * @returns {{ filePath: string, size: number } | null}
    */
@@ -360,7 +365,7 @@ export const storageService = {
   },
 
   /**
-   * 표지 이미지 바이너리 저장
+   * 표지 이미지 바이너리 저장 (언더바 파일명 규격 적용)
    * @param {string} fileName 
    * @param {Buffer} buffer 
    * @returns {boolean}
@@ -768,29 +773,29 @@ export const storageService = {
     const ext = path.extname(rawFileName).toLowerCase();
     const isTxt = ext === '.txt';
 
-    // 🌟 [핵심] 중복 크기 및 이중 확장자 방어: 순수 파일명_실제바이트
+    // 🌟 [핵심] 언더바(_) 표준 규격 적용: 순수 파일명_실제바이트
     const fileName = `${cleanBaseName}${ext}`;
-    const bookId = `${fileName}_${stat.size}`;
+    const safeBookId = sanitizeFileName(`${fileName}_${stat.size}`);
     const cleanTitle = cleanBaseName;
     const nowIso = new Date().toISOString();
 
     ensureDir(BOOKS_DIR);
 
-    // 1. 공백 보존 파일명으로 실물 파일 직접 복사
-    const targetEpubPath = path.join(BOOKS_DIR, `${bookId}.epub`);
+    // 1. 언더바 보존 표준 파일명으로 실물 파일 직접 복사
+    const targetEpubPath = path.join(BOOKS_DIR, `${safeBookId}.epub`);
     fs.copyFileSync(safeSourcePath, targetEpubPath);
 
-    console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료:`, {
+    console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료 (언더바 규격):`, {
       originalSource: safeSourcePath,
       targetDestination: targetEpubPath,
       existsOnDisk: fs.existsSync(targetEpubPath),
       savedSizeBytes: stat.size,
-      bookId: bookId
+      bookId: safeBookId
     });
 
     // 2. 정규 도서 메타데이터 JSON 생성 및 저장
     const bookData = {
-      bookId,
+      bookId: safeBookId,
       title: cleanTitle,
       fileName,
       totalCharacters: 0,
@@ -806,12 +811,12 @@ export const storageService = {
       lastModified: nowIso
     };
 
-    this.saveBookMetadata(bookId, bookData);
-    console.log(`📖 [StorageService:Import] 정규 도서 메타데이터 자동 각인 완료: '${bookId}.json'`);
+    this.saveBookMetadata(safeBookId, bookData);
+    console.log(`📖 [StorageService:Import] 정규 도서 메타데이터 자동 각인 완료: '${safeBookId}.json'`);
 
     return {
       ok: true,
-      bookId,
+      bookId: safeBookId,
       bookData,
       size: stat.size,
       fileName
