@@ -1,8 +1,9 @@
 /**
  * @file src/auditLogger.js
- * @description 개인 서버 활동 링 버퍼(RAM) 및 년/월/일 디스크 영구 저장/아카이빙 전담 모듈
- * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관
- * - 📁 [년/월/일 계층형 디스크 저장] ./data/logs/YYYY/MM/DD/audit-YYYY-MM-DD.jsonl 실시간 누적
+ * @description 개인 서버 활동 링 버퍼(RAM) 및 년/월/일 보안 침입/실패 전용 디스크 영구 저장 엔진
+ * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
+ * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
+ * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
  * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
  * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
  * - 💾 [디스크/도서 메트릭 집계] books/, archive/, logs/ 실측 용량 및 권수 60초 캐싱 연산
@@ -155,11 +156,13 @@ function appendLogToDailyFile(entry) {
 
 export const auditLogger = {
   /**
-   * 새로운 서버 접근 및 동기화 활동 1건을 RAM 및 년/월/일 디스크에 실시간 기록
+   * 새로운 서버 접근 및 동기화 활동 1건을 기록
+   * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)
+   * - 디스크: status >= 400 (외부 침입 차단, 비번 오류, 내부 실패)만 선별 영구 저장
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
-   * @param {string} params.action - 동작 설명 (예: "스냅샷 조회", "도서 보관")
+   * @param {string} params.action - 동작 설명 (예: "비인가 출처 차단", "EPUB 다운로드")
    * @param {string} [params.target="-"] - 파일명 또는 도서 식별자
    * @param {number} [params.status=200] - 응답 상태 코드
    */
@@ -171,6 +174,7 @@ export const auditLogger = {
     // 🛡️ [로그 소독] 민감정보 실시간 마스킹
     const sanitizedAction = maskSensitiveLog(action || '요청');
     const sanitizedTarget = maskSensitiveLog(target || '-');
+    const statusCode = Number(status) || 200;
 
     const entry = {
       id: 'log_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
@@ -180,17 +184,21 @@ export const auditLogger = {
       device: parseDeviceLabel(userAgent),
       action: sanitizedAction,
       target: sanitizedTarget,
-      status: Number(status) || 200
+      status: statusCode
     };
 
-    // 1. RAM 링 버퍼에 기록 (최대 30건 FIFO)
+    // 1. RAM 링 버퍼에 기록 (최대 30건 FIFO: 정상 200 포함 실시간 현황 관제)
     if (accessLogBuffer.length >= MAX_LOGS_LIMIT) {
       accessLogBuffer.shift();
     }
     accessLogBuffer.push(entry);
 
-    // 2. 📁 년/월/일 디스크 파일에 실시간 안전 영구 저장
-    appendLogToDailyFile(entry);
+    // 2. 📁 [핵심 개선] 디스크 영구 저장은 오직 '외부 침입/차단' 및 '내부 실패'(status >= 400)만 선별 저장!
+    // 정상적인 책 읽기, 표지 로딩, 정상 로그인(200, 302)은 디스크에 저장하지 않아 파일 오염을 원천 방지
+    const isSecurityIncidentOrFailure = statusCode >= 400;
+    if (isSecurityIncidentOrFailure) {
+      appendLogToDailyFile(entry);
+    }
   },
 
   /**
@@ -202,8 +210,8 @@ export const auditLogger = {
   },
 
   /**
-   * 📁 [아카이브 목록 조회] ./data/logs/ 내에 저장된 모든 일자별 로그 파일 목록 반환
-   * @returns {Array<{ date: string, relativePath: string, sizeBytes: number, sizeKb: string, linesCount: number }>}
+   * 📁 [아카이브 목록 조회] ./data/logs/ 내에 저장된 모든 일자별 침입/장애 로그 파일 목록 반환
+   * @returns {Array<{ date: string, fileName: string, relativePath: string, sizeBytes: number, sizeKb: string, linesCount: number }>}
    */
   getLogFilesList() {
     if (!fs.existsSync(LOGS_DIR)) return [];
@@ -249,9 +257,9 @@ export const auditLogger = {
   },
 
   /**
-   * 📥 [로그 다운로드용 정형화] 특정 상대 경로의 .jsonl 파일을 파싱하여 완전한 JSON 배열 문자열로 반환
+   * 📥 [로그 다운로드용 정형화] 특정 상대 경로의 침입/실패 .jsonl 파일을 파싱하여 완전한 JSON 배열 문자열로 반환
    * @param {string} relativePath - LOGS_DIR 기준 상대 경로 (예: "2025/05/18/audit-2025-05-18.jsonl")
-   * @returns {string|null} 포맷팅된 JSON 문자열 (예쁘게 인덴트된 JSON 배열)
+   * @returns {string|null} 포맷팅된 JSON 문자열
    */
   getFormattedLogContent(relativePath) {
     if (!relativePath || !fs.existsSync(LOGS_DIR)) return null;
