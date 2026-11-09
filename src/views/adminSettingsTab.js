@@ -1,7 +1,7 @@
 /**
  * @file src/views/adminSettingsTab.js
  * @description 관리자 제어 센터 [탭 2: ⚙️ 시스템 설정] HTML 렌더러 모듈
- * - 🔑 [스토리지 API 보안 키 카드] STORAGE_API_KEY 생성/복사 및 ENFORCE_STORAGE_API_KEY 엄격 모드 토글 탑재
+ * - 🔑 [스토리지 API 보안 키 & 실시간 연동 기기 관제] STORAGE_API_KEY 생성/복사, 엄격 모드 토글 및 최근 사용 기기 실시간 표출
  * - 📋 [주요 접속 정보 복사] GitHub 저장소, 서버 주소, OAuth 리디렉션 URI 원클릭 복사 카드
  * - 🔑 [Google OAuth 연동] 토큰 보유 상태 표출 및 로그인 링크
  * - 📁 [스토리지 모드 토글] 개인 서버 자체 저장소 모드 On/Off 스위치
@@ -9,8 +9,25 @@
  * - 🛠️ [시스템 상세 설정 폼] PORT, HOST, CORS, 구글 인증키, 관리자 비밀번호 변경 등 14대 환경변수 폼
  */
 
+import { auditLogger } from '../auditLogger.js';
+
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
+
+/**
+ * HTML 특수문자 이스케이프 헬퍼 (XSS 방어)
+ * @param {string} str 
+ * @returns {string}
+ */
+function escapeHtml(str = '') {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 /**
  * ⚙️ [탭 2] 시스템 설정 HTML 템플릿 렌더러
@@ -45,12 +62,60 @@ export function renderSettingsTab({
   const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
   const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
 
+  // 🔑 최근 API 키 사용 기기 정보 조회
+  const lastApiKeyUsage = auditLogger.getLastApiKeyUsage();
+
   // API 키 상태 배지
   let apiKeyStatusBadge = '<span class="badge badge-warning">미설정 (출처 검증만 사용)</span>';
   if (storageApiKey && isEnforceApiKey) {
     apiKeyStatusBadge = '<span class="badge badge-success">🛡️ 엄격 키 검증 활성</span>';
   } else if (storageApiKey) {
     apiKeyStatusBadge = '<span class="badge badge-info">🔑 키 등록됨 (호환 모드)</span>';
+  }
+
+  // 📱 [실시간 연동 현황 박스 HTML]
+  let apiKeyUsageHtml = '';
+  if (!storageApiKey) {
+    apiKeyUsageHtml = `
+      <div style="margin-top: 14px; padding: 12px 14px; background: #0f172a; border: 1px solid var(--border); border-radius: 10px;">
+        <div style="font-size: 12px; color: var(--text-muted);">
+          ⚪ API 키가 아직 설정되지 않았습니다. [🎲 새 키 생성] 후 하단의 [💾 설정 저장]을 눌러주세요.
+        </div>
+      </div>
+    `;
+  } else if (lastApiKeyUsage) {
+    apiKeyUsageHtml = `
+      <div style="margin-top: 14px; padding: 12px 14px; background: #0f172a; border: 1px solid #1e3a5f; border-radius: 10px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+          <span style="font-size: 12px; font-weight: 600; color: #38bdf8; display: flex; align-items: center; gap: 6px;">
+            <span>📱</span> 최근 API 키 연동 기기
+          </span>
+          <span style="font-size: 11px; color: #10b981; font-weight: 600;">
+            🟢 ${escapeHtml(lastApiKeyUsage.timestamp)} (${escapeHtml(lastApiKeyUsage.date)})
+          </span>
+        </div>
+        <div style="font-size: 13.5px; font-weight: 700; color: #f8fafc; margin-bottom: 4px;">
+          ${escapeHtml(lastApiKeyUsage.device)} <span style="font-size: 12px; font-weight: normal; color: var(--text-muted); font-family: monospace;">(${escapeHtml(lastApiKeyUsage.ip)})</span>
+        </div>
+        <div style="font-size: 11.5px; color: var(--text-muted); font-family: monospace;">
+          최근 요청: <span style="color: #a78bfa; font-weight: 600;">${escapeHtml(lastApiKeyUsage.method)}</span> ${escapeHtml(lastApiKeyUsage.path)}
+        </div>
+      </div>
+    `;
+  } else {
+    apiKeyUsageHtml = `
+      <div style="margin-top: 14px; padding: 12px 14px; background: #0f172a; border: 1px solid var(--border); border-radius: 10px;">
+        <div style="display: flex; align-items: center; justify-content: space-between;">
+          <span style="font-size: 12px; font-weight: 600; color: var(--text-muted); display: flex; align-items: center; gap: 6px;">
+            <span>📱</span> 최근 API 키 연동 기기
+          </span>
+          <span style="font-size: 11px; color: var(--text-muted);">연동 대기 중</span>
+        </div>
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+          ⚪ 아직 이 API 키를 사용해 서버에 접근한 기기 이력이 없습니다. (웹 뷰어에서 동기화 발생 시 자동 갱신)
+        </div>
+      </div>
+    `;
   }
 
   return `
@@ -122,7 +187,7 @@ export function renderSettingsTab({
         </div>
       </div>
 
-      <!-- 4. 🔑 [신규] 스토리지 전용 API 보안 키 및 엄격 검증 모드 -->
+      <!-- 4. 🔑 스토리지 전용 API 보안 키 및 엄격 검증 모드 (실시간 연동 기기 관제 탑재) -->
       <div class="card">
         <div class="section-title">
           <span>🔑 스토리지 API 보안 키 (STORAGE_API_KEY)</span>
@@ -155,6 +220,9 @@ export function renderSettingsTab({
             <span class="slider"></span>
           </label>
         </div>
+
+        <!-- 📱 [신규] 최근 API 키 연동 기기 현황 관제 박스 -->
+        ${apiKeyUsageHtml}
       </div>
 
       <!-- 5. 공유 도서 라이브러리 폴더 지정 (간이 탐색기 연동) -->

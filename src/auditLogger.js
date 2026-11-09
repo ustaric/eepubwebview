@@ -1,6 +1,7 @@
 /**
  * @file src/auditLogger.js
  * @description 개인 서버 활동 링 버퍼(RAM) 및 년/월/일 보안 침입/실패 전용 디스크 영구 저장 엔진
+ * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
  * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
  * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
@@ -40,10 +41,24 @@ const MAX_LOGS_LIMIT = 30;
  */
 
 /**
+ * @typedef {Object} ApiKeyUsageInfo
+ * @property {string} timestamp - 접근 시각 (HH:mm:ss)
+ * @property {string} date - 접근 일자 (YYYY-MM-DD)
+ * @property {string} fullTime - 전체 일시 (YYYY-MM-DD HH:mm:ss)
+ * @property {string} ip - 접속 IP
+ * @property {string} device - 정규화된 안전 기기 명칭
+ * @property {string} path - 접근한 스토리지 엔드포인트
+ * @property {string} method - HTTP 메서드 (GET, POST 등)
+ */
+
+/**
  * 링 버퍼 메모리 로그 저장소
  * @type {Array<AccessLogEntry>}
  */
 const accessLogBuffer = [];
+
+// 🔑 최근 스토리지 API 키 사용 현황 메모리 홀더 (0KB 부하 방어)
+let lastApiKeyUsage = null;
 
 // 디스크 용량 캐시 홀더 (60초 TTL)
 let cachedStorageMetrics = null;
@@ -155,6 +170,38 @@ function appendLogToDailyFile(entry) {
 }
 
 export const auditLogger = {
+  /**
+   * 🔑 [스토리지 API 키 사용 기록] 유효한 API 키로 인증에 성공한 요청 정보 실시간 기록
+   * @param {Object} params
+   * @param {string} params.ip - 접속 IP
+   * @param {string} [params.userAgent=""] - 요청 User-Agent
+   * @param {string} [params.path=""] - 요청 URL 경로
+   * @param {string} [params.method="GET"] - HTTP 메서드
+   */
+  recordApiKeyUsage({ ip, userAgent = "", path = "", method = "GET" }) {
+    const now = new Date();
+    const timeStr = now.toTimeString().split(' ')[0]; // HH:mm:ss
+    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+
+    lastApiKeyUsage = {
+      timestamp: timeStr,
+      date: dateStr,
+      fullTime: `${dateStr} ${timeStr}`,
+      ip: ip || '127.0.0.1',
+      device: parseDeviceLabel(userAgent),
+      path: path || '/api/storage/...',
+      method: method || 'GET'
+    };
+  },
+
+  /**
+   * 🔑 가장 최근에 API 키를 사용해 접속한 기기 정보 반환
+   * @returns {ApiKeyUsageInfo|null}
+   */
+  getLastApiKeyUsage() {
+    return lastApiKeyUsage;
+  },
+
   /**
    * 새로운 서버 접근 및 동기화 활동 1건을 기록
    * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)

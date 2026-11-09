@@ -1,7 +1,7 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
- * - 🔑 [지능형 이중 API 키 가드] STORAGE_API_KEY 검증 탑재 (헤더/쿼리 키 지원 + 엄격모드 선택형 가드)
+ * - 🔑 [지능형 이중 API 키 가드 & 사용 추적] STORAGE_API_KEY 검증 및 auditLogger.recordApiKeyUsage 연동
  * - 🛡️ [기존 뷰어 100% 무회귀] 엄격모드 비활성 시 기존 ALLOWED_ORIGIN 출처 검증으로 안전 호환
  * - 🛡️ [securityGuard 결속] nosniff, SAMEORIGIN 등 기본 HTTP 보안 응답 헤더 전역 자동 주입
  * - 🚦 [엔드포인트별 차등 바디 제한] EPUB 100MB / 표지 10MB / JSON 5MB 차등 제한으로 메모리 고갈 DoS 원천 방어
@@ -364,6 +364,15 @@ const server = http.createServer(async (req, res) => {
       const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const reportData = JSON.parse(buffer.toString('utf-8'));
       storageService.saveCrashReport(fileName, reportData);
+
+      // 🔑 크래시 리포트 전송 시 API 키 포함 여부 감지 기록
+      const env = readEnvFile();
+      const configuredApiKey = env.STORAGE_API_KEY?.trim();
+      const providedApiKey = extractApiKey(req, reqUrl);
+      if (configuredApiKey && providedApiKey === configuredApiKey) {
+        auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method });
+      }
+
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 수신', target: fileName, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, fileName, status: 'saved' });
     } catch (err) {
@@ -386,13 +395,20 @@ const server = http.createServer(async (req, res) => {
   if (pathname.startsWith('/api/storage/')) {
     const env = readEnvFile();
     const configuredApiKey = env.STORAGE_API_KEY?.trim();
-    const isEnforceMode = env.ENFORCE_STORAGE_API_KEY === 'true';
+    const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
     const providedApiKey = extractApiKey(req, reqUrl);
 
     // 1) 올바른 API 키가 전달된 경우: 출처 검증 프리패스 승인 (외부 스크립트, curl, 신규 뷰어)
     if (configuredApiKey && providedApiKey && providedApiKey === configuredApiKey) {
+      // 🔑 [신규] 유효한 API 키 인증 활동 실시간 기록 (기기명, IP, 시각, 엔드포인트)
+      auditLogger.recordApiKeyUsage({
+        ip: clientIp,
+        userAgent,
+        path: pathname,
+        method: req.method
+      });
       // API Key 인증 성공 ➔ 바로 통과
-    } else if (isEnforceMode && configuredApiKey) {
+    } else if (isEnforceApiKey && configuredApiKey) {
       // 2) 엄격 모드가 켜져 있는데 키가 없거나 일치하지 않는 경우: 401 차단
       console.warn(`⛔ [ApiKey Blocked] 유효하지 않거나 누락된 API 키 (IP: ${clientIp}, Path: ${pathname})`);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'API 키 인증 실패 차단', target: pathname, status: 401 });
