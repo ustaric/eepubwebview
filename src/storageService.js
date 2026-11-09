@@ -1,6 +1,7 @@
 /**
  * @file src/storageService.js
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
+ * - 🛡️ [securityGuard 결속] fs.realpathSync 기반 심볼릭 링크 탈출 차단 및 확장자 화이트리스트 실측 검증
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
  * - 🔤 [웹뷰 규격 100% 일치 파일명 표준화] sanitizeFileName에서 대괄호/소괄호를 안전 보존하고 공백(\s+)을 언더바(_)로 치환하여 웹뷰와 1:1 완벽 일치
@@ -8,7 +9,6 @@
  * - ✨ [서버 스마트 표지 대체 폴백] getCoverImagePath에서 요청된 해시 표지가 없더라도 같은 도서의 실물 WebP 표지가 디스크에 존재하면 200 OK로 자동 매칭 반환
  * - 🛡️ [공백/언더바/유니코드/구버전 6대 지능형 교차 탐색] getBookEpubPath, getCoverImagePath에 NFC/NFD 유니코드 및 구버전 파일명 폴백을 탑재하여 404 원천 박멸
  * - 🖼️ [단일 표지 안전 삭제] deleteCoverImage 탑재로 웹 뷰어의 표지 변경/삭제(DELETE /api/storage/covers/:fileName) 완벽 지원
- * - 🛡️ [경로 소독 및 Path Traversal 방어] sanitizeFileName 및 resolveSafeRelativePath 기반 디렉터리 이탈 공격 원천 차단
  * - 🔍 [서버 디렉터리 탐색 및 권한 실측] getDirectoryTree & testDirectoryPermissions 탑재로 관리자 간이 탐색기 완벽 지원
  * - 📚 [공유 폴더 도서 스캔] getRemoteBooks 탑재로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집 및 스트리밍 경로 반환
  * - ⚡ [올인원 통합 스냅샷 단일 쿼리] fetchUnifiedSnapshot 규격 100% 호환 데이터 수집 엔진
@@ -17,6 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { validateSafePath, isAllowedBookFile } from './securityGuard.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -81,21 +82,20 @@ function generateFilenameCandidates(baseName = '') {
 }
 
 /**
- * 🛡️ [상대 경로 안전 검증 헬퍼] 공유 폴더 내부 상대 경로가 루트를 벗어나지 못하도록 검증
+ * 🛡️ [상대 경로 안전 검증 헬퍼 - securityGuard 연동 실측]
+ * 공유 폴더 내부 상대 경로가 심볼릭 링크나 상위 탐색을 통해 루트를 벗어나지 못하도록 실물 realpath 검증
  * @param {string} baseDir 
  * @param {string} relativePath 
- * @returns {string|null} 유효한 절대 경로 또는 null
+ * @returns {string|null} 유효한 절대 실물 경로 또는 null
  */
 function resolveSafeRelativePath(baseDir, relativePath = '') {
   if (!baseDir || !relativePath) return null;
-  const resolvedBase = path.resolve(baseDir);
-  const resolvedTarget = path.resolve(resolvedBase, relativePath);
-
-  // 대상 경로가 반드시 baseDir 하위여야 함 (Path Traversal 차단)
-  if (!resolvedTarget.startsWith(resolvedBase)) {
+  const guardResult = validateSafePath(baseDir, relativePath);
+  if (!guardResult.safe) {
+    console.warn(`⛔ [SecurityGuard Blocked] 경로 이탈 또는 심볼릭 링크 탈출 차단: '${relativePath}' (사유: ${guardResult.reason})`);
     return null;
   }
-  return resolvedTarget;
+  return guardResult.realPath;
 }
 
 /**
@@ -265,6 +265,12 @@ export const storageService = {
     const targetFile = path.join(targetDir, `${safeId}.json`);
     const oppositeFile = path.join(oppositeDir, `${safeId}.json`);
 
+    // 🛡️ 쓰기 대상 경로의 안전성 검증
+    const pathCheck = validateSafePath(targetDir, `${safeId}.json`);
+    if (!pathCheck.safe) {
+      throw new Error(`안전하지 않은 메타데이터 경로: ${pathCheck.reason}`);
+    }
+
     // 1. 반대쪽 폴더에 있던 기존 메타데이터(.json) 정리
     if (fs.existsSync(oppositeFile)) {
       try {
@@ -336,6 +342,13 @@ export const storageService = {
 
     ensureDir(BOOKS_DIR);
     const targetFile = path.join(BOOKS_DIR, `${safeId}.epub`);
+
+    // 🛡️ 물리 경로 탈출 방어
+    const pathCheck = validateSafePath(BOOKS_DIR, `${safeId}.epub`);
+    if (!pathCheck.safe) {
+      throw new Error(`안전하지 않은 EPUB 저장 경로: ${pathCheck.reason}`);
+    }
+
     fs.writeFileSync(targetFile, buffer);
     console.log(`📦 [StorageService] EPUB 바이너리 저장 완료: '${safeId}.epub' (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
     return true;
@@ -364,6 +377,10 @@ export const storageService = {
 
         if (exists) {
           try {
+            // 🛡️ 심볼릭 링크 탈출 실측 검증
+            const pathCheck = validateSafePath(dir, `${cand}.epub`);
+            if (!pathCheck.safe) continue;
+
             const stat = fs.statSync(filePath);
             if (stat.isFile()) {
               return { filePath, size: stat.size };
@@ -388,6 +405,13 @@ export const storageService = {
 
     ensureDir(BOOKS_DIR);
     const targetFile = path.join(BOOKS_DIR, safeName);
+
+    // 🛡️ 물리 경로 탈출 방어
+    const pathCheck = validateSafePath(BOOKS_DIR, safeName);
+    if (!pathCheck.safe) {
+      throw new Error(`안전하지 않은 표지 저장 경로: ${pathCheck.reason}`);
+    }
+
     fs.writeFileSync(targetFile, buffer);
     console.log(`🖼️ [StorageService] 표지 저장 완료: '${safeName}' (${(buffer.length / 1024).toFixed(1)} KB)`);
     return true;
@@ -412,6 +436,9 @@ export const storageService = {
         const filePath = path.join(dir, cand);
         if (fs.existsSync(filePath)) {
           try {
+            const pathCheck = validateSafePath(dir, cand);
+            if (!pathCheck.safe) continue;
+
             const stat = fs.statSync(filePath);
             if (stat.isFile()) {
               return { filePath, size: stat.size };
@@ -438,6 +465,9 @@ export const storageService = {
 
           if (fallbackFile) {
             const fallbackPath = path.join(dir, fallbackFile);
+            const pathCheck = validateSafePath(dir, fallbackFile);
+            if (!pathCheck.safe) continue;
+
             const stat = fs.statSync(fallbackPath);
             if (stat.isFile()) {
               console.log(`✨ [StorageService:CoverFallback] 요청된 표지('${fileName}') 부재 ➔ 대체 실물 표지('${fallbackFile}') 200 OK 매칭 성공!`);
@@ -467,9 +497,12 @@ export const storageService = {
         const targetFile = path.join(dir, cand);
         if (fs.existsSync(targetFile)) {
           try {
-            fs.unlinkSync(targetFile);
-            deleted = true;
-            console.log(`🗑️ [StorageService] 단일 표지 파일 삭제 완료: '${cand}'`);
+            const pathCheck = validateSafePath(dir, cand);
+            if (pathCheck.safe) {
+              fs.unlinkSync(targetFile);
+              deleted = true;
+              console.log(`🗑️ [StorageService] 단일 표지 파일 삭제 완료: '${cand}'`);
+            }
           } catch (e) {}
         }
       });
@@ -499,9 +532,12 @@ export const storageService = {
         );
         if (isMatch) {
           try {
-            fs.unlinkSync(path.join(dir, f));
-            deletedCount++;
-            console.log(`🗑️ [StorageService] 파일 삭제 완료: '${f}' (폴더: ${path.basename(dir)})`);
+            const pathCheck = validateSafePath(dir, f);
+            if (pathCheck.safe) {
+              fs.unlinkSync(path.join(dir, f));
+              deletedCount++;
+              console.log(`🗑️ [StorageService] 파일 삭제 완료: '${f}' (폴더: ${path.basename(dir)})`);
+            }
           } catch (e) {
             console.warn(`⚠️ [StorageService] 파일 삭제 실패 ('${f}'):`, e.message);
           }
@@ -522,6 +558,12 @@ export const storageService = {
 
     ensureDir(SETTINGS_DIR);
     const targetFile = path.join(SETTINGS_DIR, safeName);
+
+    const pathCheck = validateSafePath(SETTINGS_DIR, safeName);
+    if (!pathCheck.safe) {
+      throw new Error(`안전하지 않은 설정 경로: ${pathCheck.reason}`);
+    }
+
     writeJsonSafely(targetFile, data);
     console.log(`⚙️ [StorageService] 설정 파일 저장 완료: '${safeName}'`);
     return true;
@@ -530,6 +572,9 @@ export const storageService = {
   getSettingsFile(fileName) {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) return null;
+
+    const pathCheck = validateSafePath(SETTINGS_DIR, safeName);
+    if (!pathCheck.safe) return null;
 
     const targetFile = path.join(SETTINGS_DIR, safeName);
     return readJsonSafely(targetFile);
@@ -544,6 +589,12 @@ export const storageService = {
 
     ensureDir(CRASH_REPORTS_DIR);
     const targetFile = path.join(CRASH_REPORTS_DIR, safeName);
+
+    const pathCheck = validateSafePath(CRASH_REPORTS_DIR, safeName);
+    if (!pathCheck.safe) {
+      throw new Error(`안전하지 않은 크래시 리포트 경로: ${pathCheck.reason}`);
+    }
+
     writeJsonSafely(targetFile, data);
     console.log(`🔬 [StorageService] 크래시 리포트 저장 완료: '${safeName}'`);
     return true;
@@ -580,6 +631,9 @@ export const storageService = {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) return null;
 
+    const pathCheck = validateSafePath(CRASH_REPORTS_DIR, safeName);
+    if (!pathCheck.safe) return null;
+
     const fullPath = path.join(CRASH_REPORTS_DIR, safeName);
     if (fs.existsSync(fullPath)) {
       const stat = fs.statSync(fullPath);
@@ -591,6 +645,9 @@ export const storageService = {
   deleteCrashReport(fileName) {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) return false;
+
+    const pathCheck = validateSafePath(CRASH_REPORTS_DIR, safeName);
+    if (!pathCheck.safe) return false;
 
     const fullPath = path.join(CRASH_REPORTS_DIR, safeName);
     if (fs.existsSync(fullPath)) {
@@ -716,21 +773,24 @@ export const storageService = {
           if (entry.isDirectory()) {
             scanRecursively(fullPath, currentDepth + 1);
           } else if (entry.isFile()) {
-            const ext = path.extname(entry.name).toLowerCase();
-            if (ext === '.epub' || ext === '.txt') {
-              try {
-                const stat = fs.statSync(fullPath);
-                const relPath = path.relative(sharedDir, fullPath).replace(/\\/g, '/');
+            // 🛡️ 도서 확장자 화이트리스트 검사
+            if (isAllowedBookFile(entry.name)) {
+              const ext = path.extname(entry.name).toLowerCase();
+              if (ext === '.epub' || ext === '.txt') {
+                try {
+                  const stat = fs.statSync(fullPath);
+                  const relPath = path.relative(sharedDir, fullPath).replace(/\\/g, '/');
 
-                books.push({
-                  fileName: entry.name,
-                  relativePath: relPath,
-                  extension: ext.replace('.', ''),
-                  sizeBytes: stat.size,
-                  sizeMb: (stat.size / (1024 * 1024)).toFixed(2) + ' MB',
-                  mtime: stat.mtime.toISOString()
-                });
-              } catch (statErr) {}
+                  books.push({
+                    fileName: entry.name,
+                    relativePath: relPath,
+                    extension: ext.replace('.', ''),
+                    sizeBytes: stat.size,
+                    sizeMb: (stat.size / (1024 * 1024)).toFixed(2) + ' MB',
+                    mtime: stat.mtime.toISOString()
+                  });
+                } catch (statErr) {}
+              }
             }
           }
         }
@@ -748,6 +808,13 @@ export const storageService = {
   getRemoteBookFilePath(sharedDir, relativeFilePath) {
     if (!sharedDir || !relativeFilePath) return null;
 
+    // 🛡️ 도서 확장자 사전 검증 (임의 시스템 파일 스트리밍 차단)
+    if (!isAllowedBookFile(relativeFilePath)) {
+      console.warn(`⛔ [SecurityGuard Blocked] 허용되지 않은 파일 확장자 요청: '${relativeFilePath}'`);
+      return null;
+    }
+
+    // 🛡️ 심볼릭 링크 및 Path Traversal 실측 검증
     const safeFullPath = resolveSafeRelativePath(sharedDir, relativeFilePath);
     if (!safeFullPath || !fs.existsSync(safeFullPath)) {
       return null;
@@ -775,9 +842,15 @@ export const storageService = {
   importRemoteBookToLibrary(sharedDir, relativeFilePath) {
     if (!sharedDir || !relativeFilePath) return null;
 
+    // 🛡️ 도서 확장자 검증
+    if (!isAllowedBookFile(relativeFilePath)) {
+      throw new Error('허용되지 않은 도서 파일 형식입니다 (.epub, .txt 만 가능).');
+    }
+
+    // 🛡️ 심볼릭 링크 및 Path Traversal 실측 검증
     const safeSourcePath = resolveSafeRelativePath(sharedDir, relativeFilePath);
     if (!safeSourcePath || !fs.existsSync(safeSourcePath)) {
-      throw new Error('원본 도서 파일을 찾을 수 없거나 경로가 잘못되었습니다.');
+      throw new Error('원본 도서 파일을 찾을 수 없거나 보안 검증에 실패했습니다.');
     }
 
     const stat = fs.statSync(safeSourcePath);
@@ -800,6 +873,13 @@ export const storageService = {
 
     // 1. 언더바 보존 표준 파일명으로 실물 파일 직접 복사
     const targetEpubPath = path.join(BOOKS_DIR, `${safeBookId}.epub`);
+
+    // 🛡️ 대상 저장 경로 경계 실측
+    const pathCheck = validateSafePath(BOOKS_DIR, `${safeBookId}.epub`);
+    if (!pathCheck.safe) {
+      throw new Error(`복사 대상 경로 보안 오류: ${pathCheck.reason}`);
+    }
+
     fs.copyFileSync(safeSourcePath, targetEpubPath);
 
     console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료 (언더바 규격):`, {

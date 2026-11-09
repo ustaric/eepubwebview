@@ -1,6 +1,9 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
+ * - 🛡️ [securityGuard 결속] nosniff, SAMEORIGIN 등 기본 HTTP 보안 응답 헤더 전역 자동 주입
+ * - 🚦 [엔드포인트별 차등 바디 제한] EPUB 100MB / 표지 10MB / JSON 5MB 차등 제한으로 메모리 고갈 DoS 원천 방어
+ * - 🚫 [비인가 HTTP 메서드 차단] GET, HEAD, POST, DELETE, OPTIONS 외 변칙 메서드 405 차단
  * - 🔒 [Google 로그인 비밀번호 관문 탑재] /auth/google 진입 시 관리자 비밀번호 검증으로 타인의 구글 계정 덮어쓰기 원천 차단
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
  * - ⚡ [서버 내부 도서 직통 복사 API 완비] POST /api/storage/remote-library/import 제공으로 2중 트래픽 원천 차단
@@ -26,6 +29,10 @@ import { handleAdminRoute, isAuthenticated, createAdminSession } from './src/adm
 import { renderAuthGateHtml } from './src/adminViews.js';
 import { storageService } from './src/storageService.js';
 import { auditLogger } from './src/auditLogger.js';
+import { injectSecurityHeaders } from './src/securityGuard.js';
+
+// 허용된 정규 HTTP 메서드 목록
+const ALLOWED_HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS']);
 
 /**
  * 🛡️ [Rate Limiting] 메모리 기반 IP별 요청 제한 저장소
@@ -119,11 +126,13 @@ function isAllowedClientOrigin(req) {
 }
 
 /**
- * CORS 응답 헤더 세팅
+ * CORS 응답 헤더 세팅 및 보안 헤더 자동 주입
  * @param {http.IncomingMessage} req 
  * @param {http.ServerResponse} res 
  */
 function setCorsHeaders(req, res) {
+  injectSecurityHeaders(res);
+
   const requestOrigin = req.headers.origin;
   const env = readEnvFile();
   const configuredOrigin = env.ALLOWED_ORIGIN || config.security.allowedOrigin;
@@ -239,12 +248,12 @@ function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true
 }
 
 /**
- * HTTP 요청 Body 버퍼 수신 헬퍼 (최대 100MB 안전 제한)
+ * HTTP 요청 Body 버퍼 수신 헬퍼 (엔드포인트별 차등 제한 지원)
  * @param {http.IncomingMessage} req 
- * @param {number} [maxBytes=104857600] 100MB
+ * @param {number} [maxBytes=5242880] 기본값 5MB
  * @returns {Promise<Buffer>}
  */
-function readRequestBodyBuffer(req, maxBytes = 104857600) {
+function readRequestBodyBuffer(req, maxBytes = 5242880) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let received = 0;
@@ -253,7 +262,7 @@ function readRequestBodyBuffer(req, maxBytes = 104857600) {
       received += chunk.length;
       if (received > maxBytes) {
         req.destroy();
-        reject(new Error(`요청 크기가 한도(${maxBytes / 1024 / 1024}MB)를 초과했습니다.`));
+        reject(new Error(`요청 크기가 한도(${(maxBytes / 1024 / 1024).toFixed(1)}MB)를 초과했습니다.`));
       } else {
         chunks.push(chunk);
       }
@@ -268,6 +277,16 @@ function readRequestBodyBuffer(req, maxBytes = 104857600) {
  * HTTP 요청 Router
  */
 const server = http.createServer(async (req, res) => {
+  // 🛡️ 기본 보안 응답 헤더 주입
+  injectSecurityHeaders(res);
+
+  // 🛡️ 비인가 HTTP 메서드 원천 차단
+  if (!ALLOWED_HTTP_METHODS.has(req.method)) {
+    res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: `METHOD_NOT_ALLOWED: 지원하지 않는 HTTP 메서드입니다 (${req.method})` }));
+    return;
+  }
+
   if (req.method === 'OPTIONS') {
     setCorsHeaders(req, res);
     res.writeHead(204);
@@ -311,11 +330,11 @@ const server = http.createServer(async (req, res) => {
   // 3. 🌟 자체 스토리지 모드 REST API 엔드포인트 (src/storageService 위임)
   // =========================================================================
 
-  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (항상 수신 보장)
+  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (5MB 제한)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const reportData = JSON.parse(buffer.toString('utf-8'));
       storageService.saveCrashReport(fileName, reportData);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 수신', target: fileName, status: 200 });
@@ -360,7 +379,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // ⚡ [신규] 공유 도서 서버 내부 0초 직통 복사 및 정식 등록 (POST /api/storage/remote-library/import)
+  // ⚡ [신규] 공유 도서 서버 내부 0초 직통 복사 및 정식 등록 (POST /api/storage/remote-library/import) (5MB 제한)
   // =========================================================================
   if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
     const env = readEnvFile();
@@ -375,7 +394,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const payload = JSON.parse(buffer.toString('utf-8') || '{}');
       const relativePath = payload.relativePath;
 
@@ -496,11 +515,11 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 📖 [도서 메타데이터 JSON 저장] POST /api/storage/books/:id
+  // 📖 [도서 메타데이터 JSON 저장] POST /api/storage/books/:id (5MB 제한)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const bookData = JSON.parse(buffer.toString('utf-8'));
       storageService.saveBookMetadata(bookId, bookData);
       const actionName = bookData.isArchived ? '📁 도서 보관 처리' : '📖 도서 메타 저장';
@@ -524,11 +543,11 @@ const server = http.createServer(async (req, res) => {
     return sendJsonResponse(req, res, 200, meta);
   }
 
-  // 📦 [EPUB 바이너리 파일 업로드] POST /api/storage/books/:id/epub
+  // 📦 [EPUB 바이너리 파일 업로드] POST /api/storage/books/:id/epub (대용량 100MB 보장)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 100 * 1024 * 1024);
       storageService.saveBookEpub(bookId, buffer);
       const sizeMb = (buffer.length / 1024 / 1024).toFixed(1);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📦 EPUB 업로드', target: `${bookId} (${sizeMb}MB)`, status: 200 });
@@ -572,11 +591,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🖼️ [표지 이미지 업로드] POST /api/storage/covers/:fileName
+  // 🖼️ [표지 이미지 업로드] POST /api/storage/covers/:fileName (10MB 제한)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 10 * 1024 * 1024);
       storageService.saveCoverImage(fileName, buffer);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 업로드', target: fileName, status: 200 });
       return sendJsonResponse(req, res, 200, { ok: true, fileName });
@@ -587,7 +606,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 🖼️ [표지 이미지 다운로드 및 선조회] GET / HEAD /api/storage/covers/:fileName
-  // 🌟 [핵심 개선] HEAD 메서드를 정식 수용하여 브라우저의 표지 존재 확인 시 200 OK 헤더 즉시 응답
   if ((req.method === 'GET' || req.method === 'HEAD') && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     const info = storageService.getCoverImagePath(fileName);
@@ -602,7 +620,6 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'public, max-age=86400'
     });
 
-    // 🌟 HEAD 요청인 경우 바디 스트림 없이 헤더만 전송하고 즉시 종료!
     if (req.method === 'HEAD') {
       res.end();
       return;
@@ -629,11 +646,11 @@ const server = http.createServer(async (req, res) => {
     return sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
   }
 
-  // ⚙️ [설정/통계/업적/묘비 JSON 저장] POST /api/storage/settings/:fileName
+  // ⚙️ [설정/통계/업적/묘비 JSON 저장] POST /api/storage/settings/:fileName (5MB 제한)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/settings/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
     try {
-      const buffer = await readRequestBodyBuffer(req);
+      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const data = JSON.parse(buffer.toString('utf-8'));
       storageService.saveSettingsFile(fileName, data);
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '⚙️ 시스템 데이터 동기화', target: fileName, status: 200 });
