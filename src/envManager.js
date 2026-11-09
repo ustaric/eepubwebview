@@ -1,9 +1,10 @@
 /**
  * @file src/envManager.js
- * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports) 생성 전담 모듈
- * - 🛡️ [환경변수 무누락 보존] PORT, HOST, READER_URL, TOKEN_FILE, SHARED_BOOKS_DIR을 포함한 전 12대 환경변수 영구 보존
+ * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports, logs) 생성 전담 모듈
+ * - 🛡️ [환경변수 무누락 보존] STORAGE_API_KEY, ENFORCE_STORAGE_API_KEY를 포함한 전 14대 환경변수 영구 보존
+ * - 🔑 [스토리지 API 보안 키 지원] 서버 전용 비밀키 및 엄격 검증 모드 플래그 영구 동기화
  * - 📁 [공유 도서 라이브러리 지원] SHARED_BOOKS_DIR 경로를 .env에 무손실 저장
- * - 📁 [저장소 디렉터리 세팅] ./data/books, ./data/settings, ./data/archive, ./data/crash-reports 0o755 권한 자동 생성
+ * - 📁 [저장소 디렉터리 세팅] ./data/books, ./data/settings, ./data/archive, ./data/crash-reports, ./data/logs 0o755 권한 자동 생성
  */
 
 import fs from 'fs';
@@ -39,7 +40,7 @@ export function readEnvFile() {
 }
 
 /**
- * 📁 .env 파일 안전 덮어쓰기 헬퍼 (SHARED_BOOKS_DIR 포함 전 12대 항목 무손실 보존)
+ * 📁 .env 파일 안전 덮어쓰기 헬퍼 (STORAGE_API_KEY 포함 전 14대 항목 무손실 보존)
  * @param {Record<string, string>} newValues 
  */
 export function writeEnvFile(newValues) {
@@ -58,14 +59,16 @@ export function writeEnvFile(newValues) {
     `STORAGE_MODE=${merged.STORAGE_MODE === 'true' ? 'true' : 'false'}`,
     `SHARED_BOOKS_DIR=${merged.SHARED_BOOKS_DIR || ''}`,
     `ADMIN_PASSWORD=${merged.ADMIN_PASSWORD || ''}`,
-    `READER_URL=${merged.READER_URL || 'https://epubwebview.vercel.app'}`
+    `READER_URL=${merged.READER_URL || 'https://epubwebview.vercel.app'}`,
+    `STORAGE_API_KEY=${merged.STORAGE_API_KEY || ''}`,
+    `ENFORCE_STORAGE_API_KEY=${merged.ENFORCE_STORAGE_API_KEY === 'true' ? 'true' : 'false'}`
   ];
 
   fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf-8');
 }
 
 /**
- * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅 (크래시 리포트 폴더 포함)
+ * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅 (크래시 리포트, 로그 폴더 포함)
  */
 export function ensureStorageDirectories() {
   const dirs = [
@@ -73,7 +76,8 @@ export function ensureStorageDirectories() {
     path.resolve(ROOT_DIR, 'data/books'),
     path.resolve(ROOT_DIR, 'data/settings'),
     path.resolve(ROOT_DIR, 'data/archive'),
-    path.resolve(ROOT_DIR, 'data/crash-reports')
+    path.resolve(ROOT_DIR, 'data/crash-reports'),
+    path.resolve(ROOT_DIR, 'data/logs')
   ];
 
   dirs.forEach((dir) => {
@@ -81,5 +85,5 @@ export function ensureStorageDirectories() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     }
   });
-  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings, ./data/archive, ./data/crash-reports)');
+  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings, ./data/archive, ./data/crash-reports, ./data/logs)');
 }

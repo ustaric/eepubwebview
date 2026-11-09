@@ -1,6 +1,8 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 자체 스토리지 제어 통합 HTTP 서버
+ * - 🔑 [지능형 이중 API 키 가드] STORAGE_API_KEY 검증 탑재 (헤더/쿼리 키 지원 + 엄격모드 선택형 가드)
+ * - 🛡️ [기존 뷰어 100% 무회귀] 엄격모드 비활성 시 기존 ALLOWED_ORIGIN 출처 검증으로 안전 호환
  * - 🛡️ [securityGuard 결속] nosniff, SAMEORIGIN 등 기본 HTTP 보안 응답 헤더 전역 자동 주입
  * - 🚦 [엔드포인트별 차등 바디 제한] EPUB 100MB / 표지 10MB / JSON 5MB 차등 제한으로 메모리 고갈 DoS 원천 방어
  * - 🚫 [비인가 HTTP 메서드 차단] GET, HEAD, POST, DELETE, OPTIONS 외 변칙 메서드 405 차단
@@ -8,7 +10,6 @@
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
  * - ⚡ [서버 내부 도서 직통 복사 API 완비] POST /api/storage/remote-library/import 제공으로 2중 트래픽 원천 차단
  * - 📚 [공유 라이브러리 도서 목록 및 다운로드 API] GET /api/storage/remote-library 및 download 엔드포인트 탑재
- * - 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 브라우저 Origin/Referer 검증으로 외부 비인가 스크립트 차단
  * - 🚦 [지능형 Rate Limit] 스토리지 API 1분 120회 폭주 방어
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 스냅샷, EPUB 다운로드, 표지 삭제, 차단 활동 링 버퍼 기록
  * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
@@ -88,6 +89,30 @@ function checkRateLimit(req, maxRequests = 120) {
 }
 
 /**
+ * 🔑 [API 키 추출 헬퍼] 요청 헤더 및 쿼리 파라미터에서 API 키 파싱
+ * @param {http.IncomingMessage} req 
+ * @param {URL} reqUrl 
+ * @returns {string|null}
+ */
+function extractApiKey(req, reqUrl) {
+  // 1. X-API-KEY 헤더
+  const customHeader = req.headers['x-api-key'];
+  if (customHeader) return String(customHeader).trim();
+
+  // 2. Authorization: Bearer <key>
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7).trim();
+  }
+
+  // 3. 쿼리 파라미터 ?apiKey=... (다운로드나 브라우저 직접 탐색 시)
+  const queryKey = reqUrl.searchParams.get('apiKey');
+  if (queryKey) return queryKey.trim();
+
+  return null;
+}
+
+/**
  * 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 웹 뷰어 Origin / Referer 검증
  * @param {http.IncomingMessage} req 
  * @returns {boolean}
@@ -149,7 +174,7 @@ function setCorsHeaders(req, res) {
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
@@ -314,6 +339,8 @@ const server = http.createServer(async (req, res) => {
       hasToken: hasRefreshToken(),
       storageMode: env.STORAGE_MODE === 'true',
       sharedBooksDir: env.SHARED_BOOKS_DIR || null,
+      hasStorageApiKey: Boolean(env.STORAGE_API_KEY),
+      enforceApiKey: env.ENFORCE_STORAGE_API_KEY === 'true',
       timestamp: new Date().toISOString()
     });
   }
@@ -355,14 +382,32 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [스토리지 엔드포인트 보안 가드 2] 허용된 웹 뷰어 Origin / Referer 검증
+  // 🛡️ [스토리지 엔드포인트 보안 가드 2] 🔑 지능형 이중 가드 (API Key 일치 검증 + 출처 검증 Fallback)
   if (pathname.startsWith('/api/storage/')) {
-    if (!isAllowedClientOrigin(req)) {
-      console.warn(`⛔ [Origin Blocked] 비인가 클라이언트의 스토리지 접근 차단됨 (IP: ${clientIp}, Origin: ${req.headers.origin}, Referer: ${req.headers.referer})`);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
-      return sendJsonResponse(req, res, 403, {
-        error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인에서의 스토리지 접근입니다.'
+    const env = readEnvFile();
+    const configuredApiKey = env.STORAGE_API_KEY?.trim();
+    const isEnforceMode = env.ENFORCE_STORAGE_API_KEY === 'true';
+    const providedApiKey = extractApiKey(req, reqUrl);
+
+    // 1) 올바른 API 키가 전달된 경우: 출처 검증 프리패스 승인 (외부 스크립트, curl, 신규 뷰어)
+    if (configuredApiKey && providedApiKey && providedApiKey === configuredApiKey) {
+      // API Key 인증 성공 ➔ 바로 통과
+    } else if (isEnforceMode && configuredApiKey) {
+      // 2) 엄격 모드가 켜져 있는데 키가 없거나 일치하지 않는 경우: 401 차단
+      console.warn(`⛔ [ApiKey Blocked] 유효하지 않거나 누락된 API 키 (IP: ${clientIp}, Path: ${pathname})`);
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'API 키 인증 실패 차단', target: pathname, status: 401 });
+      return sendJsonResponse(req, res, 401, {
+        error: 'UNAUTHORIZED_API_KEY: 유효한 X-API-KEY 헤더가 필요합니다. 관리자 설정(/admin)을 확인해 주세요.'
       });
+    } else {
+      // 3) 엄격 모드가 꺼져 있는 경우 (기본 호환 모드): 기존 ALLOWED_ORIGIN 출처 검증 (기존 뷰어 100% 정상 작동)
+      if (!isAllowedClientOrigin(req)) {
+        console.warn(`⛔ [Origin Blocked] 비인가 클라이언트의 스토리지 접근 차단됨 (IP: ${clientIp}, Origin: ${req.headers.origin}, Referer: ${req.headers.referer})`);
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
+        return sendJsonResponse(req, res, 403, {
+          error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인에서의 스토리지 접근입니다.'
+        });
+      }
     }
   }
 

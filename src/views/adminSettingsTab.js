@@ -1,11 +1,12 @@
 /**
  * @file src/views/adminSettingsTab.js
  * @description 관리자 제어 센터 [탭 2: ⚙️ 시스템 설정] HTML 렌더러 모듈
+ * - 🔑 [스토리지 API 보안 키 카드] STORAGE_API_KEY 생성/복사 및 ENFORCE_STORAGE_API_KEY 엄격 모드 토글 탑재
  * - 📋 [주요 접속 정보 복사] GitHub 저장소, 서버 주소, OAuth 리디렉션 URI 원클릭 복사 카드
  * - 🔑 [Google OAuth 연동] 토큰 보유 상태 표출 및 로그인 링크
  * - 📁 [스토리지 모드 토글] 개인 서버 자체 저장소 모드 On/Off 스위치
  * - 📚 [공유 라이브러리 지정] 공유 도서 폴더 경로 입력 및 실측 권한 배지
- * - 🛠️ [시스템 상세 설정 폼] PORT, HOST, CORS, 구글 인증키, 관리자 비밀번호 변경 등 12대 환경변수 폼
+ * - 🛠️ [시스템 상세 설정 폼] PORT, HOST, CORS, 구글 인증키, 관리자 비밀번호 변경 등 14대 환경변수 폼
  */
 
 // 공식 깃허브 저장소 주소
@@ -32,6 +33,8 @@ export function renderSettingsTab({
 }) {
   const isStorageMode = env.STORAGE_MODE === 'true';
   const sharedBooksDir = env.SHARED_BOOKS_DIR || '';
+  const storageApiKey = env.STORAGE_API_KEY || '';
+  const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
 
   const port = env.PORT || String(config.port || '3001');
   const serverHost = env.HOST || config.host || '127.0.0.1';
@@ -41,6 +44,14 @@ export function renderSettingsTab({
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
   const hasSecret = Boolean(env.GOOGLE_CLIENT_SECRET);
   const hasKey = Boolean(env.TOKEN_ENCRYPTION_KEY);
+
+  // API 키 상태 배지
+  let apiKeyStatusBadge = '<span class="badge badge-warning">미설정 (출처 검증만 사용)</span>';
+  if (storageApiKey && isEnforceApiKey) {
+    apiKeyStatusBadge = '<span class="badge badge-success">🛡️ 엄격 키 검증 활성</span>';
+  } else if (storageApiKey) {
+    apiKeyStatusBadge = '<span class="badge badge-info">🔑 키 등록됨 (호환 모드)</span>';
+  }
 
   return `
     <!-- 1. 주요 접속 정보 원클릭 복사 카드 -->
@@ -111,7 +122,42 @@ export function renderSettingsTab({
         </div>
       </div>
 
-      <!-- 4. 공유 도서 라이브러리 폴더 지정 (간이 탐색기 연동) -->
+      <!-- 4. 🔑 [신규] 스토리지 전용 API 보안 키 및 엄격 검증 모드 -->
+      <div class="card">
+        <div class="section-title">
+          <span>🔑 스토리지 API 보안 키 (STORAGE_API_KEY)</span>
+          ${apiKeyStatusBadge}
+        </div>
+        <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 12px 0;">
+          웹 뷰어 또는 외부 스크립트가 스토리지 API(/api/storage/...)에 접근할 때 사용할 비밀 인증키입니다.<br>
+          헤더(<code>X-API-KEY: 키값</code>) 또는 쿼리(<code>?apiKey=키값</code>)로 전달 시 출처 검사를 프리패스합니다.
+        </p>
+
+        <div class="form-group">
+          <label>스토리지 API 보안 키</label>
+          <div class="input-btn-group">
+            <input type="text" id="input-storage-api-key" name="STORAGE_API_KEY" value="${storageApiKey}" placeholder="sk_live_... 또는 [🎲 새 키 생성] 클릭" autocomplete="off">
+            <button type="button" class="btn-browse" onclick="generateRandomApiKey()">🎲 새 키 생성</button>
+            <button type="button" class="btn-browse" style="color:var(--text);" onclick="copyApiKey(this)">복사</button>
+          </div>
+        </div>
+
+        <div class="toggle-row" style="margin-top: 14px;">
+          <div class="toggle-info">
+            <h4>🛡️ 엄격 API 키 검증 모드 강제 (ENFORCE_STORAGE_API_KEY)</h4>
+            <p style="margin-bottom: 4px;">체크 시 올바른 X-API-KEY가 없는 모든 스토리지 요청을 즉시 401로 차단합니다.</p>
+            <p style="color: var(--warning); font-size: 11.5px; margin: 0;">
+              ※ 주의: 뷰어에 키를 등록하기 전에는 체크를 해제해 두세요. (체크 해제 시 기존 뷰어 100% 정상 작동)
+            </p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="ENFORCE_STORAGE_API_KEY" value="true" ${isEnforceApiKey ? 'checked' : ''}>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- 5. 공유 도서 라이브러리 폴더 지정 (간이 탐색기 연동) -->
       <div class="card">
         <div class="section-title">
           <span>📚 공유 도서 라이브러리 폴더 (SHARED_BOOKS_DIR)</span>
@@ -131,7 +177,7 @@ export function renderSettingsTab({
         </div>
       </div>
 
-      <!-- 5. 상세 환경변수 설정 (전 항목 1:1 완비) -->
+      <!-- 6. 상세 환경변수 설정 (전 항목 1:1 완비) -->
       <div class="card">
         <div class="section-title">
           <span>🛠️ 시스템 상세 설정 (.env 환경변수)</span>
@@ -193,5 +239,29 @@ export function renderSettingsTab({
 
       <button type="submit" class="btn-submit">💾 설정 저장 및 환경 적용</button>
     </form>
+
+    <script>
+      function generateRandomApiKey() {
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let key = 'sk_live_';
+        for (let i = 0; i < 32; i++) {
+          key += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        const el = document.getElementById('input-storage-api-key');
+        if (el) {
+          el.value = key;
+          el.focus();
+        }
+      }
+
+      function copyApiKey(btn) {
+        const el = document.getElementById('input-storage-api-key');
+        if (el && el.value) {
+          copyToClipboard(el.value, btn);
+        } else {
+          alert('먼저 [🎲 새 키 생성]을 누르거나 키를 입력해 주세요.');
+        }
+      }
+    </script>
   `;
 }
