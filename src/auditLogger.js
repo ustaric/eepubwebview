@@ -1,10 +1,11 @@
 /**
  * @file src/auditLogger.js
- * @description 개인 서버 활동 링 버퍼(Ring Buffer) 로깅 및 디스크/도서 현황 실시간 집계 전담 모듈
- * - 🚦 [30건 메모리 링 버퍼] IP, 브라우저/기기 식별자, 작업 유형, 상태 코드를 최대 30건 FIFO 안전 보관
- * - 🧹 [민감정보 마스킹 탑재] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 로그 RAM 노출 원천 차단
- * - 💾 [디스크/도서 메트릭 집계] books/ 및 archive/ 권수, 크래시 리포트 수, 실측 디스크 용량(MB) 60초 캐싱 연산
- * - 📱 [지능형 User-Agent 정규화] 복잡한 UA 문자열을 "Windows Chrome", "Galaxy Samsung Internet", "iPhone Safari" 등으로 깔끔하게 변환
+ * @description 개인 서버 활동 링 버퍼(RAM) 및 년/월/일 디스크 영구 저장/아카이빙 전담 모듈
+ * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관
+ * - 📁 [년/월/일 계층형 디스크 저장] ./data/logs/YYYY/MM/DD/audit-YYYY-MM-DD.jsonl 실시간 누적
+ * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
+ * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
+ * - 💾 [디스크/도서 메트릭 집계] books/, archive/, logs/ 실측 용량 및 권수 60초 캐싱 연산
  */
 
 import fs from 'fs';
@@ -20,8 +21,9 @@ const DATA_DIR = path.resolve(ROOT_DIR, 'data');
 const BOOKS_DIR = path.resolve(ROOT_DIR, 'data/books');
 const ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
 const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
+const LOGS_DIR = path.resolve(ROOT_DIR, 'data/logs');
 
-// 최대 보관 로그 건수 (메모리 고정 한도)
+// 최대 보관 메모리 로그 건수 (대시보드 실시간용)
 const MAX_LOGS_LIMIT = 30;
 
 /**
@@ -122,9 +124,38 @@ function countFilesWithExt(dirPath, ext) {
   }
 }
 
+/**
+ * 📁 [디스크 실시간 쓰기 헬퍼] 년/월/일 계층형 폴더 자동 생성 및 1줄 안전 추가
+ * @param {AccessLogEntry} entry 
+ */
+function appendLogToDailyFile(entry) {
+  try {
+    const now = new Date();
+    const year = now.getFullYear().toString();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+
+    // ./data/logs/YYYY/MM/DD/ 경로 구성
+    const targetDir = path.join(LOGS_DIR, year, month, day);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true, mode: 0o755 });
+    }
+
+    const logFileName = `audit-${entry.date}.jsonl`;
+    const targetFile = path.join(targetDir, logFileName);
+
+    // 단일 JSON 라인 추가 (원자적 쓰기)
+    const line = JSON.stringify(entry) + '\n';
+    fs.appendFileSync(targetFile, line, 'utf-8');
+  } catch (err) {
+    // 디스크 쓰기 오류가 발생해도 주 독서 서비스는 절대 중단되지 않음 (Fail-Safe)
+    console.warn('⚠️ [AuditLogger:DiskWriteWarn] 일자별 로그 파일 저장 실패:', err.message);
+  }
+}
+
 export const auditLogger = {
   /**
-   * 새로운 서버 접근 및 동기화 활동 1건을 링 버퍼에 기록 (민감정보 마스킹 자동 적용)
+   * 새로운 서버 접근 및 동기화 활동 1건을 RAM 및 년/월/일 디스크에 실시간 기록
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
@@ -137,7 +168,7 @@ export const auditLogger = {
     const timeStr = now.toTimeString().split(' ')[0]; // HH:mm:ss
     const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
 
-    // 🛡️ [로그 소독] action 및 target에 섞인 비밀번호나 토큰 실시간 마스킹
+    // 🛡️ [로그 소독] 민감정보 실시간 마스킹
     const sanitizedAction = maskSensitiveLog(action || '요청');
     const sanitizedTarget = maskSensitiveLog(target || '-');
 
@@ -152,15 +183,18 @@ export const auditLogger = {
       status: Number(status) || 200
     };
 
-    // FIFO: 최대 한도 초과 시 가장 오래된 1건 밀어내기
+    // 1. RAM 링 버퍼에 기록 (최대 30건 FIFO)
     if (accessLogBuffer.length >= MAX_LOGS_LIMIT) {
       accessLogBuffer.shift();
     }
     accessLogBuffer.push(entry);
+
+    // 2. 📁 년/월/일 디스크 파일에 실시간 안전 영구 저장
+    appendLogToDailyFile(entry);
   },
 
   /**
-   * 최근 보관된 로그 목록 반환 (최신순 역순 정렬)
+   * 최근 보관된 로그 목록 반환 (최신순 역순 정렬 - RAM)
    * @returns {Array<AccessLogEntry>}
    */
   getRecentLogs() {
@@ -168,16 +202,107 @@ export const auditLogger = {
   },
 
   /**
+   * 📁 [아카이브 목록 조회] ./data/logs/ 내에 저장된 모든 일자별 로그 파일 목록 반환
+   * @returns {Array<{ date: string, relativePath: string, sizeBytes: number, sizeKb: string, linesCount: number }>}
+   */
+  getLogFilesList() {
+    if (!fs.existsSync(LOGS_DIR)) return [];
+
+    const results = [];
+
+    function scanDirRecursively(currentDir) {
+      try {
+        const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(currentDir, entry.name);
+          if (entry.isDirectory()) {
+            scanDirRecursively(fullPath);
+          } else if (entry.isFile() && entry.name.startsWith('audit-') && (entry.name.endsWith('.jsonl') || entry.name.endsWith('.json'))) {
+            try {
+              const stat = fs.statSync(fullPath);
+              const relPath = path.relative(LOGS_DIR, fullPath).replace(/\\/g, '/');
+              const dateMatch = entry.name.match(/audit-(\d{4}-\d{2}-\d{2})/);
+              const dateStr = dateMatch ? dateMatch[1] : entry.name;
+
+              // 라인 수 실측
+              const content = fs.readFileSync(fullPath, 'utf-8');
+              const linesCount = content.trim().split('\n').filter(Boolean).length;
+
+              results.push({
+                date: dateStr,
+                fileName: entry.name,
+                relativePath: relPath,
+                sizeBytes: stat.size,
+                sizeKb: (stat.size / 1024).toFixed(1) + ' KB',
+                linesCount
+              });
+            } catch (e) {}
+          }
+        }
+      } catch (err) {}
+    }
+
+    scanDirRecursively(LOGS_DIR);
+    // 최신 일자순 정렬
+    results.sort((a, b) => b.date.localeCompare(a.date));
+    return results;
+  },
+
+  /**
+   * 📥 [로그 다운로드용 정형화] 특정 상대 경로의 .jsonl 파일을 파싱하여 완전한 JSON 배열 문자열로 반환
+   * @param {string} relativePath - LOGS_DIR 기준 상대 경로 (예: "2025/05/18/audit-2025-05-18.jsonl")
+   * @returns {string|null} 포맷팅된 JSON 문자열 (예쁘게 인덴트된 JSON 배열)
+   */
+  getFormattedLogContent(relativePath) {
+    if (!relativePath || !fs.existsSync(LOGS_DIR)) return null;
+
+    const fullPath = path.resolve(LOGS_DIR, relativePath);
+    if (!fullPath.startsWith(LOGS_DIR) || !fs.existsSync(fullPath)) {
+      return null;
+    }
+
+    try {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      const lines = content.trim().split('\n').filter(Boolean);
+      const parsedArray = lines.map(line => {
+        try {
+          return JSON.parse(line);
+        } catch (e) {
+          return { raw: line };
+        }
+      });
+      return JSON.stringify(parsedArray, null, 2);
+    } catch (err) {
+      console.warn(`⚠️ [AuditLogger] 로그 내용 파싱 실패:`, err.message);
+      return null;
+    }
+  },
+
+  /**
+   * 🗑️ [단일 일자 로그 삭제]
+   * @param {string} relativePath 
+   * @returns {boolean} 삭제 성공 여부
+   */
+  deleteLogFile(relativePath) {
+    if (!relativePath || !fs.existsSync(LOGS_DIR)) return false;
+
+    const fullPath = path.resolve(LOGS_DIR, relativePath);
+    if (!fullPath.startsWith(LOGS_DIR) || !fs.existsSync(fullPath)) {
+      return false;
+    }
+
+    try {
+      fs.unlinkSync(fullPath);
+      console.log(`🗑️ [AuditLogger] 일자별 로그 파일 삭제 완료: '${relativePath}'`);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  },
+
+  /**
    * 💾 서버 저장소 실시간 현황 집계 (60초 캐싱 지원)
    * @param {boolean} [forceRefresh=false]
-   * @returns {{
-   *   activeBooksCount: number,
-   *   archivedBooksCount: number,
-   *   crashReportsCount: number,
-   *   totalDataSizeMb: string,
-   *   totalDataSizeBytes: number,
-   *   lastCalculatedAt: string
-   * }}
    */
   getStorageMetrics(forceRefresh = false) {
     const now = Date.now();

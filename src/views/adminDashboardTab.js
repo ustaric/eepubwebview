@@ -2,13 +2,16 @@
  * @file src/views/adminDashboardTab.js
  * @description 관리자 제어 센터 [탭 1: 📊 관제 대시보드] HTML 렌더러 모듈
  * - 💾 [디스크 및 도서 메트릭] 활성/보관 도서 권수 및 실측 디스크 용량 현황 카드
- * - 🛡️ [서버 보안 방어선 상태] 심볼릭 링크 격리, 확장자 화이트리스트, 요청 제한, 로그 소독 실시간 현황
+ * - 🚨 [동적 보안 위협 감지 배지] 403 차단, 429 락 발생 시 실시간 경고 배지 및 차단 건수 카운터 작동
+ * - 📁 [일자별 감사 로그 다운로드 센터] data/logs/YYYY/MM/DD/ 영구 저장 파일 목록 표출 및 즉시 다운로드/삭제
  * - 📋 [실시간 활동 로그] 최근 30건 FIFO 링 버퍼 활동 내역 및 상태 코드 표출
  * - 🔬 [크래시 리포트 센터] 뷰어 조판 결함 진단 리포트 목록 및 다운로드/일괄 정리
  */
 
+import { auditLogger } from '../auditLogger.js';
+
 /**
- * 📊 [탭 1] 관제 대시보드 HTML 템플릿 렌더러
+ * 📊 [탭 1] 관제 대시보드 HTML 템플릿 렌더러 (동적 위협 감지 및 일자별 로그 아카이브 통합)
  * @param {Object} metrics - auditLogger 저장소 메트릭 객체
  * @param {Array} recentLogs - auditLogger 최근 활동 로그 배열
  * @param {Array} crashReports - storageService 크래시 리포트 목록
@@ -18,6 +21,20 @@
 export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports = [], env = {}) {
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
   const isOriginStrict = allowedOrigin !== '*';
+
+  // 🛡️ 실시간 위협 및 차단 건수 동적 집계
+  const count403 = recentLogs.filter(l => l.status === 403 || l.status === 405).length;
+  const count429 = recentLogs.filter(l => l.status === 429).length;
+  const count500 = recentLogs.filter(l => l.status >= 500).length;
+  const totalThreats = count403 + count429;
+
+  // 동적 상태 배지 결정
+  let securityBadgeHtml = '<span class="badge badge-success">✔ 실시간 보호 중 (위협 0건)</span>';
+  if (totalThreats > 0) {
+    securityBadgeHtml = `<span class="badge badge-error" style="background:rgba(239,68,68,0.25);color:#f87171;border:1px solid #ef4444;font-weight:700;">🚨 최근 차단 ${totalThreats}건 감지</span>`;
+  } else if (count500 > 0) {
+    securityBadgeHtml = `<span class="badge badge-warning">⚠️ 서버 오류 ${count500}건 발생</span>`;
+  }
 
   // 1. 최근 30건 활동 로그 테이블 마크업
   let activityLogsHtml = '';
@@ -70,7 +87,62 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 2. 크래시 리포트 테이블 마크업
+  // 2. 📁 [신규] 일자별 감사 로그 아카이브 목록 조회 및 마크업
+  const logFiles = auditLogger.getLogFilesList();
+  let logFilesHtml = '';
+  if (!logFiles || logFiles.length === 0) {
+    logFilesHtml = `
+      <div style="text-align: center; padding: 24px 12px; color: var(--text-muted); font-size: 13px;">
+        <span style="font-size: 20px; display: block; margin-bottom: 4px;">📂</span>
+        누적된 일자별 로그 파일이 없습니다. (접속 시 자동 생성)
+      </div>
+    `;
+  } else {
+    const fileRows = logFiles.map(f => {
+      const encodedRelPath = encodeURIComponent(f.relativePath);
+      return `
+        <tr>
+          <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8;">
+            📅 ${f.date}
+          </td>
+          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted);">
+            ${f.relativePath}
+          </td>
+          <td style="text-align: center;">
+            <span style="background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
+              ${f.linesCount}건 기록
+            </span>
+          </td>
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right;">${f.sizeKb}</td>
+          <td style="text-align: right; white-space: nowrap;">
+            <a href="/admin/logs/download?file=${encodedRelPath}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
+            <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" onclick="return confirm('${f.date} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    logFilesHtml = `
+      <div style="overflow-x: auto; margin-top: 8px;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>기록 일자</th>
+              <th>저장 경로</th>
+              <th style="text-align: center;">활동/접근 수</th>
+              <th style="text-align: right;">용량</th>
+              <th style="text-align: right;">작업</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${fileRows}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  // 3. 크래시 리포트 테이블 마크업
   let crashReportsHtml = '';
   if (!crashReports || crashReports.length === 0) {
     crashReportsHtml = `
@@ -151,17 +223,19 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </p>
     </div>
 
-    <!-- 2. 🛡️ [신규] 서버 보안 거버넌스 및 방어선 상태 카드 -->
+    <!-- 2. 🛡️ 서버 보안 거버넌스 및 동적 방어선 상태 카드 -->
     <div class="card">
       <div class="section-title">
         <span>🛡️ 서버 보안 거버넌스 및 방어선 상태</span>
-        <span class="badge badge-success">실시간 보호 중</span>
+        ${securityBadgeHtml}
       </div>
       <div class="stat-grid" style="grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px;">
         <div class="stat-card" style="text-align: left; padding: 10px 14px;">
           <div style="display: flex; align-items: center; justify-content: space-between;">
-            <span style="font-size: 12.5px; font-weight: 600;">심볼릭 링크 격리</span>
-            <span class="badge badge-success" style="font-size: 10.5px;">realpath 실측</span>
+            <span style="font-size: 12.5px; font-weight: 600;">심볼릭 링크 & 경로 격리</span>
+            <span class="badge ${count403 > 0 ? 'badge-error' : 'badge-success'}" style="font-size: 10.5px;">
+              ${count403 > 0 ? `${count403}건 차단됨` : 'realpath 실측'}
+            </span>
           </div>
           <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">시스템 루트(/etc) 탈출 차단</div>
         </div>
@@ -176,10 +250,12 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
         <div class="stat-card" style="text-align: left; padding: 10px 14px;">
           <div style="display: flex; align-items: center; justify-content: space-between;">
-            <span style="font-size: 12.5px; font-weight: 600;">요청 폭주 제한</span>
-            <span class="badge badge-info" style="font-size: 10.5px;">120회 / 분</span>
+            <span style="font-size: 12.5px; font-weight: 600;">요청 폭주 제한 (Rate Limit)</span>
+            <span class="badge ${count429 > 0 ? 'badge-warning' : 'badge-info'}" style="font-size: 10.5px;">
+              ${count429 > 0 ? `${count429}건 초과 락` : '120회 / 분'}
+            </span>
           </div>
-          <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">IP 기반 Rate Limit 방어선</div>
+          <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">IP 기반 비정상 트래픽 방어</div>
         </div>
 
         <div class="stat-card" style="text-align: left; padding: 10px 14px;">
@@ -187,7 +263,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
             <span style="font-size: 12.5px; font-weight: 600;">로그 민감정보 마스킹</span>
             <span class="badge badge-success" style="font-size: 10.5px;">실시간 소독</span>
           </div>
-          <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">토큰/비밀번호 로그 유출 차단</div>
+          <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">토큰/비밀번호 디스크 노출 차단</div>
         </div>
       </div>
 
@@ -199,19 +275,30 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </div>
     </div>
 
-    <!-- 3. 최근 30건 실시간 기기/IP 활동 로그 위젯 -->
+    <!-- 3. 📁 [신규] 일자별 보안 감사 로그 다운로드 센터 -->
     <div class="card">
       <div class="section-title">
-        <span>📋 최근 동기화 및 접근 활동 로그 (최근 30건 FIFO)</span>
+        <span>📁 일자별 보안 감사 로그 다운로드 센터 (${logFiles.length}일분 보관 중)</span>
+      </div>
+      <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
+        서버에 실제 접근 시도(동기화, 다운로드, 침투 차단)가 발생할 때마다 <strong>./data/logs/YYYY/MM/DD/</strong> 에 실시간 누적된 일자별 영구 보관 파일입니다.
+      </p>
+      ${logFilesHtml}
+    </div>
+
+    <!-- 4. 최근 30건 실시간 기기/IP 활동 로그 위젯 (RAM) -->
+    <div class="card">
+      <div class="section-title">
+        <span>📋 최근 실시간 활동 로그 (최근 30건 FIFO 링 버퍼)</span>
         <span class="badge badge-success">실시간 관제 중</span>
       </div>
       <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        웹 뷰어의 도서 동기화, 다운로드 및 비인가 접근 차단 이력이 서버 RAM 링 버퍼에 기록됩니다.
+        웹 뷰어의 도서 동기화, 다운로드 및 비인가 접근 차단 이력이 서버 RAM에 최신순으로 표출됩니다.
       </p>
       ${activityLogsHtml}
     </div>
 
-    <!-- 4. 조판 결함 및 크래시 리포트 다운로드 센터 -->
+    <!-- 5. 조판 결함 및 크래시 리포트 다운로드 센터 -->
     <div class="card">
       <div class="section-title">
         <span>🔬 조판 결함 및 크래시 리포트 (${crashReports ? crashReports.length : 0}건)</span>

@@ -1,25 +1,34 @@
 /**
  * @file src/adminController.js
- * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 공유 폴더 탐색 API 및 설정 저장 전담 컨트롤러 (Controller)
+ * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 감사 로그 다운로드/삭제 및 설정 저장 전담 컨트롤러 (Controller)
  * - 🎨 [MVC 패턴 완성] 거대 HTML 뷰 템플릿을 src/adminViews.js로 완전 분리하여 초경량 순수 컨트롤러로 슬림화
  * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 직통 위임 유지
  * - 📁 [간이 파일 탐색기 API 탑재] GET /admin/fs-tree 제공으로 서버 최상위 루트부터 자유로운 디렉터리 브라우징 지원
  * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 Node/PM2 프로세스의 읽기 권한 유무 즉각 검증
+ * - 📥 [일자별 감사 로그 다운로드/삭제 API 탑재] securityGuard 연동 실시간 로그 다운로드 및 영구 파쇄 지원
  * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 모듈 내 캡슐화
  * - 🛠️ [공유 도서 폴더(SHARED_BOOKS_DIR) 포함 전 환경변수 영구 반영] .env 파일 원자적 동기화
  */
 
 import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
 import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './envManager.js';
 import { storageService } from './storageService.js';
 import { auditLogger } from './auditLogger.js';
+import { validateSafePath } from './securityGuard.js';
 
 // 🌟 분리된 순수 View 렌더러 import
 import { renderLoginPageHtml, renderAdminSettingsHtml } from './adminViews.js';
 
 // 하위 호환성 및 테스트를 위한 Re-export 계약 보존
 export { renderLoginPageHtml, renderAdminSettingsHtml };
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ROOT_DIR = path.resolve(__dirname, '..');
+const LOGS_DIR = path.resolve(ROOT_DIR, 'data/logs');
 
 // 🔒 [관리자 인증 세션] 유효 세션 토큰 저장소 (메모리 격리)
 const adminSessionTokens = new Set();
@@ -254,9 +263,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // =========================================================================
-  // 🔍 4. [신규] 관리자 간이 탐색기용 디렉터리 트리 조회 API (GET /admin/fs-tree)
-  // =========================================================================
+  // 4. 간이 탐색기 디렉터리 트리 조회 API (GET /admin/fs-tree)
   if (req.method === 'GET' && pathname === '/admin/fs-tree') {
     if (!isAuthenticated(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -273,9 +280,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // =========================================================================
-  // 🛡️ 5. [신규] 폴더 권한 실측 검증 API (POST /admin/test-folder)
-  // =========================================================================
+  // 5. 폴더 권한 실측 검증 API (POST /admin/test-folder)
   if (req.method === 'POST' && pathname === '/admin/test-folder') {
     if (!isAuthenticated(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -301,7 +306,79 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 6. 크래시 리포트 다운로드 (GET /admin/crash-reports/download/:fileName)
+  // =========================================================================
+  // 📥 6. [신규] 일자별 보안 감사 로그 다운로드 (GET /admin/logs/download)
+  // =========================================================================
+  if (req.method === 'GET' && pathname === '/admin/logs/download') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const relFile = reqUrl.searchParams.get('file');
+
+    if (!relFile) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'file 파라미터가 누락되었습니다.' }));
+      return true;
+    }
+
+    // 🛡️ 심볼릭 링크 및 Path Traversal 실측 검증
+    const pathCheck = validateSafePath(LOGS_DIR, relFile);
+    if (!pathCheck.safe) {
+      console.warn(`⛔ [SecurityGuard Blocked] 로그 파일 경로 이탈 차단: '${relFile}'`);
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'FORBIDDEN: 비정상적인 로그 파일 경로입니다.' }));
+      return true;
+    }
+
+    const formattedJson = auditLogger.getFormattedLogContent(relFile);
+    if (!formattedJson) {
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '로그 파일을 찾을 수 없습니다.' }));
+      return true;
+    }
+
+    const downloadFileName = path.basename(relFile).replace(/\.jsonl$/i, '.json');
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📥 감사 로그 다운로드', target: downloadFileName, status: 200 });
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(downloadFileName)}"`
+    });
+    res.end(formattedJson);
+    return true;
+  }
+
+  // =========================================================================
+  // 🗑️ 7. [신규] 일자별 보안 감사 로그 단일 삭제 (GET /admin/logs/delete)
+  // =========================================================================
+  if (req.method === 'GET' && pathname === '/admin/logs/delete') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const relFile = reqUrl.searchParams.get('file');
+
+    if (relFile) {
+      const pathCheck = validateSafePath(LOGS_DIR, relFile);
+      if (pathCheck.safe) {
+        auditLogger.deleteLogFile(relFile);
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🗑️ 감사 로그 삭제', target: relFile, status: 200 });
+      }
+    }
+
+    res.writeHead(302, { Location: '/admin' });
+    res.end();
+    return true;
+  }
+
+  // 8. 크래시 리포트 다운로드 (GET /admin/crash-reports/download/:fileName)
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -328,7 +405,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 7. 크래시 리포트 단일 삭제 (GET /admin/crash-reports/delete/:fileName)
+  // 9. 크래시 리포트 단일 삭제 (GET /admin/crash-reports/delete/:fileName)
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/delete/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -344,7 +421,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 8. 크래시 리포트 전체 비우기 (GET /admin/crash-reports/clear)
+  // 10. 크래시 리포트 전체 비우기 (GET /admin/crash-reports/clear)
   if (req.method === 'GET' && pathname === '/admin/crash-reports/clear') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -359,7 +436,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 9. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
+  // 11. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -389,7 +466,6 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const isStorageMode = params.get('STORAGE_MODE') === 'true';
         updates.STORAGE_MODE = isStorageMode ? 'true' : 'false';
 
-        // 🌟 [신규] 관리자 지정 공유 도서 폴더 경로 파싱 및 권한 실측 검증
         const sharedBooksDir = params.get('SHARED_BOOKS_DIR')?.trim() || '';
         updates.SHARED_BOOKS_DIR = sharedBooksDir;
 
