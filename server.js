@@ -18,6 +18,7 @@
  * - 📊 [실시간 활동 로깅 Hook 탑재] auditLogger 연동으로 사용자별 활동 내역 실시간 기록
  * - 🛡️ [STORAGE_MODE 검증 가드] 어드민 설정(STORAGE_MODE=true) 활성 시에만 로컬 도서 저장 허용
  * - 🖼️ [HEAD 메서드 지원 탑재] 표지 이미지 선조회(HEAD) 요청 정식 수용으로 가짜 404 및 중복 업로드 원천 차단
+ * - 📊 [시스템 자원 감시 & 디스코드 웹훅] systemMonitor 연동으로 CPU/RAM/DISK 1분 평균 연산 및 알림 완비
  */
 
 import http from 'http';
@@ -28,12 +29,13 @@ import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToke
 import { hasRefreshToken } from './tokenStore.js';
 
 // 🌟 분리된 전담 모듈 import
-import { readEnvFile } from './src/envManager.js';
+import { readEnvFile, writeEnvFile } from './src/envManager.js';
 import { handleAdminRoute } from './src/adminController.js';
 import { storageService } from './src/storageService.js';
 import { auditLogger } from './src/auditLogger.js';
 import { injectSecurityHeaders } from './src/securityGuard.js';
 import { apiKeyManager } from './src/apiKeyManager.js';
+import { systemMonitor } from './src/systemMonitor.js';
 
 // 허용된 정규 HTTP 메서드 목록
 const ALLOWED_HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS']);
@@ -343,7 +345,7 @@ const server = http.createServer(async (req, res) => {
   console.log(`[Request] ${req.method} ${pathname} (IP: ${clientIp})`);
 
   // =========================================================================
-  // 1. 서버 헬스체크
+  // 1. 서버 헬스체크 & 시스템 모니터링 API
   // =========================================================================
   if (req.method === 'GET' && pathname === '/api/health') {
     const env = readEnvFile();
@@ -376,6 +378,45 @@ const server = http.createServer(async (req, res) => {
       enforceApiKey: env.ENFORCE_STORAGE_API_KEY === 'true',
       timestamp: new Date().toISOString()
     });
+  }
+
+  // 📊 [신규] 관리자 대시보드 실시간 자원(CPU, RAM, DISK) 사용량 API
+  if (req.method === 'GET' && pathname === '/api/admin/system-stats') {
+    const stats = systemMonitor.getSystemStats();
+    return sendJsonResponse(req, res, 200, { ok: true, stats });
+  }
+
+  // 🔔 [신규] Discord 웹훅 URL 저장 및 테스트 발송 라우트
+  if (req.method === 'POST' && pathname === '/api/admin/discord-webhook') {
+    try {
+      const buffer = await readRequestBodyBuffer(req, 1024 * 64);
+      const payload = JSON.parse(buffer.toString('utf-8') || '{}');
+      const { webhookUrl, action } = payload;
+
+      if (action === 'test') {
+        const testResult = await systemMonitor.testDiscordWebhook(webhookUrl);
+        return sendJsonResponse(req, res, testResult.ok ? 200 : 400, testResult);
+      }
+
+      if (action === 'save') {
+        const env = readEnvFile();
+        env.DISCORD_WEBHOOK_URL = (webhookUrl || '').trim();
+        writeEnvFile(env);
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '⚙️ 디스코드 웹훅 설정 저장',
+          target: env.DISCORD_WEBHOOK_URL ? '웹훅 등록' : '웹훅 제거',
+          status: 200,
+          user: 'Root Admin'
+        });
+        return sendJsonResponse(req, res, 200, { ok: true, message: 'Discord 웹훅 설정이 저장되었습니다.' });
+      }
+
+      return sendJsonResponse(req, res, 400, { error: '잘못된 액션 요청입니다.' });
+    } catch (err) {
+      return sendJsonResponse(req, res, 500, { error: err.message });
+    }
   }
 
   // =========================================================================
@@ -1032,4 +1073,7 @@ server.listen(config.port, config.host, () => {
   console.log(`   - 허용 출처: ${config.security.allowedOrigin}`);
   console.log(`   - 토큰 상태: ${hasRefreshToken() ? '저장됨 ✅' : '미등록 (로그인 필요 ⚠️)'}`);
   console.log('====================================================');
+
+  // 📊 백그라운드 시스템 모니터링 엔진 자동 가동
+  systemMonitor.startMonitoring();
 });

@@ -6,6 +6,7 @@
  * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
  * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
  * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
+ * - 🚨 [서버 500 장애 디스코드 실시간 알림] statusCode >= 500 감지 시 systemMonitor.sendErrorAlert 자동 연계
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
  * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
  * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
@@ -17,6 +18,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { maskSensitiveLog } from './securityGuard.js';
 import { readEnvFile } from './envManager.js';
+import { systemMonitor } from './systemMonitor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -213,6 +215,7 @@ export const auditLogger = {
    * 새로운 서버 접근 및 동기화 활동 1건을 기록 (사용자 서재 식별자 user 지원)
    * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)
    * - 디스크: status >= 400 (외부 침입 차단, 비번 오류, 내부 실패)만 선별 영구 저장
+   * - 디스코드: status >= 500 (서버 내부 치명적 장애) 감지 시 자동 텍스트 알림 발송
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
@@ -253,6 +256,17 @@ export const auditLogger = {
     const isSecurityIncidentOrFailure = statusCode >= 400;
     if (isSecurityIncidentOrFailure) {
       appendLogToDailyFile(entry);
+    }
+
+    // 3. 🚨 [신규] 서버 500번대 치명적 내부 장애 발생 시 Discord 웹훅 텍스트 알림 즉시 발송
+    if (statusCode >= 500) {
+      systemMonitor.sendErrorAlert({
+        path: sanitizedAction,
+        error: sanitizedTarget,
+        user: user || 'Root Admin',
+        status: statusCode,
+        ip: ip || '127.0.0.1'
+      }).catch(() => {});
     }
   },
 
