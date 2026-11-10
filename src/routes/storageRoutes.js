@@ -2,6 +2,7 @@
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
  * - 🔑 [지능형 듀얼 API 키 & 기기 검증] Root 관리자 키 + 다중 사용자 키 실시간 인증 및 차단/슬롯 초과(403) 차단
+ * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🚦 [용량 초과 사전 차단] Content-Length 검사로 사용자 할당량 초과 시 413 즉시 거부
  * - ⚡ [공유 라이브러리 I/O] 목록 조회, 다운로드 스트리밍 및 서버 내부 0초 복사(/import) 지원
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
@@ -160,7 +161,47 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 5. 공유 도서 내부 복사 (/api/storage/remote-library/import)
+  // 🌟 [신규 5] 등록된 기기 목록 조회 (GET /api/storage/devices)
+  if (req.method === 'GET' && pathname === '/api/storage/devices') {
+    const devices = targetUserFolder ? apiKeyManager.getUserDevices(targetUserFolder) : [];
+    const maxDevices = 6;
+    sendJsonResponse(req, res, 200, {
+      ok: true,
+      maxDevices,
+      totalDevices: devices.length,
+      devices
+    });
+    return true;
+  }
+
+  // 🌟 [신규 6] 안 쓰는 기기 슬롯 삭제 및 반환 (DELETE /api/storage/devices/:deviceId)
+  if (req.method === 'DELETE' && pathname.startsWith('/api/storage/devices/')) {
+    const targetDeviceId = decodeURIComponent(pathname.replace('/api/storage/devices/', ''));
+    if (!targetUserFolder) {
+      sendJsonResponse(req, res, 400, { error: '루트 관리자 계정은 기기 관리가 지원되지 않습니다.' });
+      return true;
+    }
+
+    const deleteResult = apiKeyManager.deleteDevice(targetUserFolder, targetDeviceId);
+    if (!deleteResult.success) {
+      sendJsonResponse(req, res, 400, { error: deleteResult.error || '기기 삭제에 실패했습니다.' });
+      return true;
+    }
+
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '📱 기기 슬롯 반환(삭제)',
+      target: targetDeviceId,
+      status: 200,
+      user: authenticatedUserMemo
+    });
+
+    sendJsonResponse(req, res, 200, { ok: true, message: '기기가 성공적으로 삭제되었습니다.', deviceId: targetDeviceId });
+    return true;
+  }
+
+  // 7. 공유 도서 내부 복사 (/api/storage/remote-library/import)
   if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
     const sharedDir = env.SHARED_BOOKS_DIR;
     if (!sharedDir || !fs.existsSync(sharedDir)) {
@@ -195,7 +236,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 6. 공유 도서 목록 조회 (/api/storage/remote-library)
+  // 8. 공유 도서 목록 조회 (/api/storage/remote-library)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
     const sharedDir = env.SHARED_BOOKS_DIR;
     if (!sharedDir || !fs.existsSync(sharedDir)) {
@@ -215,7 +256,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 7. 공유 도서 파일 스트리밍 다운로드 (/api/storage/remote-library/download)
+  // 9. 공유 도서 파일 스트리밍 다운로드 (/api/storage/remote-library/download)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
     const sharedDir = env.SHARED_BOOKS_DIR;
     const reqFile = reqUrl.searchParams.get('file');
@@ -253,7 +294,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 8. 서재 스냅샷 조회 (/api/storage/snapshot)
+  // 10. 서재 스냅샷 조회 (/api/storage/snapshot)
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
     try {
       const snapshot = await storageService.getUnifiedSnapshot(targetUserFolder);
@@ -274,7 +315,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 9. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
+  // 11. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
   if (pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
 
@@ -329,7 +370,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 10. EPUB 도서 바이너리 업로드 및 다운로드 (/api/storage/books/:id/epub)
+  // 12. EPUB 도서 바이너리 업로드 및 다운로드 (/api/storage/books/:id/epub)
   if (pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const rawSegment = pathname.replace('/api/storage/books/', '').replace(/\/epub$/, '');
     const bookId = decodeURIComponent(rawSegment);
@@ -396,7 +437,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 11. 표지 이미지 관리 (/api/storage/covers/:fileName)
+  // 13. 표지 이미지 관리 (/api/storage/covers/:fileName)
   if (pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
 
@@ -445,7 +486,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 12. 시스템 및 동기화 설정 파일 관리 (/api/storage/settings/:fileName)
+  // 14. 시스템 및 동기화 설정 파일 관리 (/api/storage/settings/:fileName)
   if (pathname.startsWith('/api/storage/settings/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
 
