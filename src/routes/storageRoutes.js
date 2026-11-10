@@ -4,10 +4,10 @@
  * - 🔑 [지능형 듀얼 API 키 & 기기 검증] Root 관리자 키 + 다중 사용자 키 실시간 인증 및 차단/슬롯 초과(403) 차단
  * - 🚫 [미등록/삭제 기기 403 즉시 차단] 장부에서 삭제된 기기의 임의 재접속 원천 거부 및 6자리 번호 재로그인 요구
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
+ * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단] Content-Length 검사로 사용자 할당량 초과 시 413 즉시 거부
  * - ⚡ [공유 라이브러리 I/O] 목록 조회, 다운로드 스트리밍 및 서버 내부 0초 복사(/import) 지원
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
- * - 🖼️ [표지 이미지 I/O] HEAD 선조회 및 WebP 캐시 제어
  */
 
 import fs from 'fs';
@@ -25,22 +25,12 @@ import {
   readRequestBodyBuffer
 } from '../httpUtils.js';
 
-/**
- * 스토리지(/api/storage/*) 관련 HTTP 요청을 처리합니다.
- * @param {import('http').IncomingMessage} req 
- * @param {import('http').ServerResponse} res 
- * @param {string} pathname 
- * @param {URL} reqUrl 
- * @param {string} clientIp 
- * @param {string} userAgent 
- * @returns {Promise<boolean>} 라우트 처리 여부
- */
 export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
   if (!pathname.startsWith('/api/storage/')) {
     return false;
   }
 
-  // 1. 크래시 리포트 수신 (별도 인증 없이 수용)
+  // 1. 크래시 리포트 수신
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
@@ -104,7 +94,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       if (deviceId) {
         const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
 
-        // 🚨 [방어선 A] 관리자가 직접 밴(차단)한 기기
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_BLOCKED') {
           auditLogger.recordAccessLog({
             ip: clientIp,
@@ -118,7 +107,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
           return true;
         }
 
-        // 🚨 [방어선 B] 기기 슬롯(6대) 한도 초과
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_LIMIT_EXCEEDED') {
           auditLogger.recordAccessLog({
             ip: clientIp,
@@ -135,7 +123,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
           return true;
         }
 
-        // 🚨 [방어선 C - 신규] 삭제되었거나 정식 OTP 등록을 거치지 않은 미등록 기기 원천 차단!
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_UNREGISTERED') {
           auditLogger.recordAccessLog({
             ip: clientIp,
@@ -336,7 +323,27 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
 
   // 11. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
   if (pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
-    const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
+    const rawEnd = pathname.replace('/api/storage/books/', '');
+    const bookId = decodeURIComponent(rawEnd);
+
+    // 🌟 [안전망] 만약 클라이언트가 /api/storage/books/도서.cover_xxx.webp 형식으로 표지를 요청하면 표지 핸들러로 자동 연결!
+    if (rawEnd.endsWith('.webp')) {
+      const coverFileName = decodeURIComponent(rawEnd);
+      const info = storageService.getCoverImagePath(coverFileName, targetUserFolder);
+      if (!info) {
+        sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
+        return true;
+      }
+      setCorsHeaders(req, res);
+      res.writeHead(200, {
+        'Content-Type': 'image/webp',
+        'Content-Length': info.size,
+        'Cache-Control': 'public, max-age=86400'
+      });
+      if (req.method === 'HEAD') { res.end(); return true; }
+      fs.createReadStream(info.filePath).pipe(res);
+      return true;
+    }
 
     if (req.method === 'POST') {
       try {
