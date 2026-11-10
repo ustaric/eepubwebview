@@ -1,6 +1,7 @@
 /**
  * @file src/views/adminUsersTab.js
  * @description 관리자 제어 센터 [탭 2: 👥 사용자 & API 저장소 관리] HTML 렌더러 모듈
+ * - 📱 [1-Click 기기 모달 직통 연결] 테이블의 '2/6대' 배지 클릭 즉시 해당 사용자의 등록 기기 관제 팝업 오픈
  * - 📱 [기기 관리 모달 탑재] #modal-user-devices 지원으로 사용자별 등록 기기 목록(기기명, IP, 최근 접속) 및 개별 차단/해제/삭제
  * - 📱 [기기 한도 실시간 조절] 기본 6대 기기 한도 인플레이스 변경 및 기기 수(N/M대) 실측 현황 표출
  * - 🎛️ [상단 일괄 액션 툴바] 새 발급, 기기 관리, 용량 변경, 키 재발급, 삭제를 상단 툴바로 일원화
@@ -79,10 +80,15 @@ export function renderUsersTab(env = {}) {
         devices: u.devices || []
       };
 
-      let deviceBadge = `<span style="font-size: 12.5px; font-weight: 700; color: #38bdf8;">${devCount}</span><span style="font-size: 11px; color: var(--text-muted);">/${maxDev}대</span>`;
-      if (blockedCount > 0) {
-        deviceBadge += ` <span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-weight: 700;">${blockedCount}차단</span>`;
-      }
+      // 🌟 [핵심 개선] 클릭 시 기기 관리 모달이 즉시 열리는 인터랙티브 뱃지 (1-Click Fast-Pass)
+      let deviceBadge = `
+        <div class="device-click-pill" onclick="event.stopPropagation(); openUserDevicesModalDirectly('${safeFolder}')" 
+             title="클릭하여 '${safeMemo}' 사용자의 기기 목록 관리" 
+             style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 6px; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); transition: all 0.2s;">
+          <span style="font-size: 12px; font-weight: 700; color: #38bdf8;">📱 ${devCount}/${maxDev}대</span>
+          ${blockedCount > 0 ? `<span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: #ef4444; color: white; font-weight: 700;">${blockedCount}차단</span>` : ''}
+        </div>
+      `;
 
       return `
         <tr id="row-user-${safeFolder}" style="cursor: pointer;" onclick="selectUserRadio('${safeFolder}')">
@@ -166,7 +172,7 @@ export function renderUsersTab(env = {}) {
               <th>서재 폴더명</th>
               <th>사용자 메모</th>
               <th style="text-align: center;">상태</th>
-              <th style="text-align: center;">기기 수</th>
+              <th style="text-align: center;">기기 수 (클릭 관리)</th>
               <th style="text-align: center;">도서 수</th>
               <th>저장 용량</th>
               <th style="text-align: right;">최근 접속</th>
@@ -332,6 +338,12 @@ export function renderUsersTab(env = {}) {
 
     <script>
       let activeSelectedUser = null;
+
+      // 🌟 [1-Click Fast-Pass] 2/6대 배지 클릭 시 즉시 모달 오픈
+      function openUserDevicesModalDirectly(folderName) {
+        selectUserRadio(folderName);
+        triggerToolbarDevices();
+      }
 
       function selectUserRadio(folderName) {
         const radio = document.getElementById('radio-' + folderName);

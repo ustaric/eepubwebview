@@ -1,6 +1,7 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 다중 사용자 자체 스토리지 제어 통합 HTTP 서버
+ * - ⚡ [구글 공식 로그인 0초 직통 점프] 중간 HTML 게이트 없이 클릭 즉시 구글 계정 선택 화면으로 302 다이렉트 이동
  * - 🔢 [6자리 단기 기기 연결 OTP 라우트] /api/auth/otp/issue 및 /api/auth/otp/verify 탑재로 카메라 없는 초간편 번호 로그인
  * - 📱 [기기 식별 및 차단 미들웨어 탑재] X-Device-Id 헤더 검증으로 차단 기기(403) 및 6대 슬롯 초과(403) 실시간 차단
  * - 👥 [다중 사용자 샌드박스 직통 라우팅] apiKeyManager 연동으로 사용자별 data/users/{folderName}/ 투명 연결
@@ -10,7 +11,6 @@
  * - 🛡️ [securityGuard 결속] nosniff, SAMEORIGIN 등 기본 HTTP 보안 응답 헤더 전역 자동 주입
  * - 🚦 [엔드포인트별 차등 바디 제한] EPUB 100MB / 표지 10MB / JSON 5MB 차등 제한으로 메모리 고갈 DoS 원천 방어
  * - 🚫 [비인가 HTTP 메서드 차단] GET, HEAD, POST, DELETE, OPTIONS 외 변칙 메서드 405 차단
- * - 🔒 [Google 로그인 비밀번호 관문 탑재] /auth/google 진입 시 관리자 비밀번호 검증으로 타인의 구글 계정 덮어쓰기 원천 차단
  * - 📁 [책임 기반 완벽 분리] 관리자 라우트(/admin/*)를 adminController.handleAdminRoute로 100% 위임 슬림화
  * - ⚡ [서버 내부 도서 직통 복사 API 완비] POST /api/storage/remote-library/import 제공으로 2중 트래픽 원천 차단
  * - 📚 [공유 라이브러리 도서 목록 및 다운로드 API] GET /api/storage/remote-library 및 download 엔드포인트 탑재
@@ -29,8 +29,7 @@ import { hasRefreshToken } from './tokenStore.js';
 
 // 🌟 분리된 전담 모듈 import
 import { readEnvFile } from './src/envManager.js';
-import { handleAdminRoute, isAuthenticated, createAdminSession } from './src/adminController.js';
-import { renderAuthGateHtml } from './src/adminViews.js';
+import { handleAdminRoute } from './src/adminController.js';
 import { storageService } from './src/storageService.js';
 import { auditLogger } from './src/auditLogger.js';
 import { injectSecurityHeaders } from './src/securityGuard.js';
@@ -47,7 +46,6 @@ const rateLimitMap = new Map();
 // 🔒 [OTP 무차별 대입 방어 맵] (1분 내 5회 실패 시 10분 락)
 const otpAttemptMap = new Map();
 
-// 주기적 메모리 청소 (5분 간격)
 setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of rateLimitMap.entries()) {
@@ -60,11 +58,6 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-/**
- * 클라이언트 실제 IP 추출
- * @param {http.IncomingMessage} req 
- * @returns {string}
- */
 function getClientIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
   if (forwarded) {
@@ -73,12 +66,6 @@ function getClientIp(req) {
   return req.socket.remoteAddress || '127.0.0.1';
 }
 
-/**
- * 일반 엔드포인트 및 스토리지 API 요청 속도 제한 (1분당 120회)
- * @param {http.IncomingMessage} req 
- * @param {number} [maxRequests=120]
- * @returns {boolean} 허용 여부
- */
 function checkRateLimit(req, maxRequests = 120) {
   const ip = getClientIp(req);
   const now = Date.now();
@@ -100,11 +87,6 @@ function checkRateLimit(req, maxRequests = 120) {
   return true;
 }
 
-/**
- * 🔒 OTP 브루트포스 시도 검사
- * @param {string} ip 
- * @returns {{ allowed: boolean, waitMinutes?: number }}
- */
 function checkOtpRateLimit(ip) {
   const now = Date.now();
   const record = otpAttemptMap.get(ip);
@@ -121,7 +103,7 @@ function checkOtpRateLimit(ip) {
   }
 
   if (record.failCount >= 5) {
-    record.blockedUntil = now + (10 * 60 * 1000); // 10분 차단
+    record.blockedUntil = now + (10 * 60 * 1000);
     return { allowed: false, waitMinutes: 10 };
   }
 
@@ -143,12 +125,6 @@ function clearOtpFailure(ip) {
   otpAttemptMap.delete(ip);
 }
 
-/**
- * 🔑 [API 키 추출 헬퍼] 요청 헤더 및 쿼리 파라미터에서 API 키 파싱
- * @param {http.IncomingMessage} req 
- * @param {URL} reqUrl 
- * @returns {string|null}
- */
 function extractApiKey(req, reqUrl) {
   const customHeader = req.headers['x-api-key'];
   if (customHeader) return String(customHeader).trim();
@@ -164,12 +140,6 @@ function extractApiKey(req, reqUrl) {
   return null;
 }
 
-/**
- * 📱 [기기 식별자 추출 헬퍼] 요청 헤더 및 쿼리에서 deviceId와 deviceName 파싱
- * @param {http.IncomingMessage} req 
- * @param {URL} reqUrl 
- * @returns {{ deviceId: string, deviceName: string }}
- */
 function extractDeviceInfo(req, reqUrl) {
   let deviceId = req.headers['x-device-id'] || reqUrl.searchParams.get('deviceId') || '';
   let deviceName = req.headers['x-device-name'] || reqUrl.searchParams.get('deviceName') || '';
@@ -186,11 +156,6 @@ function extractDeviceInfo(req, reqUrl) {
   return { deviceId, deviceName };
 }
 
-/**
- * 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 웹 뷰어 Origin / Referer 검증
- * @param {http.IncomingMessage} req 
- * @returns {boolean}
- */
 function isAllowedClientOrigin(req) {
   const env = readEnvFile();
   const allowedConfig = env.ALLOWED_ORIGIN || config.security.allowedOrigin;
@@ -221,11 +186,6 @@ function isAllowedClientOrigin(req) {
   return false;
 }
 
-/**
- * CORS 응답 헤더 세팅 및 보안 헤더 자동 주입
- * @param {http.IncomingMessage} req 
- * @param {http.ServerResponse} res 
- */
 function setCorsHeaders(req, res) {
   injectSecurityHeaders(res);
 
@@ -249,18 +209,12 @@ function setCorsHeaders(req, res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-/**
- * JSON 응답 전송 헬퍼
- */
 function sendJsonResponse(req, res, statusCode, payload) {
   setCorsHeaders(req, res);
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload, null, 2));
 }
 
-/**
- * 안내 HTML 응답 전송 헬퍼
- */
 function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true) {
   setCorsHeaders(req, res);
   res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -343,12 +297,6 @@ function sendHtmlResponse(req, res, statusCode, title, message, isSuccess = true
   res.end(html);
 }
 
-/**
- * HTTP 요청 Body 버퍼 수신 헬퍼
- * @param {http.IncomingMessage} req 
- * @param {number} [maxBytes=5242880] 기본값 5MB
- * @returns {Promise<Buffer>}
- */
 function readRequestBodyBuffer(req, maxBytes = 5242880) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -369,9 +317,6 @@ function readRequestBodyBuffer(req, maxBytes = 5242880) {
   });
 }
 
-/**
- * HTTP 요청 Router
- */
 const server = http.createServer(async (req, res) => {
   injectSecurityHeaders(res);
 
@@ -434,10 +379,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 🔢 2. 6자리 일회용 연결 번호 (OTP) 발급 및 검증 라우트 (신규 탑재)
+  // 🔢 2. 6자리 일회용 연결 번호 (OTP) 발급 및 검증 라우트
   // =========================================================================
 
-  // 1) [Host 기기] 6자리 연결 번호 발급 (POST /api/auth/otp/issue)
   if (req.method === 'POST' && pathname === '/api/auth/otp/issue') {
     const providedApiKey = extractApiKey(req, reqUrl);
     if (!providedApiKey) {
@@ -448,7 +392,6 @@ const server = http.createServer(async (req, res) => {
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     let folderName = 'root';
 
-    // 루트 관리자 키 또는 다중 사용자 키 검증
     if (rootMasterKey && providedApiKey === rootMasterKey) {
       folderName = 'root';
     } else {
@@ -481,7 +424,6 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 2) [Guest 기기] 6자리 연결 번호 검증 및 교환 (POST /api/auth/otp/verify)
   if (req.method === 'POST' && pathname === '/api/auth/otp/verify') {
     const otpGuard = checkOtpRateLimit(clientIp);
     if (!otpGuard.allowed) {
@@ -536,7 +478,6 @@ const server = http.createServer(async (req, res) => {
   // 4. 자체 스토리지 모드 REST API 엔드포인트
   // =========================================================================
 
-  // 🔬 [크래시 리포트 수신] POST /api/storage/crash-reports/:fileName (5MB 제한)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
@@ -559,7 +500,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [스토리지 보안 가드 1] 속도 제한 (1분 120회)
   if (pathname.startsWith('/api/storage/')) {
     if (!checkRateLimit(req, 120)) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '요청 횟수 초과 차단', target: pathname, status: 429 });
@@ -569,7 +509,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [스토리지 보안 가드 2] STORAGE_MODE 검증 가드
   if (pathname.startsWith('/api/storage/')) {
     const env = readEnvFile();
     if (env.STORAGE_MODE !== 'true') {
@@ -580,7 +519,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [스토리지 보안 가드 3] 🔑 지능형 듀얼 API 키 및 다중 사용자 샌드박스 + 📱 기기 식별/차단 거버넌스
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
   let authenticatedUserMemo = 'Root Admin';
@@ -688,9 +626,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // =========================================================================
-  // ⚡ 공유 도서 서버 내부 0초 직통 복사 (POST /api/storage/remote-library/import)
-  // =========================================================================
   if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
     const env = readEnvFile();
     const sharedDir = env.SHARED_BOOKS_DIR;
@@ -729,9 +664,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // =========================================================================
-  // 📚 공유 라이브러리 도서 목록 조회 (GET /api/storage/remote-library)
-  // =========================================================================
   if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
     const env = readEnvFile();
     const sharedDir = env.SHARED_BOOKS_DIR;
@@ -763,9 +695,6 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // =========================================================================
-  // 📖 공유 도서 원본 실시간 스트리밍 다운로드 (GET /api/storage/remote-library/download)
-  // =========================================================================
   if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
     const env = readEnvFile();
     const sharedDir = env.SHARED_BOOKS_DIR;
@@ -805,7 +734,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ⚡ [올인원 통합 스냅샷 단일 쿼리] GET /api/storage/snapshot
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
     try {
       const snapshot = await storageService.getUnifiedSnapshot(targetUserFolder);
@@ -824,7 +752,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 📖 [도서 메타데이터 JSON 저장] POST /api/storage/books/:id
   if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     try {
@@ -848,7 +775,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 📖 [도서 메타데이터 JSON 조회] GET /api/storage/books/:id
   if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     const meta = storageService.getBookMetadata(bookId, targetUserFolder);
@@ -860,7 +786,6 @@ const server = http.createServer(async (req, res) => {
     return sendJsonResponse(req, res, 200, meta);
   }
 
-  // 📦 [EPUB 바이너리 파일 업로드] POST /api/storage/books/:id/epub
   if (req.method === 'POST' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', '').replace('/epub', ''));
     const contentLength = Number(req.headers['content-length'] || 0);
@@ -895,7 +820,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 📦 [EPUB 바이너리 파일 스트리밍 다운로드] GET /api/storage/books/:id/epub
   if (req.method === 'GET' && pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const rawSegment = pathname.replace('/api/storage/books/', '').replace(/\/epub$/, '');
     const bookId = decodeURIComponent(rawSegment);
@@ -927,7 +851,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🖼️ [표지 이미지 업로드] POST /api/storage/covers/:fileName
   if (req.method === 'POST' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     try {
@@ -941,7 +864,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🖼️ [표지 이미지 다운로드 및 선조회] GET / HEAD /api/storage/covers/:fileName
   if ((req.method === 'GET' || req.method === 'HEAD') && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     const info = storageService.getCoverImagePath(fileName, targetUserFolder);
@@ -966,7 +888,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🖼️ [표지 이미지 단일 삭제] DELETE /api/storage/covers/:fileName
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     storageService.deleteCoverImage(fileName, targetUserFolder);
@@ -974,7 +895,6 @@ const server = http.createServer(async (req, res) => {
     return sendJsonResponse(req, res, 200, { ok: true, fileName });
   }
 
-  // 🗑️ [도서 완전 삭제 트랜잭션] DELETE /api/storage/books/:id
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/books/')) {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     const count = storageService.deleteBookAll(bookId, targetUserFolder);
@@ -989,7 +909,6 @@ const server = http.createServer(async (req, res) => {
     return sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
   }
 
-  // ⚙️ [설정/통계/업적/묘비 JSON 저장] POST /api/storage/settings/:fileName
   if (req.method === 'POST' && pathname.startsWith('/api/storage/settings/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
     try {
@@ -1004,7 +923,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ⚙️ [설정/통계/업적/묘비 JSON 조회] GET /api/storage/settings/:fileName
   if (req.method === 'GET' && pathname.startsWith('/api/storage/settings/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
     const data = storageService.getSettingsFile(fileName, targetUserFolder);
@@ -1013,62 +931,31 @@ const server = http.createServer(async (req, res) => {
   }
 
   // =========================================================================
-  // 5. Google OAuth 인증 라우트
+  // 5. 🌟 Google OAuth 인증 라우트 (중간 HTML 없이 0초 즉시 구글 창 점프)
   // =========================================================================
 
+  // 1) [GET /auth/google] 로그인 링크 ➔ 중간 HTML 게이트 없이 즉각 302 구글 로그인 URL 이동
   if (req.method === 'GET' && pathname === '/auth/google') {
-    if (isAuthenticated(req)) {
-      try {
-        const authUrl = generateAuthUrl();
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 계정 연동 시작', target: '관리자 인증 통과 ➔ 구글 이동', status: 302, user: 'Root Admin' });
-        res.writeHead(302, { Location: authUrl });
-        res.end();
-        return;
-      } catch (err) {
-        return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다. 설정 값을 확인해 주세요.', false);
-      }
+    try {
+      const authUrl = generateAuthUrl();
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '구글 계정 연동 시작',
+        target: '구글 공식 인증 창으로 즉시 이동',
+        status: 302,
+        user: 'Root Admin'
+      });
+      res.writeHead(302, { Location: authUrl });
+      res.end();
+      return;
+    } catch (err) {
+      console.error('[OAuth Init Error]', err.message);
+      return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다. Google Client ID 및 Secret 설정을 확인해 주세요.', false);
     }
-
-    const html = renderAuthGateHtml();
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
-    return;
   }
 
-  if (req.method === 'POST' && pathname === '/auth/google') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const inputPass = params.get('password')?.trim() || '';
-      const env = readEnvFile();
-      const currentPass = env.ADMIN_PASSWORD;
-
-      if (currentPass && inputPass === currentPass) {
-        const sessionToken = createAdminSession();
-        try {
-          const authUrl = generateAuthUrl();
-          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 인증 성공', target: '구글 로그인 화면 점프', status: 302, user: 'Root Admin' });
-          res.writeHead(302, {
-            'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
-            'Location': authUrl
-          });
-          res.end();
-          return;
-        } catch (err) {
-          return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다.', false);
-        }
-      } else {
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 오류', target: '접근 차단', status: 401, user: 'Root Admin' });
-        const html = renderAuthGateHtml('관리자 비밀번호가 올바르지 않습니다.');
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-        return;
-      }
-    });
-    return;
-  }
-
+  // 2) [GET /auth/google/callback] Google 승인 후 돌아오는 콜백 라우트
   if (req.method === 'GET' && pathname === '/auth/google/callback') {
     const code = reqUrl.searchParams.get('code');
     const state = reqUrl.searchParams.get('state');
@@ -1102,6 +989,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 3) [GET /api/access-token] 평소 독서 중 백그라운드 자동 갱신 엔드포인트
   if (req.method === 'GET' && pathname === '/api/access-token') {
     if (!checkRateLimit(req, 60)) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 횟수 초과', target: '/api/access-token', status: 429 });
@@ -1126,6 +1014,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 기본 루트 접속 시 관리자 대시보드로 이동
   if (req.method === 'GET' && pathname === '/') {
     res.writeHead(302, { Location: '/admin' });
     res.end();
