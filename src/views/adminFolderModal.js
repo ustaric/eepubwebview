@@ -1,8 +1,10 @@
 /**
  * @file src/views/adminFolderModal.js
  * @description 관리자 제어 센터 간이 파일 탐색기 모달 다이얼로그 마크업 및 브라우저 클라이언트 JS 스크립트 전담 모듈
- * - 📁 [탐색기 모달 마크업] 상위 이동 버튼, 현재 경로 바, 폴더 목록 그리드, 선택/취소 푸터
- * - ⚡ [브라우저 인터랙션 스크립트] 탭 전환(localStorage 기억), 클립보드 복사, fs-tree AJAX 비동기 브라우징, test-folder 권한 실측
+ * - 📁 [탐색기 모달 마크업] 상위 이동 버튼, 현재 경로 바, 폴더 목록 그리드, 선택/취소 푸터 (기본 display: none 강제 결속)
+ * - 🎯 [범용 인풋 주입 지원] openFolderPicker(targetInputId) 지원으로 시스템 설정 및 공유 서재 등록 폼 어디든 경로 주입 가능
+ * - ⚡ [탭 충돌 원천 제거] 오케스트레이터와 충돌하던 구버전 switchAdminTab 중복 선언 완전 제거
+ * - 🔍 [fs-tree 비동기 브라우징 & 실측] /admin/fs-tree 및 /admin/test-folder 연동 안전한 디렉터리 탐색
  */
 
 /**
@@ -12,8 +14,84 @@
 export function renderFolderModalAndScript() {
   return `
   <!-- =========================================================================
-       📁 간이 파일 탐색기 모달 다이얼로그 마크업
+       📁 간이 파일 탐색기 모달 다이얼로그 마크업 (display: none !important 기본 은닉)
        ========================================================================= -->
+  <style>
+    #folder-picker-modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: none !important;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    #folder-picker-modal.active {
+      display: flex !important;
+    }
+    .explorer-path-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 12px;
+    }
+    .explorer-path-text {
+      flex: 1;
+      font-family: monospace;
+      font-size: 13px;
+      color: #38bdf8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .btn-up {
+      background: #334155;
+      color: #f8fafc;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .folder-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 280px;
+      overflow-y: auto;
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .folder-item {
+      display: flex;
+      align-items: center;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #0f172a;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    .folder-item:hover {
+      background: #1e293b;
+      color: #38bdf8;
+    }
+    .folder-item.no-access {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  </style>
+
   <div class="modal-overlay" id="folder-picker-modal">
     <div class="modal-box">
       <div class="modal-header">
@@ -38,36 +116,13 @@ export function renderFolderModalAndScript() {
   </div>
 
   <script>
-    function switchAdminTab(tabName) {
-      const isDashboard = tabName === 'dashboard';
-      
-      document.getElementById('tab-btn-dashboard').classList.toggle('active', isDashboard);
-      document.getElementById('tab-btn-settings').classList.toggle('active', !isDashboard);
-      
-      document.getElementById('tab-content-dashboard').classList.toggle('active', isDashboard);
-      document.getElementById('tab-content-settings').classList.toggle('active', !isDashboard);
-
-      try {
-        localStorage.setItem('admin_active_tab', tabName);
-      } catch (e) {}
-    }
-
-    (function initTabState() {
-      try {
-        const savedTab = localStorage.getItem('admin_active_tab');
-        if (savedTab === 'settings') {
-          switchAdminTab('settings');
-        }
-      } catch (e) {}
-    })();
-
     function copyToClipboard(text, btnElement) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => {
+        navigator.clipboard.writeText(text).then(function() {
           showCopiedEffect(btnElement);
         });
       } else {
-        const tempInput = document.createElement('input');
+        var tempInput = document.createElement('input');
         tempInput.value = text;
         document.body.appendChild(tempInput);
         tempInput.select();
@@ -78,24 +133,28 @@ export function renderFolderModalAndScript() {
     }
 
     function showCopiedEffect(btn) {
-      const originalText = btn.textContent;
+      var originalText = btn.textContent;
       btn.textContent = '✔ 복사됨!';
       btn.classList.add('copied');
-      setTimeout(() => {
+      setTimeout(function() {
         btn.textContent = originalText;
         btn.classList.remove('copied');
       }, 1800);
     }
 
     // =========================================================================
-    // 📁 간이 파일 탐색기 모달 제어 및 권한 실측 스크립트
+    // 📁 간이 파일 탐색기 모달 제어 및 범용 인풋 주입 스크립트
     // =========================================================================
-    let currentNavPath = '/';
-    let currentParentPath = null;
+    var currentNavPath = '/';
+    var currentParentPath = null;
+    var currentTargetInputId = 'input-shared-books-dir'; // 기본값
 
-    function openFolderPicker() {
-      const inputVal = document.getElementById('input-shared-books-dir').value.trim();
-      const startPath = inputVal || '/home';
+    // 🌟 [핵심 개선] 범용 targetInputId 지원 (어느 인풋이든 경로 입력 가능!)
+    function openFolderPicker(targetInputId) {
+      currentTargetInputId = targetInputId || 'input-shared-books-dir';
+      var targetInput = document.getElementById(currentTargetInputId);
+      var inputVal = targetInput ? targetInput.value.trim() : '';
+      var startPath = inputVal || '/home';
       document.getElementById('folder-picker-modal').classList.add('active');
       loadDirectoryTree(startPath);
     }
@@ -105,19 +164,19 @@ export function renderFolderModalAndScript() {
     }
 
     async function loadDirectoryTree(targetPath) {
-      const pathEl = document.getElementById('explorer-current-path');
-      const listEl = document.getElementById('explorer-folder-list');
-      const upBtn = document.getElementById('btn-path-up');
-      const msgEl = document.getElementById('explorer-status-msg');
+      var pathEl = document.getElementById('explorer-current-path');
+      var listEl = document.getElementById('explorer-folder-list');
+      var upBtn = document.getElementById('btn-path-up');
+      var msgEl = document.getElementById('explorer-status-msg');
 
       pathEl.textContent = '조회 중...';
       listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-muted);font-size:12px;">폴더 목록을 불러오는 중...</div>';
       msgEl.textContent = '';
 
       try {
-        const res = await fetch('/admin/fs-tree?path=' + encodeURIComponent(targetPath));
+        var res = await fetch('/admin/fs-tree?path=' + encodeURIComponent(targetPath));
         if (!res.ok) throw new Error('폴더 접근 실패 (HTTP ' + res.status + ')');
-        const data = await res.json();
+        var data = await res.json();
 
         currentNavPath = data.currentPath || '/';
         currentParentPath = data.parentPath;
@@ -129,18 +188,17 @@ export function renderFolderModalAndScript() {
           return;
         }
 
-        let html = '';
-        data.directories.forEach(d => {
-          const accessClass = d.readable ? '' : 'no-access';
-          const icon = d.readable ? '📁' : '🔒';
-          const badge = d.readable ? '' : '<span style="font-size:10px;color:var(--danger);margin-left:auto;">(권한 없음)</span>';
+        var html = '';
+        data.directories.forEach(function(d) {
+          var accessClass = d.readable ? '' : 'no-access';
+          var icon = d.readable ? '📁' : '🔒';
+          var badge = d.readable ? '' : '<span style="font-size:10px;color:var(--danger);margin-left:auto;">(권한 없음)</span>';
+          var safePath = d.path.replace(/\\\\/g, '/');
 
-          html += \`
-            <div class="folder-item \${accessClass}" onclick="handleFolderClick('\${d.path.replace(/\\\\/g, '/')}', \${d.readable})">
-              <span class="folder-name"><span>\${icon}</span> \${d.name}</span>
-              \${badge}
-            </div>
-          \`;
+          html += '<div class="folder-item ' + accessClass + '" onclick="handleFolderClick(\\'' + safePath + '\\', ' + d.readable + ')">' +
+                  '<span class="folder-name"><span>' + icon + '</span> ' + d.name + '</span>' +
+                  badge +
+                  '</div>';
         });
         listEl.innerHTML = html;
 
@@ -148,14 +206,14 @@ export function renderFolderModalAndScript() {
         pathEl.textContent = targetPath;
         listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--danger);font-size:12px;">폴더를 읽을 수 없습니다: ' + err.message + '</div>';
         if (targetPath !== '/') {
-          setTimeout(() => loadDirectoryTree('/'), 1200);
+          setTimeout(function() { loadDirectoryTree('/'); }, 1200);
         }
       }
     }
 
     function handleFolderClick(folderPath, isReadable) {
       if (!isReadable) {
-        const msgEl = document.getElementById('explorer-status-msg');
+        var msgEl = document.getElementById('explorer-status-msg');
         msgEl.innerHTML = '<span style="color:var(--danger);">⚠️ 이 폴더는 서버(Ubuntu) 읽기 권한이 없습니다.</span>';
         return;
       }
@@ -169,21 +227,24 @@ export function renderFolderModalAndScript() {
     }
 
     async function selectCurrentFolder() {
-      const msgEl = document.getElementById('explorer-status-msg');
+      var msgEl = document.getElementById('explorer-status-msg');
       msgEl.innerHTML = '<span style="color:#38bdf8;">🔄 서버 권한 실측 검증 중...</span>';
 
       try {
-        const res = await fetch('/admin/test-folder', {
+        var res = await fetch('/admin/test-folder', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ folderPath: currentNavPath })
         });
-        const result = await res.json();
+        var result = await res.json();
 
         if (result.readable) {
-          document.getElementById('input-shared-books-dir').value = currentNavPath;
+          var targetInput = document.getElementById(currentTargetInputId);
+          if (targetInput) {
+            targetInput.value = currentNavPath;
+          }
           closeFolderPicker();
-          alert('✔ 폴더가 선택되었습니다: ' + currentNavPath + '\\n하단의 [💾 설정 저장]을 눌러 영구 반영해 주세요.');
+          alert('✔ 폴더가 선택되었습니다: ' + currentNavPath);
         } else {
           msgEl.innerHTML = '<span style="color:var(--danger);">❌ 지정 불가: ' + (result.error || '읽기 권한이 없습니다.') + '</span>';
         }

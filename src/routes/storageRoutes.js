@@ -1,20 +1,23 @@
 /**
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
- * - 🔑 [지능형 듀얼 API 키 & 기기 검증] Root 관리자 키 + 다중 사용자 키 실시간 인증 및 차단/슬롯 초과(403) 차단
+ * - 🔑 [지능형 관리자 쿠키 & 듀얼 API 키 검증] 관리자 웹 세션(admin_session) 및 Root/User API 키 완벽 동시 지원
  * - 🚫 [미등록/삭제 기기 403 즉시 차단] 장부에서 삭제된 기기의 임의 재접속 원천 거부 및 6자리 번호 재로그인 요구
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단] Content-Length 검사로 사용자 할당량 초과 시 413 즉시 거부
- * - ⚡ [공유 라이브러리 I/O] 목록 조회, 다운로드 스트리밍 및 서버 내부 0초 복사(/import) 지원
+ * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더 및 기기별 Stealth 권한 필터링 완비
+ * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
  */
 
 import fs from 'fs';
+import path from 'path';
 import { storageService } from '../storageService.js';
 import { auditLogger } from '../auditLogger.js';
 import { apiKeyManager } from '../apiKeyManager.js';
 import { readEnvFile } from '../envManager.js';
+import { isAuthenticated } from '../adminController.js';
 import {
   extractApiKey,
   extractDeviceInfo,
@@ -24,6 +27,56 @@ import {
   sendJsonResponse,
   readRequestBodyBuffer
 } from '../httpUtils.js';
+
+// 📁 다중 공유 폴더 설정 저장 파일 경로
+const SHARED_FOLDERS_CONFIG_FILE = './data/shared_folders.json';
+
+/**
+ * 📂 다중 공유 폴더 설정 안전 조회 헬퍼 (하위 호환성 100% 보장)
+ * @param {Object} env 
+ * @returns {{ enabled: boolean, folders: Array<{ id: string, name: string, path: string, enabled: boolean, allowedDevices: string[] }> }}
+ */
+function getSharedFoldersConfig(env) {
+  let config = { enabled: true, folders: [] };
+
+  if (fs.existsSync(SHARED_FOLDERS_CONFIG_FILE)) {
+    try {
+      const raw = fs.readFileSync(SHARED_FOLDERS_CONFIG_FILE, 'utf-8');
+      config = JSON.parse(raw);
+    } catch (e) {
+      console.warn('⚠️ [StorageRoutes] shared_folders.json 파싱 실패 (기본값 복구):', e.message);
+    }
+  }
+
+  // 기존 .env의 SHARED_BOOKS_DIR가 있고 폴더 목록이 비어있다면 자동 1개 등록 (마이그레이션)
+  const legacyDir = env.SHARED_BOOKS_DIR;
+  if (config.folders.length === 0 && legacyDir && fs.existsSync(legacyDir)) {
+    config.folders.push({
+      id: 'default',
+      name: '기본 공유 서재',
+      path: legacyDir,
+      enabled: true,
+      allowedDevices: ['*'] // '*' = 전체 기기 허용
+    });
+    saveSharedFoldersConfig(config);
+  }
+
+  return config;
+}
+
+/**
+ * 💾 다중 공유 폴더 설정 안전 저장 헬퍼
+ * @param {Object} config 
+ */
+function saveSharedFoldersConfig(config) {
+  try {
+    const dir = path.dirname(SHARED_FOLDERS_CONFIG_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SHARED_FOLDERS_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('❌ [StorageRoutes] shared_folders.json 저장 실패:', e.message);
+  }
+}
 
 export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
   if (!pathname.startsWith('/api/storage/')) {
@@ -70,19 +123,26 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 4. API 키 인증 및 사용자/기기 화이트리스트 가드
+  // 4. 관리자 쿠키 세션 & API 키 인증 및 사용자/기기 화이트리스트 가드
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
   let authenticatedUserMemo = 'Root Admin';
+  let isRootAdmin = false;
 
   const rootMasterKey = env.STORAGE_API_KEY?.trim();
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
   const providedApiKey = extractApiKey(req, reqUrl);
   const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
 
-  if (rootMasterKey && providedApiKey && providedApiKey === rootMasterKey) {
+  // 🌟 [핵심 개선] 관리자 웹 제어 센터 세션 쿠키가 유효한 경우 즉시 Root Admin 권한 부여!
+  if (isAuthenticated(req)) {
+    isRootAdmin = true;
+    targetUserFolder = null;
+    authenticatedUserMemo = 'Root Admin (Web Session)';
+  } else if (rootMasterKey && providedApiKey && providedApiKey === rootMasterKey) {
     targetUserFolder = null;
     authenticatedUserMemo = 'Root Admin';
+    isRootAdmin = true;
     auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
   } else if (providedApiKey) {
     const auth = apiKeyManager.authenticateApiKey(providedApiKey);
@@ -207,32 +267,100 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 7. 공유 도서 내부 복사 (/api/storage/remote-library/import)
+  // -------------------------------------------------------------------------
+  // 🎛️ [신규] 관리자용 다중 공유 폴더 및 기기별 권한 제어 REST API
+  // -------------------------------------------------------------------------
+  if (pathname === '/api/storage/admin/shared-folders') {
+    if (!isRootAdmin) {
+      sendJsonResponse(req, res, 403, { error: 'ROOT_ADMIN_REQUIRED: 공유 폴더 설정은 루트 관리자만 가능합니다.' });
+      return true;
+    }
+
+    if (req.method === 'GET') {
+      const config = getSharedFoldersConfig(env);
+      sendJsonResponse(req, res, 200, { ok: true, config });
+      return true;
+    }
+
+    if (req.method === 'POST') {
+      try {
+        const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
+        const newConfig = JSON.parse(buffer.toString('utf-8') || '{}');
+        saveSharedFoldersConfig(newConfig);
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '⚙️ 공유 폴더 설정 갱신',
+          target: `폴더 ${newConfig.folders?.length || 0}개 (기능활성: ${newConfig.enabled})`,
+          status: 200,
+          user: authenticatedUserMemo
+        });
+
+        sendJsonResponse(req, res, 200, { ok: true, message: '공유 폴더 설정이 저장되었습니다.', config: newConfig });
+        return true;
+      } catch (err) {
+        sendJsonResponse(req, res, 500, { error: err.message });
+        return true;
+      }
+    }
+  }
+
+  // 7. ⚡ 공유 도서 내부 복사 (/api/storage/remote-library/import)
   if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
-    const sharedDir = env.SHARED_BOOKS_DIR;
-    if (!sharedDir || !fs.existsSync(sharedDir)) {
-      sendJsonResponse(req, res, 404, { ok: false, error: 'SHARED_BOOKS_DIR_NOT_FOUND', message: '공유 도서 폴더가 존재하지 않습니다.' });
+    const config = getSharedFoldersConfig(env);
+    if (!config.enabled) {
+      sendJsonResponse(req, res, 403, { ok: false, error: 'FEATURE_DISABLED', message: '공유 도서 라이브러리 기능이 비활성화되어 있습니다.' });
       return true;
     }
 
     try {
       const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const payload = JSON.parse(buffer.toString('utf-8') || '{}');
-      const relativePath = payload.relativePath;
-      if (!relativePath) {
+      const rawRelativePath = payload.relativePath;
+      const targetFolderId = payload.folderId;
+
+      if (!rawRelativePath) {
         sendJsonResponse(req, res, 400, { error: 'relativePath 필드가 누락되었습니다.' });
         return true;
       }
 
-      const importResult = storageService.importRemoteBookToLibrary(sharedDir, relativePath, targetUserFolder);
+      // 🌟 [보안 및 경로 정규화] 슬래시 통일 및 상위 디렉터리 탈출(..) 차단
+      const normalizedRelPath = rawRelativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (normalizedRelPath.includes('..')) {
+        sendJsonResponse(req, res, 400, { error: 'INVALID_PATH: 잘못된 경로 형식입니다 (상위 경로 이동 불가).' });
+        return true;
+      }
+
+      // 대상 공유 폴더 결정
+      let matchedFolder = null;
+      if (targetFolderId) {
+        matchedFolder = config.folders.find(f => f.id === targetFolderId && f.enabled);
+      } else {
+        matchedFolder = config.folders.find(f => f.enabled && (isRootAdmin || f.allowedDevices.includes('*') || (deviceId && f.allowedDevices.includes(deviceId))));
+      }
+
+      if (!matchedFolder || !fs.existsSync(matchedFolder.path)) {
+        sendJsonResponse(req, res, 404, { ok: false, error: 'SHARED_FOLDER_NOT_FOUND', message: '접근 가능한 공유 도서 폴더를 찾을 수 없습니다.' });
+        return true;
+      }
+
+      // 권한 검증
+      if (!isRootAdmin && !matchedFolder.allowedDevices.includes('*') && (!deviceId || !matchedFolder.allowedDevices.includes(deviceId))) {
+        sendJsonResponse(req, res, 403, { ok: false, error: 'PERMISSION_DENIED', message: '해당 공유 폴더에 접근할 수 있는 권한이 없습니다.' });
+        return true;
+      }
+
+      const importResult = storageService.importRemoteBookToLibrary(matchedFolder.path, normalizedRelPath, targetUserFolder);
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
         action: '⚡ 공유 도서 내부 복사',
-        target: `${importResult.fileName} ➔ ${targetUserFolder || 'root'}`,
+        target: `${importResult.fileName} ➔ ${targetUserFolder || 'root'} (폴더: ${matchedFolder.name})`,
         status: 200,
         user: authenticatedUserMemo
       });
+
       sendJsonResponse(req, res, 200, importResult);
       return true;
     } catch (err) {
@@ -242,36 +370,100 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 8. 공유 도서 목록 조회 (/api/storage/remote-library)
+  // 8. 📚 공유 도서 목록 조회 (/api/storage/remote-library)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
-    const sharedDir = env.SHARED_BOOKS_DIR;
-    if (!sharedDir || !fs.existsSync(sharedDir)) {
-      sendJsonResponse(req, res, 404, { ok: false, error: 'SHARED_BOOKS_DIR_NOT_FOUND', message: '공유 도서 폴더가 존재하지 않습니다.' });
+    const config = getSharedFoldersConfig(env);
+
+    if (!config.enabled || config.folders.length === 0) {
+      sendJsonResponse(req, res, 200, { ok: true, enabled: false, totalBooks: 0, folders: [], books: [] });
       return true;
     }
 
-    const permCheck = storageService.testDirectoryPermissions(sharedDir);
-    if (!permCheck.readable) {
-      sendJsonResponse(req, res, 403, { ok: false, error: 'PERMISSION_DENIED', message: `공유 폴더 읽기 권한이 없습니다: ${permCheck.error || ''}` });
+    // 🌟 [기기별 폴더 칩 Stealth 필터링] 요청한 기기에 권한이 부여된 폴더만 엄격 선별
+    const allowedFolders = config.folders.filter(f => {
+      if (!f.enabled) return false;
+      if (!fs.existsSync(f.path)) return false;
+      if (isRootAdmin) return true;
+      if (f.allowedDevices.includes('*')) return true;
+      return Boolean(deviceId && f.allowedDevices.includes(deviceId));
+    });
+
+    if (allowedFolders.length === 0) {
+      sendJsonResponse(req, res, 200, { ok: true, enabled: true, totalBooks: 0, folders: [], books: [] });
       return true;
     }
 
-    const books = storageService.getRemoteBooks(sharedDir);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📚 공유 서재 목록 조회', target: `${books.length}권`, status: 200, user: authenticatedUserMemo });
-    sendJsonResponse(req, res, 200, { ok: true, sharedDir, totalBooks: books.length, books });
+    let aggregatedBooks = [];
+    const foldersMeta = [];
+
+    for (const folder of allowedFolders) {
+      try {
+        const permCheck = storageService.testDirectoryPermissions(folder.path);
+        if (!permCheck.readable) continue;
+
+        const books = storageService.getRemoteBooks(folder.path) || [];
+        foldersMeta.push({
+          id: folder.id,
+          name: folder.name,
+          bookCount: books.length
+        });
+
+        for (const b of books) {
+          aggregatedBooks.push({
+            ...b,
+            folderId: folder.id,
+            folderName: folder.name,
+            relativePath: (b.relativePath || '').replace(/\\/g, '/')
+          });
+        }
+      } catch (folderErr) {
+        console.warn(`⚠️ [StorageRoutes] 폴더 '${folder.name}' 스캔 예외:`, folderErr.message);
+      }
+    }
+
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '📚 공유 서재 목록 조회',
+      target: `총 ${aggregatedBooks.length}권 (허용 폴더 ${foldersMeta.length}개)`,
+      status: 200,
+      user: authenticatedUserMemo
+    });
+
+    sendJsonResponse(req, res, 200, {
+      ok: true,
+      enabled: true,
+      totalBooks: aggregatedBooks.length,
+      folders: foldersMeta,
+      books: aggregatedBooks
+    });
     return true;
   }
 
   // 9. 공유 도서 파일 스트리밍 다운로드 (/api/storage/remote-library/download)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
-    const sharedDir = env.SHARED_BOOKS_DIR;
+    const config = getSharedFoldersConfig(env);
     const reqFile = reqUrl.searchParams.get('file');
-    if (!sharedDir || !reqFile) {
-      sendJsonResponse(req, res, 400, { error: 'file 쿼리 파라미터가 누락되었습니다.' });
+    const folderId = reqUrl.searchParams.get('folderId');
+
+    if (!config.enabled || !reqFile) {
+      sendJsonResponse(req, res, 400, { error: 'file 쿼리 파라미터가 누락되었거나 기능이 꺼져있습니다.' });
       return true;
     }
 
-    const fileInfo = storageService.getRemoteBookFilePath(sharedDir, reqFile);
+    let targetFolder = null;
+    if (folderId) {
+      targetFolder = config.folders.find(f => f.id === folderId && f.enabled);
+    } else {
+      targetFolder = config.folders.find(f => f.enabled && (isRootAdmin || f.allowedDevices.includes('*') || (deviceId && f.allowedDevices.includes(deviceId))));
+    }
+
+    if (!targetFolder || !fs.existsSync(targetFolder.path)) {
+      sendJsonResponse(req, res, 404, { error: '공유 폴더를 찾을 수 없습니다.' });
+      return true;
+    }
+
+    const fileInfo = storageService.getRemoteBookFilePath(targetFolder.path, reqFile);
     if (!fileInfo) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: reqFile, status: 404, user: authenticatedUserMemo });
       sendJsonResponse(req, res, 404, { error: '도서 파일을 찾을 수 없습니다.' });
@@ -326,7 +518,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     const rawEnd = pathname.replace('/api/storage/books/', '');
     const bookId = decodeURIComponent(rawEnd);
 
-    // 🌟 [안전망] 만약 클라이언트가 /api/storage/books/도서.cover_xxx.webp 형식으로 표지를 요청하면 표지 핸들러로 자동 연결!
     if (rawEnd.endsWith('.webp')) {
       const coverFileName = decodeURIComponent(rawEnd);
       const info = storageService.getCoverImagePath(coverFileName, targetUserFolder);

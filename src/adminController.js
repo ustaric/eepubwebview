@@ -843,6 +843,12 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       try {
         const params = new URLSearchParams(body);
         const updates = {};
+        
+        // 기존 env에 저장되어 있던 DISCORD_WEBHOOK_URL 보존
+        const currentEnv = readEnvFile();
+        if (currentEnv.DISCORD_WEBHOOK_URL) {
+          updates.DISCORD_WEBHOOK_URL = currentEnv.DISCORD_WEBHOOK_URL;
+        }
 
         const port = params.get('PORT')?.trim();
         if (port) updates.PORT = port;

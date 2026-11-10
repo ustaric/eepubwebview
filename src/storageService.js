@@ -939,7 +939,7 @@ export const storageService = {
     }
 
     const books = [];
-    const maxDepth = 4;
+    const maxDepth = 8;
 
     function scanRecursively(currentDir, currentDepth = 0) {
       if (currentDepth > maxDepth) return;
