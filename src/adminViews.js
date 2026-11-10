@@ -1,12 +1,13 @@
 /**
  * @file src/adminViews.js
  * @description 관리자 제어 센터 메인 뷰 오케스트레이터 및 파사드 모듈 (Facade)
- * - 🎨 [ESM 컴포넌트 파사드 패턴] 거대 HTML을 책임별 서브 모듈(views/)로 분할 조립
+ * - 👥 [3단 탭 네비게이션] STORAGE_MODE=true 시 [📊 관제 대시보드] | [👥 사용자 관리] | [⚙️ 시스템 설정] 3단 탭 지원
+ * - 🔑 [신규 발급 키 1회 복사 팝업] newIssuedKey 전달 시 화면 로딩 즉시 복사 모달 자동 팝업
  * - 🔒 [인증 뷰 위임] renderAuthGateHtml, renderLoginPageHtml ➔ adminAuthViews.js
- * - 📊 [관제 대시보드 조립] renderDashboardTab ➔ adminDashboardTab.js (보안 방어선 배지 탑재)
+ * - 📊 [관제 대시보드 조립] renderDashboardTab ➔ adminDashboardTab.js
+ * - 👥 [사용자 관리 조립] renderUsersTab ➔ adminUsersTab.js
  * - ⚙️ [시스템 설정 폼 조립] renderSettingsTab ➔ adminSettingsTab.js
  * - 📁 [모달 및 스크립트 결속] renderFolderModalAndScript ➔ adminFolderModal.js
- * - 🛡️ [공개 API 100% 보존] 기존 server.js 및 adminController.js와의 외부 계약 완벽 유지
  */
 
 import { config } from '../config.js';
@@ -18,23 +19,25 @@ import { auditLogger } from './auditLogger.js';
 // 🌟 분리된 전담 뷰 컴포넌트 import
 import { renderAuthGateHtml, renderLoginPageHtml } from './views/adminAuthViews.js';
 import { renderDashboardTab } from './views/adminDashboardTab.js';
+import { renderUsersTab } from './views/adminUsersTab.js';
 import { renderSettingsTab } from './views/adminSettingsTab.js';
 import { renderFolderModalAndScript } from './views/adminFolderModal.js';
 
-// 하위 호환성 Re-export (server.js, adminController.js 계약 100% 보존)
 export { renderAuthGateHtml, renderLoginPageHtml };
 
 /**
- * 🎨 웹 설정 대시보드 본문 HTML 렌더러 (상단 2단 탭 & 보안 배지 & 간이 폴더 탐색기 통합)
+ * 🎨 웹 설정 대시보드 본문 HTML 렌더러
  * @param {import('http').IncomingMessage} req 
  * @param {string|null} [successMessage=null] 
  * @param {string|null} [errorMessage=null] 
+ * @param {Object|null} [newIssuedKeyInfo=null] - 신규 발급 또는 재발급된 API 키 정보 { apiKey, folderName, memo, expiresAt }
  * @returns {string} 완성된 관리자 대시보드 전체 HTML 문자열
  */
-export function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null) {
+export function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null, newIssuedKeyInfo = null) {
   const env = readEnvFile();
   const hasToken = hasRefreshToken();
   const sharedBooksDir = env.SHARED_BOOKS_DIR || '';
+  const isStorageMode = env.STORAGE_MODE === 'true';
 
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host || `${config.host}:${config.port}`;
@@ -64,10 +67,13 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
   }
 
-  // 1. [탭 1: 관제 대시보드] 조각 렌더링 (보안 방어선 카드 포함)
+  // 1. [탭 1: 관제 대시보드] 조각 렌더링
   const dashboardTabContent = renderDashboardTab(metrics, recentLogs, crashReports, env);
 
-  // 2. [탭 2: 시스템 설정] 조각 렌더링
+  // 2. [탭 2: 사용자 & API 관리] 조각 렌더링 (신규 탑재)
+  const usersTabContent = renderUsersTab(env);
+
+  // 3. [탭 3: 시스템 설정] 조각 렌더링
   const settingsTabContent = renderSettingsTab({
     env,
     config,
@@ -77,8 +83,48 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     sharedDirBadge
   });
 
-  // 3. [간이 파일 탐색기 모달 및 클라이언트 스크립트] 조각 렌더링
+  // 4. [간이 파일 탐색기 모달 및 클라이언트 스크립트] 조각 렌더링
   const modalAndScriptContent = renderFolderModalAndScript();
+
+  // 🌟 [신규 발급 키 1회 복사 모달 HTML]
+  let keyModalHtml = '';
+  if (newIssuedKeyInfo && newIssuedKeyInfo.apiKey) {
+    keyModalHtml = `
+      <div class="modal-overlay active" id="modal-new-key-alert">
+        <div class="modal-box" style="max-width: 480px; text-align: center;">
+          <div class="modal-header">
+            <h3 style="color: #10b981;">🎉 새 API 키 발급 완료</h3>
+            <button type="button" class="modal-close-btn" onclick="closeKeyAlertModal()">&times;</button>
+          </div>
+          <div class="modal-body" style="padding: 24px 20px;">
+            <p style="font-size: 13.5px; color: #f8fafc; margin: 0 0 10px 0;">
+              <strong>${newIssuedKeyInfo.memo}</strong> (${newIssuedKeyInfo.folderName}) 서재에 접근할 API 키입니다.
+            </p>
+            <p style="font-size: 12px; color: var(--warning); margin: 0 0 16px 0;">
+              ⚠️ 보안을 위해 이 창을 닫으면 키 원문을 다시 확인할 수 없습니다.<br>반드시 지금 복사하여 사용자에게 전달하세요!
+            </p>
+            <div class="copy-box" style="margin-bottom: 16px; background: #0b1120; border-color: #38bdf8;">
+              <span class="copy-text" id="text-new-issued-key" style="font-size: 14px; font-weight: 700; color: #38bdf8;">${newIssuedKeyInfo.apiKey}</span>
+              <button type="button" class="btn-copy" style="background: #0284c7;" onclick="copyToClipboard('${newIssuedKeyInfo.apiKey}', this)">키 복사</button>
+            </div>
+            <div style="font-size: 11.5px; color: var(--text-muted); text-align: left; background: #0f172a; padding: 10px; border-radius: 6px; border: 1px solid var(--border);">
+              • 서버 주소: <strong>${currentServerUrl}</strong><br>
+              • 유효 시간: 24시간 내 웹 뷰어에서 1회 인증 시 영구 활성화
+            </div>
+          </div>
+          <div class="modal-footer" style="justify-content: center;">
+            <button type="button" class="btn-modal-select" style="min-width: 120px;" onclick="closeKeyAlertModal()">확인 완료</button>
+          </div>
+        </div>
+      </div>
+      <script>
+        function closeKeyAlertModal() {
+          const el = document.getElementById('modal-new-key-alert');
+          if (el) el.classList.remove('active');
+        }
+      </script>
+    `;
+  }
 
   return `<!DOCTYPE html>
 <html lang="ko">
@@ -111,7 +157,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       box-sizing: border-box;
     }
     .container {
-      max-width: 680px;
+      max-width: 720px;
       width: 100%;
     }
     .header {
@@ -161,7 +207,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       color: var(--text-muted);
       padding: 10px 14px;
       border-radius: 8px;
-      font-size: 14px;
+      font-size: 13.5px;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.2s;
@@ -325,7 +371,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       color: var(--text-muted);
       margin-bottom: 6px;
     }
-    input[type="text"], input[type="password"] {
+    input[type="text"], input[type="password"], input[type="number"] {
       width: 100%;
       background: #0f172a;
       border: 1px solid var(--border);
@@ -337,7 +383,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       outline: none;
       transition: border-color 0.2s;
     }
-    input[type="text"]:focus, input[type="password"]:focus {
+    input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus {
       border-color: var(--primary);
     }
 
@@ -514,7 +560,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     }
     .oauth-btn:hover { background: #64748b; }
 
-    /* 간이 파일 탐색기 모달 팝업 스타일 */
     .modal-overlay {
       position: fixed;
       inset: 0;
@@ -566,70 +611,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       overflow-y: auto;
       flex: 1;
     }
-    .explorer-path-bar {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
-      background: #0f172a;
-      padding: 8px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      align-items: center;
-    }
-    .explorer-path-text {
-      flex: 1;
-      font-family: monospace;
-      font-size: 13px;
-      color: #38bdf8;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .btn-up {
-      background: #334155;
-      color: var(--text);
-      border: none;
-      border-radius: 6px;
-      padding: 4px 10px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .btn-up:hover { background: #475569; }
-    .folder-list {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      max-height: 280px;
-      overflow-y: auto;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #0f172a;
-      padding: 6px;
-    }
-    .folder-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 13px;
-      transition: background 0.15s;
-    }
-    .folder-item:hover {
-      background: rgba(56, 189, 248, 0.12);
-      color: #38bdf8;
-    }
-    .folder-item.no-access {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-    .folder-name {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
     .modal-footer {
       padding: 14px 20px;
       border-top: 1px solid var(--border);
@@ -665,29 +646,41 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     <div class="header">
       <div>
         <h1>⚙️ EPUB Server 제어 센터</h1>
-        <p>Google OAuth 프록시 및 로컬 동기화 스토리지 통합 관제</p>
+        <p>Google OAuth 프록시 및 다중 사용자 스토리지 통합 관제</p>
       </div>
       <a href="/admin/logout" class="btn-logout">🔒 로그아웃</a>
     </div>
 
     ${alertBanner}
 
-    <!-- 상단 2단 네비게이션 탭 바 -->
+    <!-- 상단 네비게이션 탭 바 (STORAGE_MODE에 따라 2단 또는 3단 동적 활성화) -->
     <div class="tab-nav">
       <button type="button" class="tab-btn active" id="tab-btn-dashboard" onclick="switchAdminTab('dashboard')">
         <span>📊</span> 관제 대시보드
       </button>
+      ${isStorageMode ? `
+      <button type="button" class="tab-btn" id="tab-btn-users" onclick="switchAdminTab('users')">
+        <span>👥</span> 사용자 관리
+      </button>
+      ` : ''}
       <button type="button" class="tab-btn" id="tab-btn-settings" onclick="switchAdminTab('settings')">
         <span>⚙️</span> 시스템 설정
       </button>
     </div>
 
-    <!-- 📊 [탭 1] 관제 대시보드 (컴포넌트 조립) -->
+    <!-- 📊 [탭 1] 관제 대시보드 -->
     <div id="tab-content-dashboard" class="tab-content active">
       ${dashboardTabContent}
     </div>
 
-    <!-- ⚙️ [탭 2] 시스템 설정 (컴포넌트 조립) -->
+    <!-- 👥 [탭 2] 사용자 & API 저장소 관리 (개인 서버 모드 전용) -->
+    ${isStorageMode ? `
+    <div id="tab-content-users" class="tab-content">
+      ${usersTabContent}
+    </div>
+    ` : ''}
+
+    <!-- ⚙️ [탭 3] 시스템 설정 -->
     <div id="tab-content-settings" class="tab-content">
       ${settingsTabContent}
     </div>
@@ -695,8 +688,37 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
   </div>
 
-  <!-- 📁 간이 파일 탐색기 모달 다이얼로그 및 제어 스크립트 (컴포넌트 조립) -->
+  <!-- 📁 간이 파일 탐색기 모달 다이얼로그 및 제어 스크립트 -->
   ${modalAndScriptContent}
+
+  <!-- 🌟 [신규 발급 키 1회 복사 모달] -->
+  ${keyModalHtml}
+
+  <script>
+    // 3단 탭 전환 헬퍼 확장
+    function switchAdminTab(tabName) {
+      const tabs = ['dashboard', 'users', 'settings'];
+      tabs.forEach(t => {
+        const btn = document.getElementById('tab-btn-' + t);
+        const content = document.getElementById('tab-content-' + t);
+        if (btn) btn.classList.toggle('active', t === tabName);
+        if (content) content.classList.toggle('active', t === tabName);
+      });
+
+      try {
+        localStorage.setItem('admin_active_tab', tabName);
+      } catch (e) {}
+    }
+
+    (function initTabState() {
+      try {
+        const savedTab = localStorage.getItem('admin_active_tab');
+        if (savedTab && (savedTab === 'settings' || savedTab === 'users')) {
+          switchAdminTab(savedTab);
+        }
+      } catch (e) {}
+    })();
+  </script>
 </body>
 </html>`;
 }

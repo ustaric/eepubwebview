@@ -1,6 +1,8 @@
 /**
  * @file src/storageService.js
  * @description 도서 메타데이터, EPUB 바이너리 파일, 전역 설정 JSON, 크래시 리포트, 공유 폴더 탐색 및 올인원 스냅샷 디스크 I/O 전담 엔진
+ * - 👥 [다중 사용자 샌드박스 스코핑] userFolder 매개변수 지원으로 data/users/{userFolder}/books, settings, archive 완전 격리
+ * - 📁 [보관 도서 스마트 라우팅] saveBookEpub, saveCoverImage가 isArchived 상태를 감지하여 archive/ 폴더로 실물 파일 정확히 저장
  * - 🛡️ [securityGuard 결속] fs.realpathSync 기반 심볼릭 링크 탈출 차단 및 확장자 화이트리스트 실측 검증
  * - 📁 [원자적 도서 보관/복원 동기화] saveBookMetadata 실행 시 메타 JSON뿐만 아니라 .epub 원본 및 모든 표지(.cover_) 파일을 books/ ⇄ archive/ 간 원자적 동시 이동
  * - ⚡ [서버 내부 도서 직통 복사] importRemoteBookToLibrary 탑재로 클라이언트 왕복 트래픽 없이 서버 디스크 내부에서 0.001초 만에 books/ 정식 도서로 안착
@@ -23,10 +25,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
 
-const BOOKS_DIR = path.resolve(ROOT_DIR, 'data/books');
-const SETTINGS_DIR = path.resolve(ROOT_DIR, 'data/settings');
-const ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
+// 기본 최상위 디렉터리 (루트 관리자 및 Fallback용)
+const BASE_BOOKS_DIR = path.resolve(ROOT_DIR, 'data/books');
+const BASE_SETTINGS_DIR = path.resolve(ROOT_DIR, 'data/settings');
+const BASE_ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
 const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
+const USERS_DIR = path.resolve(ROOT_DIR, 'data/users');
 
 /**
  * 🛡️ [경로 소독 및 언더바(_) 웹뷰 규격 일치화 헬퍼]
@@ -138,40 +142,123 @@ function writeJsonSafely(filePath, data) {
   fs.renameSync(tempPath, filePath);
 }
 
+/**
+ * 특정 디렉터리의 실측 용량(Byte) 계산
+ * @param {string} dirPath 
+ * @returns {number}
+ */
+function calculateDirSizeBytes(dirPath) {
+  if (!fs.existsSync(dirPath)) return 0;
+  let totalBytes = 0;
+  try {
+    const files = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const f of files) {
+      const fullPath = path.join(dirPath, f.name);
+      if (f.isDirectory()) {
+        totalBytes += calculateDirSizeBytes(fullPath);
+      } else if (f.isFile()) {
+        try {
+          totalBytes += fs.statSync(fullPath).size;
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return totalBytes;
+}
+
+/**
+ * 👥 [사용자 전용 디렉터리 경로 동적 해석 헬퍼]
+ * userFolder가 지정되면 data/users/{userFolder}/books, settings, archive 반환
+ * userFolder가 없으면 기존 최상위 data/books, settings, archive 반환 (100% 하위 호환)
+ * @param {string|null} [userFolder=null] 
+ * @returns {{ booksDir: string, settingsDir: string, archiveDir: string, userRoot: string }}
+ */
+function resolveStorageContext(userFolder = null) {
+  if (!userFolder || typeof userFolder !== 'string') {
+    return {
+      booksDir: BASE_BOOKS_DIR,
+      settingsDir: BASE_SETTINGS_DIR,
+      archiveDir: BASE_ARCHIVE_DIR,
+      userRoot: ROOT_DIR
+    };
+  }
+
+  const cleanFolder = path.basename(userFolder.trim());
+  const safeCheck = validateSafePath(USERS_DIR, cleanFolder);
+  if (!safeCheck.safe) {
+    console.warn(`⛔ [SecurityGuard Blocked] 유효하지 않은 사용자 폴더 접근: '${userFolder}'`);
+    throw new Error('UNAUTHORIZED_USER_STORAGE_PATH');
+  }
+
+  const userRoot = safeCheck.realPath;
+  const booksDir = path.join(userRoot, 'books');
+  const settingsDir = path.join(userRoot, 'settings');
+  const archiveDir = path.join(userRoot, 'archive');
+
+  ensureDir(booksDir);
+  ensureDir(settingsDir);
+  ensureDir(archiveDir);
+
+  return { booksDir, settingsDir, archiveDir, userRoot };
+}
+
 export const storageService = {
+  /**
+   * 📊 [사용자 저장 용량 한도 실측 검사]
+   * @param {string} userFolder 
+   * @param {number} incomingBytes - 저장하려는 파일 바이트 수
+   * @param {number} quotaBytes - 사용자 할당 용량 바이트 수
+   * @returns {{ allowed: boolean, currentBytes: number, quotaBytes: number, remainingBytes: number }}
+   */
+  checkUserStorageQuota(userFolder, incomingBytes = 0, quotaBytes = 1073741824) {
+    if (!userFolder) return { allowed: true, currentBytes: 0, quotaBytes, remainingBytes: quotaBytes };
+
+    const ctx = resolveStorageContext(userFolder);
+    const currentBytes = calculateDirSizeBytes(ctx.userRoot);
+    const willUseBytes = currentBytes + Number(incomingBytes || 0);
+
+    return {
+      allowed: willUseBytes <= quotaBytes,
+      currentBytes,
+      quotaBytes,
+      remainingBytes: Math.max(0, quotaBytes - currentBytes)
+    };
+  },
+
   // =========================================================================
   // ⚡ 1. 올인원 통합 스냅샷 수집 및 고아 표지 자가 소독 엔진
   // =========================================================================
-  async getUnifiedSnapshot() {
-    ensureDir(BOOKS_DIR);
-    ensureDir(SETTINGS_DIR);
-    ensureDir(ARCHIVE_DIR);
+  async getUnifiedSnapshot(userFolder = null) {
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.booksDir);
+    ensureDir(ctx.settingsDir);
+    ensureDir(ctx.archiveDir);
 
-    const settingsData = readJsonSafely(path.join(SETTINGS_DIR, 'settings.json'));
-    const achievementsData = readJsonSafely(path.join(SETTINGS_DIR, 'achievements.json'));
-    const readingStatsData = readJsonSafely(path.join(SETTINGS_DIR, 'reading-stats.json'));
-    const masterKeyFile = readJsonSafely(path.join(SETTINGS_DIR, 'vault_master_key.json'));
-    const rawTombstones = readJsonSafely(path.join(SETTINGS_DIR, 'deleted-books.json'));
+    const settingsData = readJsonSafely(path.join(ctx.settingsDir, 'settings.json'));
+    const achievementsData = readJsonSafely(path.join(ctx.settingsDir, 'achievements.json'));
+    const readingStatsData = readJsonSafely(path.join(ctx.settingsDir, 'reading-stats.json'));
+    const masterKeyFile = readJsonSafely(path.join(ctx.settingsDir, 'vault_master_key.json'));
+    const rawTombstones = readJsonSafely(path.join(ctx.settingsDir, 'deleted-books.json'));
     const cloudTombstones = Array.isArray(rawTombstones) ? rawTombstones : [];
 
     const cloudBooks = [];
-    const bookFiles = fs.readdirSync(BOOKS_DIR);
+    const bookFiles = fs.readdirSync(ctx.booksDir);
     for (const file of bookFiles) {
       if (file.endsWith('.json')) {
-        const fullJsonPath = path.join(BOOKS_DIR, file);
+        const fullJsonPath = path.join(ctx.booksDir, file);
         const bookMeta = readJsonSafely(fullJsonPath);
         if (bookMeta && bookMeta.bookId) {
           bookMeta.isArchived = false;
 
           // 🌟 [핵심 자가 소독] cloudCoverFileName이 지정되어 있는데 실제 디스크에 실물 표지 파일이 존재하는지 검증!
           if (bookMeta.cloudCoverFileName) {
-            const coverCheck = this.getCoverImagePath(bookMeta.cloudCoverFileName);
+            const coverCheck = this.getCoverImagePath(bookMeta.cloudCoverFileName, userFolder);
             if (!coverCheck) {
               // 디스크에 실물 파일이 없는 고아 표지 감지 ➔ 실물 대체 표지 탐색
               const candidates = generateFilenameCandidates(bookMeta.bookId);
               let foundCoverName = null;
 
-              for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+              for (const dir of [ctx.booksDir, ctx.archiveDir]) {
                 if (!fs.existsSync(dir)) continue;
                 try {
                   const dirFiles = fs.readdirSync(dir);
@@ -185,12 +272,12 @@ export const storageService = {
 
               if (foundCoverName) {
                 // 대체 실물 표지가 있으면 메타데이터를 실물 파일명으로 자동 연결
-                console.log(`✨ [StorageService:SelfHeal] 도서('${bookMeta.bookId}') 실물 표지('${foundCoverName}') 자동 연결 완료!`);
+                console.log(`✨ [StorageService:SelfHeal] 도서('${bookMeta.bookId}') 실물 표지('${foundCoverName}') 자동 연결 완료! (폴더: ${userFolder || 'root'})`);
                 bookMeta.cloudCoverFileName = foundCoverName;
                 writeJsonSafely(fullJsonPath, bookMeta);
               } else {
                 // 디스크에 실물 표지가 아예 없는 도서 ➔ 고아 파일명 태그 완전 소독!
-                console.warn(`🧹 [StorageService:Sanitize] 도서('${bookMeta.bookId}') 표지 실물 부재 ➔ 서버 메타데이터 JSON 완전 소독 완료`);
+                console.warn(`🧹 [StorageService:Sanitize] 도서('${bookMeta.bookId}') 표지 실물 부재 ➔ 서버 메타데이터 JSON 완전 소독 완료 (폴더: ${userFolder || 'root'})`);
                 bookMeta.cloudCoverFileName = "";
                 bookMeta.coverHash = "";
                 bookMeta.covers = [];
@@ -205,10 +292,10 @@ export const storageService = {
     }
 
     const cloudArchivedBooks = [];
-    const archiveFiles = fs.readdirSync(ARCHIVE_DIR);
+    const archiveFiles = fs.readdirSync(ctx.archiveDir);
     for (const file of archiveFiles) {
       if (file.endsWith('.json')) {
-        const fullJsonPath = path.join(ARCHIVE_DIR, file);
+        const fullJsonPath = path.join(ctx.archiveDir, file);
         const archivedMeta = readJsonSafely(fullJsonPath);
         if (archivedMeta && archivedMeta.bookId) {
           archivedMeta.isArchived = true;
@@ -216,7 +303,7 @@ export const storageService = {
 
           // 보관 도서도 고아 표지 실측 및 자동 소독
           if (archivedMeta.cloudCoverFileName) {
-            const coverCheck = this.getCoverImagePath(archivedMeta.cloudCoverFileName);
+            const coverCheck = this.getCoverImagePath(archivedMeta.cloudCoverFileName, userFolder);
             if (!coverCheck) {
               archivedMeta.cloudCoverFileName = "";
               archivedMeta.coverHash = "";
@@ -230,7 +317,7 @@ export const storageService = {
       }
     }
 
-    console.log(`⚡ [StorageService:Snapshot] 스냅샷 수집 완료 (활성 도서: ${cloudBooks.length}권, 보관 도서: ${cloudArchivedBooks.length}권, 묘비: ${cloudTombstones.length}개)`);
+    console.log(`⚡ [StorageService:Snapshot] 스냅샷 수집 완료 (폴더: ${userFolder || 'root'} / 활성 도서: ${cloudBooks.length}권, 보관 도서: ${cloudArchivedBooks.length}권, 묘비: ${cloudTombstones.length}개)`);
 
     return {
       settingsData,
@@ -250,18 +337,20 @@ export const storageService = {
    * 도서 메타데이터 JSON 저장 및 바이너리/표지 물리적 폴더 일괄 이동
    * @param {string} bookId 
    * @param {Object} bookData 
+   * @param {string|null} [userFolder=null]
    * @returns {boolean}
    */
-  saveBookMetadata(bookId, bookData) {
+  saveBookMetadata(bookId, bookData, userFolder = null) {
     const safeId = sanitizeFileName(bookId);
     if (!safeId) throw new Error('유효하지 않은 bookId 입니다.');
 
-    ensureDir(BOOKS_DIR);
-    ensureDir(ARCHIVE_DIR);
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.booksDir);
+    ensureDir(ctx.archiveDir);
 
     const isArchived = Boolean(bookData.isArchived);
-    const targetDir = isArchived ? ARCHIVE_DIR : BOOKS_DIR;
-    const oppositeDir = isArchived ? BOOKS_DIR : ARCHIVE_DIR;
+    const targetDir = isArchived ? ctx.archiveDir : ctx.booksDir;
+    const oppositeDir = isArchived ? ctx.booksDir : ctx.archiveDir;
     const targetFile = path.join(targetDir, `${safeId}.json`);
     const oppositeFile = path.join(oppositeDir, `${safeId}.json`);
 
@@ -293,7 +382,7 @@ export const storageService = {
             const newPath = path.join(targetDir, file);
             try {
               fs.renameSync(oldPath, newPath);
-              console.log(`📦 [StorageService:Move] 실물 파일 이동 완료: '${file}' ➔ ${isArchived ? 'archive/' : 'books/'}`);
+              console.log(`📦 [StorageService:Move] 실물 파일 이동 완료: '${file}' ➔ ${isArchived ? 'archive/' : 'books/'} (폴더: ${userFolder || 'root'})`);
             } catch (moveErr) {
               console.warn(`⚠️ [StorageService] 실물 파일 이동 실패 ('${file}'):`, moveErr.message);
             }
@@ -306,20 +395,22 @@ export const storageService = {
 
     // 3. 목적지 폴더에 최신 메타데이터 JSON 저장
     writeJsonSafely(targetFile, bookData);
-    console.log(`📖 [StorageService] 도서 메타 저장 완료: '${safeId}.json' (${isArchived ? 'archive' : 'books'})`);
+    console.log(`📖 [StorageService] 도서 메타 저장 완료: '${safeId}.json' (${isArchived ? 'archive' : 'books'}, 폴더: ${userFolder || 'root'})`);
     return true;
   },
 
   /**
    * 🔍 특정 도서 메타데이터 조회 (3단계 지능형 교차 탐색)
    * @param {string} bookId 
+   * @param {string|null} [userFolder=null]
    * @returns {Object|null}
    */
-  getBookMetadata(bookId) {
+  getBookMetadata(bookId, userFolder = null) {
     if (!bookId) return null;
     const candidates = generateFilenameCandidates(bookId);
+    const ctx = resolveStorageContext(userFolder);
 
-    for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+    for (const dir of [ctx.booksDir, ctx.archiveDir]) {
       for (const cand of candidates) {
         const p = path.join(dir, `${cand}.json`);
         if (fs.existsSync(p)) {
@@ -331,44 +422,53 @@ export const storageService = {
   },
 
   /**
-   * EPUB 원본 파일 바이너리 저장 (언더바 파일명 규격 적용)
+   * EPUB 원본 파일 바이너리 저장 (보관 도서 스마트 라우팅 지원)
    * @param {string} bookId 
    * @param {Buffer} buffer 
+   * @param {string|null} [userFolder=null]
    * @returns {boolean}
    */
-  saveBookEpub(bookId, buffer) {
+  saveBookEpub(bookId, buffer, userFolder = null) {
     const safeId = sanitizeFileName(bookId);
     if (!safeId) throw new Error('유효하지 않은 bookId 입니다.');
 
-    ensureDir(BOOKS_DIR);
-    const targetFile = path.join(BOOKS_DIR, `${safeId}.epub`);
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.booksDir);
+    ensureDir(ctx.archiveDir);
+
+    // 🌟 [보관 도서 스마트 감지] archive/ 에 메타데이터가 존재하면 보관 도서로 판정하여 archive/ 에 직접 저장!
+    const isArchived = fs.existsSync(path.join(ctx.archiveDir, `${safeId}.json`));
+    const targetDir = isArchived ? ctx.archiveDir : ctx.booksDir;
+    const targetFile = path.join(targetDir, `${safeId}.epub`);
 
     // 🛡️ 물리 경로 탈출 방어
-    const pathCheck = validateSafePath(BOOKS_DIR, `${safeId}.epub`);
+    const pathCheck = validateSafePath(targetDir, `${safeId}.epub`);
     if (!pathCheck.safe) {
       throw new Error(`안전하지 않은 EPUB 저장 경로: ${pathCheck.reason}`);
     }
 
     fs.writeFileSync(targetFile, buffer);
-    console.log(`📦 [StorageService] EPUB 바이너리 저장 완료: '${safeId}.epub' (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`📦 [StorageService] EPUB 바이너리 저장 완료: '${safeId}.epub' ➔ ${isArchived ? 'archive/' : 'books/'} (${(buffer.length / 1024 / 1024).toFixed(2)} MB, 폴더: ${userFolder || 'root'})`);
     return true;
   },
 
   /**
    * 🎯 EPUB 원본 파일 경로 반환 (3단계 지능형 교차 탐색 ➔ 404 박멸)
    * @param {string} bookId 
+   * @param {string|null} [userFolder=null]
    * @returns {{ filePath: string, size: number } | null}
    */
-  getBookEpubPath(bookId) {
+  getBookEpubPath(bookId, userFolder = null) {
     if (!bookId) {
       console.warn('⚠️ [StorageService:GetEpub] bookId가 비어 있습니다.');
       return null;
     }
 
     const candidates = generateFilenameCandidates(bookId);
+    const ctx = resolveStorageContext(userFolder);
 
     // books/ (1순위) ➔ archive/ (2순위) 탐색
-    for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+    for (const dir of [ctx.booksDir, ctx.archiveDir]) {
       if (!fs.existsSync(dir)) continue;
 
       for (const cand of candidates) {
@@ -394,26 +494,36 @@ export const storageService = {
   },
 
   /**
-   * 표지 이미지 바이너리 저장 (언더바 파일명 규격 적용)
+   * 표지 이미지 바이너리 저장 (보관 도서 스마트 라우팅 지원)
    * @param {string} fileName 
    * @param {Buffer} buffer 
+   * @param {string|null} [userFolder=null]
    * @returns {boolean}
    */
-  saveCoverImage(fileName, buffer) {
+  saveCoverImage(fileName, buffer, userFolder = null) {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) throw new Error('유효하지 않은 표지 파일명입니다.');
 
-    ensureDir(BOOKS_DIR);
-    const targetFile = path.join(BOOKS_DIR, safeName);
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.booksDir);
+    ensureDir(ctx.archiveDir);
+
+    // 🌟 [보관 도서 표지 감지] 표지 파일명에서 bookId 추출 (예: 제목_크기.cover_hash.webp)
+    const prefixMatch = safeName.match(/^(.*?)\.cover_/);
+    const bookPrefix = prefixMatch ? prefixMatch[1] : '';
+    const isArchived = bookPrefix && fs.existsSync(path.join(ctx.archiveDir, `${bookPrefix}.json`));
+
+    const targetDir = isArchived ? ctx.archiveDir : ctx.booksDir;
+    const targetFile = path.join(targetDir, safeName);
 
     // 🛡️ 물리 경로 탈출 방어
-    const pathCheck = validateSafePath(BOOKS_DIR, safeName);
+    const pathCheck = validateSafePath(targetDir, safeName);
     if (!pathCheck.safe) {
       throw new Error(`안전하지 않은 표지 저장 경로: ${pathCheck.reason}`);
     }
 
     fs.writeFileSync(targetFile, buffer);
-    console.log(`🖼️ [StorageService] 표지 저장 완료: '${safeName}' (${(buffer.length / 1024).toFixed(1)} KB)`);
+    console.log(`🖼️ [StorageService] 표지 저장 완료: '${safeName}' ➔ ${isArchived ? 'archive/' : 'books/'} (${(buffer.length / 1024).toFixed(1)} KB, 폴더: ${userFolder || 'root'})`);
     return true;
   },
 
@@ -422,14 +532,16 @@ export const storageService = {
    * 1. 요청된 파일명(NFC/NFD/공백/언더바 6대 후보)을 1차 탐색합니다.
    * 2. 요청된 특정 해시 파일이 없더라도, 해당 도서의 다른 실물 표지(*.cover_*.webp)가 디스크에 존재하면 실물 표지를 자동 반환하여 404를 원천 차단합니다.
    * @param {string} fileName 
+   * @param {string|null} [userFolder=null]
    * @returns {{ filePath: string, size: number } | null}
    */
-  getCoverImagePath(fileName) {
+  getCoverImagePath(fileName, userFolder = null) {
     if (!fileName) return null;
     const candidates = generateFilenameCandidates(fileName);
+    const ctx = resolveStorageContext(userFolder);
 
     // 1차: 요청된 파일명 완전 일치 탐색
-    for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+    for (const dir of [ctx.booksDir, ctx.archiveDir]) {
       if (!fs.existsSync(dir)) continue;
 
       for (const cand of candidates) {
@@ -454,7 +566,7 @@ export const storageService = {
       const bookPrefix = coverMatch[1];
       const prefixCandidates = generateFilenameCandidates(bookPrefix);
 
-      for (const dir of [BOOKS_DIR, ARCHIVE_DIR]) {
+      for (const dir of [ctx.booksDir, ctx.archiveDir]) {
         if (!fs.existsSync(dir)) continue;
         try {
           const files = fs.readdirSync(dir);
@@ -470,7 +582,7 @@ export const storageService = {
 
             const stat = fs.statSync(fallbackPath);
             if (stat.isFile()) {
-              console.log(`✨ [StorageService:CoverFallback] 요청된 표지('${fileName}') 부재 ➔ 대체 실물 표지('${fallbackFile}') 200 OK 매칭 성공!`);
+              console.log(`✨ [StorageService:CoverFallback] 요청된 표지('${fileName}') 부재 ➔ 대체 실물 표지('${fallbackFile}') 200 OK 매칭 성공! (폴더: ${userFolder || 'root'})`);
               return { filePath: fallbackPath, size: stat.size };
             }
           }
@@ -484,14 +596,16 @@ export const storageService = {
   /**
    * 단일 표지 이미지 파일 삭제
    * @param {string} fileName 
+   * @param {string|null} [userFolder=null]
    * @returns {boolean}
    */
-  deleteCoverImage(fileName) {
+  deleteCoverImage(fileName, userFolder = null) {
     if (!fileName) return false;
     const candidates = generateFilenameCandidates(fileName);
+    const ctx = resolveStorageContext(userFolder);
     let deleted = false;
 
-    [BOOKS_DIR, ARCHIVE_DIR].forEach((dir) => {
+    [ctx.booksDir, ctx.archiveDir].forEach((dir) => {
       if (!fs.existsSync(dir)) return;
       candidates.forEach((cand) => {
         const targetFile = path.join(dir, cand);
@@ -501,7 +615,7 @@ export const storageService = {
             if (pathCheck.safe) {
               fs.unlinkSync(targetFile);
               deleted = true;
-              console.log(`🗑️ [StorageService] 단일 표지 파일 삭제 완료: '${cand}'`);
+              console.log(`🗑️ [StorageService] 단일 표지 파일 삭제 완료: '${cand}' (폴더: ${userFolder || 'root'})`);
             }
           } catch (e) {}
         }
@@ -514,16 +628,18 @@ export const storageService = {
   /**
    * 🗑️ 도서 완전 삭제 (메타데이터 JSON, EPUB 본문, 모든 WebP 표지 일괄 영구 파쇄)
    * @param {string} bookId 
+   * @param {string|null} [userFolder=null]
    * @returns {number} 실제 삭제된 파일 총 개수
    */
-  deleteBookAll(bookId) {
+  deleteBookAll(bookId, userFolder = null) {
     if (!bookId) return 0;
     // 확장자(.json/.epub)가 혹시 붙어있다면 순수 bookId로 정규화
     const cleanId = String(bookId).replace(/\.(json|epub)$/i, '');
     const candidates = generateFilenameCandidates(cleanId);
+    const ctx = resolveStorageContext(userFolder);
     let deletedCount = 0;
 
-    [BOOKS_DIR, ARCHIVE_DIR].forEach((dir) => {
+    [ctx.booksDir, ctx.archiveDir].forEach((dir) => {
       if (!fs.existsSync(dir)) return;
       const files = fs.readdirSync(dir);
       files.forEach((f) => {
@@ -545,38 +661,40 @@ export const storageService = {
       });
     });
 
-    console.log(`🏁 [StorageService:DeleteAll] 도서('${cleanId}') 일괄 삭제 완료: 총 ${deletedCount}개 실물 파일 파쇄`);
+    console.log(`🏁 [StorageService:DeleteAll] 도서('${cleanId}') 일괄 삭제 완료: 총 ${deletedCount}개 실물 파일 파쇄 (폴더: ${userFolder || 'root'})`);
     return deletedCount;
   },
 
   // =========================================================================
-  // ⚙️ 3. 전역 설정, 통계, 업적, 묘비 전용 I/O
+  // ⚙️ 3. 전역 설정, 통계, 업적, 묘비 전용 I/O (사용자 격리 완비)
   // =========================================================================
-  saveSettingsFile(fileName, data) {
+  saveSettingsFile(fileName, data, userFolder = null) {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) throw new Error('유효하지 않은 설정 파일명입니다.');
 
-    ensureDir(SETTINGS_DIR);
-    const targetFile = path.join(SETTINGS_DIR, safeName);
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.settingsDir);
+    const targetFile = path.join(ctx.settingsDir, safeName);
 
-    const pathCheck = validateSafePath(SETTINGS_DIR, safeName);
+    const pathCheck = validateSafePath(ctx.settingsDir, safeName);
     if (!pathCheck.safe) {
       throw new Error(`안전하지 않은 설정 경로: ${pathCheck.reason}`);
     }
 
     writeJsonSafely(targetFile, data);
-    console.log(`⚙️ [StorageService] 설정 파일 저장 완료: '${safeName}'`);
+    console.log(`⚙️ [StorageService:SettingsSaved] 설정 파일 저장 완료: '${safeName}' (경로: ${ctx.settingsDir})`);
     return true;
   },
 
-  getSettingsFile(fileName) {
+  getSettingsFile(fileName, userFolder = null) {
     const safeName = sanitizeFileName(fileName);
     if (!safeName) return null;
 
-    const pathCheck = validateSafePath(SETTINGS_DIR, safeName);
+    const ctx = resolveStorageContext(userFolder);
+    const pathCheck = validateSafePath(ctx.settingsDir, safeName);
     if (!pathCheck.safe) return null;
 
-    const targetFile = path.join(SETTINGS_DIR, safeName);
+    const targetFile = path.join(ctx.settingsDir, safeName);
     return readJsonSafely(targetFile);
   },
 
@@ -838,8 +956,9 @@ export const storageService = {
    * ⚡ 공유 폴더 도서를 서버 내부 디스크에서 books/ 로 직접 복사(Import)하고 정식 메타데이터 생성
    * @param {string} sharedDir - 공유 폴더 절대 경로
    * @param {string} relativeFilePath - 공유 폴더 내 파일 상대 경로
+   * @param {string|null} [userFolder=null] - 대상 사용자 폴더명
    */
-  importRemoteBookToLibrary(sharedDir, relativeFilePath) {
+  importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolder = null) {
     if (!sharedDir || !relativeFilePath) return null;
 
     // 🛡️ 도서 확장자 검증
@@ -869,13 +988,14 @@ export const storageService = {
     const cleanTitle = cleanBaseName;
     const nowIso = new Date().toISOString();
 
-    ensureDir(BOOKS_DIR);
+    const ctx = resolveStorageContext(userFolder);
+    ensureDir(ctx.booksDir);
 
     // 1. 언더바 보존 표준 파일명으로 실물 파일 직접 복사
-    const targetEpubPath = path.join(BOOKS_DIR, `${safeBookId}.epub`);
+    const targetEpubPath = path.join(ctx.booksDir, `${safeBookId}.epub`);
 
     // 🛡️ 대상 저장 경로 경계 실측
-    const pathCheck = validateSafePath(BOOKS_DIR, `${safeBookId}.epub`);
+    const pathCheck = validateSafePath(ctx.booksDir, `${safeBookId}.epub`);
     if (!pathCheck.safe) {
       throw new Error(`복사 대상 경로 보안 오류: ${pathCheck.reason}`);
     }
@@ -887,7 +1007,8 @@ export const storageService = {
       targetDestination: targetEpubPath,
       existsOnDisk: fs.existsSync(targetEpubPath),
       savedSizeBytes: stat.size,
-      bookId: safeBookId
+      bookId: safeBookId,
+      userFolder: userFolder || 'root'
     });
 
     // 2. 정규 도서 메타데이터 JSON 생성 및 저장
@@ -908,8 +1029,8 @@ export const storageService = {
       lastModified: nowIso
     };
 
-    this.saveBookMetadata(safeBookId, bookData);
-    console.log(`📖 [StorageService:Import] 정규 도서 메타데이터 자동 각인 완료: '${safeBookId}.json'`);
+    this.saveBookMetadata(safeBookId, bookData, userFolder);
+    console.log(`📖 [StorageService:Import] 정규 도서 메타데이터 자동 각인 완료: '${safeBookId}.json' (폴더: ${userFolder || 'root'})`);
 
     return {
       ok: true,

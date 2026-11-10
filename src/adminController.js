@@ -1,14 +1,13 @@
 /**
  * @file src/adminController.js
- * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 감사 로그 다운로드/삭제 및 설정 저장 전담 컨트롤러 (Controller)
- * - 🔑 [API 보안 키 저장 반영] STORAGE_API_KEY 및 ENFORCE_STORAGE_API_KEY .env 동기화 완비
- * - 🎨 [MVC 패턴 완성] 거대 HTML 뷰 템플릿을 src/adminViews.js로 완전 분리하여 초경량 순수 컨트롤러로 슬림화
+ * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 다중 사용자 API 관리 및 설정 저장 전담 컨트롤러
+ * - 👥 [다중 사용자 관리 라우트 탑재] /admin/users/create, /admin/users/reissue, /admin/users/delete 핸들러
+ * - 🔑 [발급 키 1회 복사 지원] 신규/재발급 성공 시 원문 API 키를 관리자 화면에 즉시 모달로 표출
  * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 직통 위임 유지
- * - 📁 [간이 파일 탐색기 API 탑재] GET /admin/fs-tree 제공으로 서버 최상위 루트부터 자유로운 디렉터리 브라우징 지원
- * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 Node/PM2 프로세스의 읽기 권한 유무 즉각 검증
- * - 📥 [일자별 감사 로그 다운로드/삭제 API 탑재] securityGuard 연동 실시간 로그 다운로드 및 영구 파쇄 지원
- * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 모듈 내 캡슐화
- * - 🛠️ [공유 도서 폴더(SHARED_BOOKS_DIR) 포함 전 14대 환경변수 영구 반영] .env 파일 원자적 동기화
+ * - 📁 [간이 파일 탐색기 API 탑재] GET /admin/fs-tree 제공으로 서버 디렉터리 브라우징 지원
+ * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 프로세스 읽기 권한 즉시 검증
+ * - 📥 [보안 감사 로그 다운로드/삭제] securityGuard 연동 실시간 로그 다운로드 및 영구 파쇄 지원
+ * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 캡슐화
  */
 
 import fs from 'fs';
@@ -19,11 +18,11 @@ import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './envManage
 import { storageService } from './storageService.js';
 import { auditLogger } from './auditLogger.js';
 import { validateSafePath } from './securityGuard.js';
+import { apiKeyManager } from './apiKeyManager.js';
 
 // 🌟 분리된 순수 View 렌더러 import
 import { renderLoginPageHtml, renderAdminSettingsHtml } from './adminViews.js';
 
-// 하위 호환성 및 테스트를 위한 Re-export 계약 보존
 export { renderLoginPageHtml, renderAdminSettingsHtml };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -76,10 +75,6 @@ function checkLoginRateLimit(ip) {
   return { allowed: true, remainingAttempts: 5 - record.failCount };
 }
 
-/**
- * 로그인 실패 횟수 기록
- * @param {string} ip 
- */
 function recordLoginFailure(ip) {
   const now = Date.now();
   let record = loginAttemptMap.get(ip);
@@ -91,10 +86,6 @@ function recordLoginFailure(ip) {
   loginAttemptMap.set(ip, record);
 }
 
-/**
- * 로그인 성공 시 실패 기록 소독
- * @param {string} ip 
- */
 function clearLoginFailure(ip) {
   loginAttemptMap.delete(ip);
 }
@@ -137,20 +128,12 @@ export function isAuthenticated(req) {
   return Boolean(sessionToken && adminSessionTokens.has(sessionToken));
 }
 
-/**
- * 🔑 관리자 세션 토큰 발급 및 등록
- * @returns {string} 세션 토큰
- */
 export function createAdminSession() {
   const token = crypto.randomBytes(32).toString('hex');
   adminSessionTokens.add(token);
   return token;
 }
 
-/**
- * 🚪 관리자 세션 파기 (로그아웃)
- * @param {string} token 
- */
 export function destroyAdminSession(token) {
   if (token) {
     adminSessionTokens.delete(token);
@@ -159,14 +142,6 @@ export function destroyAdminSession(token) {
 
 /**
  * 🌟 [관리자 라우트 전담 통합 디스패처]
- * server.js로부터 /admin/* 및 /settings 요청을 위임받아 100% 처리
- * 
- * @param {import('http').IncomingMessage} req 
- * @param {import('http').ServerResponse} res 
- * @param {string} pathname 
- * @param {string} clientIp 
- * @param {string} userAgent 
- * @returns {Promise<boolean>} 처리 완료 여부
  */
 export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) {
   // 1. 관리자 로그인 처리 (POST /admin/login)
@@ -198,7 +173,6 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         }
 
         writeEnvFile({ ADMIN_PASSWORD: inputPass });
-        console.log('🔒 [Admin] 신규 관리자 비밀번호가 .env에 영구 등록되었습니다.');
         clearLoginFailure(clientIp);
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200 });
 
@@ -223,7 +197,6 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       } else {
         recordLoginFailure(clientIp);
         const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
-        console.warn(`⚠️ [Login Failed] 관리자 비밀번호 불일치 (IP: ${clientIp}, 잔여 시도: ${Math.max(0, remaining)}회)`);
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401 });
         const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -264,24 +237,166 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 4. 간이 탐색기 디렉터리 트리 조회 API (GET /admin/fs-tree)
+  // =========================================================================
+  // 👥 4. 다중 사용자 API 키 관리 라우트 (신규 탑재)
+  // =========================================================================
+
+  // 1) [새 사용자 키 발급] POST /admin/users/create
+  if (req.method === 'POST' && pathname === '/admin/users/create') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const memo = params.get('memo')?.trim() || '새 사용자';
+        const quotaMb = parseInt(params.get('quotaMb') || '1024', 10);
+
+        const result = apiKeyManager.issueApiKey({ memo, quotaMb, role: 'user' });
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '👥 새 사용자 키 발급',
+          target: `${memo} (${result.folderName})`,
+          status: 200
+        });
+
+        // 🌟 새로 발급된 API 키 정보를 포함하여 대시보드 렌더링 (모달 즉시 표출)
+        const html = renderAdminSettingsHtml(req, '새 사용자 API 키가 발급되었습니다!', null, {
+          type: 'CREATE',
+          apiKey: result.apiKey,
+          folderName: result.folderName,
+          memo: result.memo,
+          expiresAt: result.expiresAt
+        });
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      } catch (err) {
+        const html = renderAdminSettingsHtml(req, null, '사용자 키 발급 실패: ' + err.message);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      }
+    });
+    return true;
+  }
+
+  // 2) [사용자 키 재발급] POST /admin/users/reissue
+  if (req.method === 'POST' && pathname === '/admin/users/reissue') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+
+        const result = apiKeyManager.reissueApiKey(folderName);
+        if (!result.success) {
+          throw new Error(result.error || '재발급 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '🔄 사용자 키 재발급',
+          target: `${result.memo} (${folderName})`,
+          status: 200
+        });
+
+        // 🌟 재발급된 새 API 키 정보를 포함하여 모달 표출
+        const html = renderAdminSettingsHtml(req, `'${result.memo}' 사용자의 새 API 키가 발급되었습니다. (기존 책 100% 보존)`, null, {
+          type: 'REISSUE',
+          apiKey: result.newApiKey,
+          folderName: result.folderName,
+          memo: result.memo,
+          expiresAt: result.expiresAt
+        });
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      } catch (err) {
+        const html = renderAdminSettingsHtml(req, null, '키 재발급 실패: ' + err.message);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      }
+    });
+    return true;
+  }
+
+  // 3) [사용자 삭제] POST /admin/users/delete
+  if (req.method === 'POST' && pathname === '/admin/users/delete') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const deleteFolder = params.get('deleteFolder') === 'true';
+
+        const result = apiKeyManager.revokeApiKey(folderName, deleteFolder);
+        if (!result.success) {
+          throw new Error(result.error || '삭제 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: deleteFolder ? '🗑️ 사용자 및 도서 완전 삭제' : '🔒 사용자 API 키 폐기',
+          target: folderName,
+          status: 200
+        });
+
+        const successMsg = deleteFolder
+          ? `'${folderName}' 사용자의 API 키와 도서 폴더가 영구 삭제되었습니다.`
+          : `'${folderName}' 사용자의 API 키가 폐기되었습니다. (도서 폴더 보존)`;
+
+        const html = renderAdminSettingsHtml(req, successMsg);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      } catch (err) {
+        const html = renderAdminSettingsHtml(req, null, '사용자 삭제 실패: ' + err.message);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      }
+    });
+    return true;
+  }
+
+  // 5. 간이 탐색기 디렉터리 트리 조회 API (GET /admin/fs-tree)
   if (req.method === 'GET' && pathname === '/admin/fs-tree') {
     if (!isAuthenticated(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: 'UNAUTHORIZED: 관리자 로그인이 필요합니다.' }));
+      res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
       return true;
     }
 
     const reqUrl = new URL(req.url, 'http://localhost');
     const targetPath = reqUrl.searchParams.get('path') || '/';
-
     const treeData = storageService.getDirectoryTree(targetPath);
+
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(treeData));
     return true;
   }
 
-  // 5. 폴더 권한 실측 검증 API (POST /admin/test-folder)
+  // 6. 폴더 권한 실측 검증 API (POST /admin/test-folder)
   if (req.method === 'POST' && pathname === '/admin/test-folder') {
     if (!isAuthenticated(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -307,7 +422,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 6. 일자별 보안 감사 로그 다운로드 (GET /admin/logs/download)
+  // 7. 일자별 보안 감사 로그 다운로드 (GET /admin/logs/download)
   if (req.method === 'GET' && pathname === '/admin/logs/download') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -320,22 +435,21 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
     if (!relFile) {
       res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: 'file 파라미터가 누락되었습니다.' }));
+      res.end(JSON.stringify({ error: 'file 파라미터 누락' }));
       return true;
     }
 
     const pathCheck = validateSafePath(LOGS_DIR, relFile);
     if (!pathCheck.safe) {
-      console.warn(`⛔ [SecurityGuard Blocked] 로그 파일 경로 이탈 차단: '${relFile}'`);
       res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: 'FORBIDDEN: 비정상적인 로그 파일 경로입니다.' }));
+      res.end(JSON.stringify({ error: 'FORBIDDEN' }));
       return true;
     }
 
     const formattedJson = auditLogger.getFormattedLogContent(relFile);
     if (!formattedJson) {
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: '로그 파일을 찾을 수 없습니다.' }));
+      res.end(JSON.stringify({ error: '로그 파일 없음' }));
       return true;
     }
 
@@ -350,7 +464,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 7. 일자별 보안 감사 로그 단일 삭제 (GET /admin/logs/delete)
+  // 8. 일자별 보안 감사 로그 삭제 (GET /admin/logs/delete)
   if (req.method === 'GET' && pathname === '/admin/logs/delete') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -374,7 +488,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 8. 크래시 리포트 다운로드 (GET /admin/crash-reports/download/:fileName)
+  // 9. 크래시 리포트 다운로드
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -386,7 +500,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     const info = storageService.getCrashReportPath(fileName);
     if (!info) {
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: '크래시 리포트 파일을 찾을 수 없습니다.' }));
+      res.end(JSON.stringify({ error: '리포트 파일 없음' }));
       return true;
     }
 
@@ -401,7 +515,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 9. 크래시 리포트 단일 삭제 (GET /admin/crash-reports/delete/:fileName)
+  // 10. 크래시 리포트 단일 삭제
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/delete/')) {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -417,7 +531,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 10. 크래시 리포트 전체 비우기 (GET /admin/crash-reports/clear)
+  // 11. 크래시 리포트 전체 비우기
   if (req.method === 'GET' && pathname === '/admin/crash-reports/clear') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -432,7 +546,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 11. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
+  // 12. 환경변수 전체 파싱 및 영구 저장 (POST /admin/save)
   if (req.method === 'POST' && pathname === '/admin/save') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -465,7 +579,6 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const sharedBooksDir = params.get('SHARED_BOOKS_DIR')?.trim() || '';
         updates.SHARED_BOOKS_DIR = sharedBooksDir;
 
-        // 🔑 [신규] 스토리지 전용 API 키 및 엄격 검증 모드 플래그 파싱
         const storageApiKey = params.get('STORAGE_API_KEY')?.trim() || '';
         updates.STORAGE_API_KEY = storageApiKey;
 
@@ -490,7 +603,6 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const newAdminPassword = params.get('NEW_ADMIN_PASSWORD')?.trim();
         if (newAdminPassword) {
           updates.ADMIN_PASSWORD = newAdminPassword;
-          console.log('🔒 [Admin] 관리자 비밀번호가 갱신되었습니다.');
         }
 
         writeEnvFile(updates);
@@ -501,25 +613,10 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200 });
 
-        let successMsg = isStorageMode
-          ? '설정이 저장되었습니다! 도서 로컬 저장소(./data/books)가 활성화되었습니다.'
-          : '설정이 성공적으로 저장되었습니다. (인증 프록시 모드)';
-
-        if (sharedBooksDir) {
-          successMsg += ` [공유 서재: ${sharedBooksDir}]`;
-        }
-
-        if (storageApiKey && isEnforceApiKey) {
-          successMsg += ' [🛡️ 엄격 API 키 검증 모드 ON]';
-        } else if (storageApiKey) {
-          successMsg += ' [🔑 API 키 등록됨 (호환 모드)]';
-        }
-
-        const html = renderAdminSettingsHtml(req, successMsg);
+        const html = renderAdminSettingsHtml(req, '설정이 성공적으로 저장되었습니다!');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
       } catch (err) {
-        console.error('[Admin Save Error]', err);
         const html = renderAdminSettingsHtml(req, null, '설정 저장 오류: ' + err.message);
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);

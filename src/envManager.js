@@ -1,10 +1,11 @@
 /**
  * @file src/envManager.js
- * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports, logs) 생성 전담 모듈
+ * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports, logs, users, api) 생성 전담 모듈
  * - 🛡️ [환경변수 무누락 보존] STORAGE_API_KEY, ENFORCE_STORAGE_API_KEY를 포함한 전 14대 환경변수 영구 보존
+ * - 👥 [다중 사용자 저장소 준비] ./data/users 및 ./data/api 디렉터리 자동 권한 세팅 지원
  * - 🔑 [스토리지 API 보안 키 지원] 서버 전용 비밀키 및 엄격 검증 모드 플래그 영구 동기화
  * - 📁 [공유 도서 라이브러리 지원] SHARED_BOOKS_DIR 경로를 .env에 무손실 저장
- * - 📁 [저장소 디렉터리 세팅] ./data/books, ./data/settings, ./data/archive, ./data/crash-reports, ./data/logs 0o755 권한 자동 생성
+ * - 📁 [저장소 디렉터리 세팅] 0o755 권한으로 디렉터리 안전 자동 생성
  */
 
 import fs from 'fs';
@@ -68,7 +69,7 @@ export function writeEnvFile(newValues) {
 }
 
 /**
- * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅 (크래시 리포트, 로그 폴더 포함)
+ * 📦 저장소 모드 필수 디렉터리 자동 생성 및 권한 세팅 (다중 사용자 폴더 data/users, data/api 포함)
  */
 export function ensureStorageDirectories() {
   const dirs = [
@@ -77,7 +78,9 @@ export function ensureStorageDirectories() {
     path.resolve(ROOT_DIR, 'data/settings'),
     path.resolve(ROOT_DIR, 'data/archive'),
     path.resolve(ROOT_DIR, 'data/crash-reports'),
-    path.resolve(ROOT_DIR, 'data/logs')
+    path.resolve(ROOT_DIR, 'data/logs'),
+    path.resolve(ROOT_DIR, 'data/users'),
+    path.resolve(ROOT_DIR, 'data/api')
   ];
 
   dirs.forEach((dir) => {
@@ -85,5 +88,5 @@ export function ensureStorageDirectories() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     }
   });
-  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (./data/books, ./data/settings, ./data/archive, ./data/crash-reports, ./data/logs)');
+  console.log('📁 [StorageMode] 필수 저장소 디렉터리 검증 및 권한 세팅 완료 (books, settings, archive, crash-reports, logs, users, api)');
 }
