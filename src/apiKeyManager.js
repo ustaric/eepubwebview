@@ -1,6 +1,7 @@
 /**
  * @file src/apiKeyManager.js
- * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 사용자 디렉터리 생명주기 관리 엔진
+ * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 6자리 단기 기기 연결 OTP 관리 엔진
+ * - 🔢 [6자리 단기 기기 연결 OTP 탑재] issueDeviceOtp & verifyAndExchangeDeviceOtp 지원으로 카메라 없는 초간편 번호 로그인
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
  * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
  * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
@@ -31,6 +32,25 @@ const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // 기본 계정당 최대 허용 기기 수
 const DEFAULT_MAX_DEVICES = 6;
+
+// 🔢 6자리 기기 연결 OTP 유효 시간 (3분: 180,000ms)
+const OTP_TTL_MS = 3 * 60 * 1000;
+
+/**
+ * 🔒 6자리 일회용 연결 번호 인메모리 저장소
+ * @type {Map<string, { code: string, folderName: string, apiKey: string, expiresAt: number }>}
+ */
+const deviceOtpStore = new Map();
+
+// 1분마다 만료된 OTP 자동 청소
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, item] of deviceOtpStore.entries()) {
+    if (now > item.expiresAt) {
+      deviceOtpStore.delete(code);
+    }
+  }
+}, 60 * 1000);
 
 /**
  * @typedef {Object} DeviceRecord
@@ -180,14 +200,12 @@ export const apiKeyManager = {
     ensureDir(USERS_DIR);
     ensureDir(path.dirname(API_KEYS_FILE));
 
-    // 1. 임의 고유 폴더명 채번 및 물리 골격(books, settings, archive) 생성
     const folderName = generateUniqueFolderName();
     const userRoot = path.join(USERS_DIR, folderName);
     ensureDir(path.join(userRoot, 'books'));
     ensureDir(path.join(userRoot, 'settings'));
     ensureDir(path.join(userRoot, 'archive'));
 
-    // 2. 무작위 비밀 API 키 생성 (sk_live_...)
     const rawSecret = crypto.randomBytes(24).toString('hex');
     const apiKey = `sk_live_${rawSecret}`;
     const keyHash = hashApiKey(apiKey);
@@ -200,13 +218,13 @@ export const apiKeyManager = {
       memo: String(memo).trim() || '새 사용자',
       keyHash,
       role: role === 'admin' ? 'admin' : 'user',
-      status: 'PENDING', // PENDING (24시간 내 활성화 대기) ➔ ACTIVE (인증 성공)
+      status: 'PENDING',
       storageQuotaBytes: Math.max(10, Number(quotaMb) || 1024) * 1024 * 1024,
       maxDevices: Math.max(1, parseInt(maxDevices, 10) || DEFAULT_MAX_DEVICES),
-      devices: {}, // 기기 맵 { [deviceId]: DeviceRecord }
+      devices: {},
       createdAt: new Date(now).toISOString(),
       activatedAt: null,
-      expiresAt: expiresAt, // 등록 마감 시각 (24시간 후)
+      expiresAt: expiresAt,
       lastAccessedAt: null
     };
 
@@ -247,12 +265,10 @@ export const apiKeyManager = {
     const user = list[index];
     const now = Date.now();
 
-    // 1. 이미 폐기된 키 거절
     if (user.status === 'REVOKED') {
       return { authenticated: false, reason: 'API_KEY_REVOKED' };
     }
 
-    // 2. 24시간 등록 윈도우 만료 여부 판정 (PENDING 상태 검사)
     if (user.status === 'PENDING') {
       const deadline = new Date(user.expiresAt).getTime();
       if (now > deadline) {
@@ -263,21 +279,18 @@ export const apiKeyManager = {
         return { authenticated: false, reason: 'API_KEY_EXPIRED' };
       }
 
-      // 🌟 [핵심] 24시간 내 최초 1회 정상 접근 성공 ➔ ACTIVE 영구 활성화 전이!
       user.status = 'ACTIVE';
       user.activatedAt = new Date(now).toISOString();
-      user.expiresAt = null; // 활성화 완료 후 만료 해제 (관리자가 폐기할 때까지 유지)
-      console.log(`✨ [ApiKeyManager:Activated] 사용자 서재가 성공적으로 활성화되었습니다: 폴더='${user.folderName}'`);
+      user.expiresAt = null;
+      console.log(`✨ [ApiKeyManager:Activated] 사용자 서재 활성화 완료: 폴더='${user.folderName}'`);
     } else if (user.status === 'EXPIRED') {
       return { authenticated: false, reason: 'API_KEY_EXPIRED' };
     }
 
-    // 3. 마지막 접근 시각 갱신
     user.lastAccessedAt = new Date(now).toISOString();
     list[index] = user;
     writeJsonAtomic(API_KEYS_FILE, list);
 
-    // 4. 대상 사용자 전용 물리 경로 검증
     const safeCheck = validateSafePath(USERS_DIR, user.folderName);
     if (!safeCheck.safe) {
       return { authenticated: false, reason: 'INVALID_USER_DIRECTORY' };
@@ -297,22 +310,94 @@ export const apiKeyManager = {
   },
 
   /* ========================================================================= */
-  /* 📱 기기(Device ID) 식별, 6대 슬롯 한도 검증 및 개별 차단(Ban) 거버넌스      */
+  /* 🔢 3분 유효 6자리 일회용 연결 번호 (OTP) 엔진                               */
   /* ========================================================================= */
 
   /**
-   * 기기 접속 검증, 등록 및 최근 접속 갱신 (Heartbeat)
-   * @param {string} folderName - 대상 사용자 폴더명
-   * @param {Object} deviceInfo
-   * @param {string} deviceInfo.deviceId - 클라이언트 기기 고유 ID
-   * @param {string} [deviceInfo.deviceName=""] - 기기 모델/브라우저 라벨
-   * @param {string} [deviceInfo.clientIp=""] - 접속 IP
-   * @returns {{ allowed: boolean, reason?: string, device?: DeviceRecord, maxDevices?: number }}
+   * 🔢 [Host 기기] 3분 유효 6자리 연결 번호 발급
+   * @param {string} folderName - 사용자 폴더명
+   * @param {string} rawApiKey - 연결할 원본 API 키
+   * @returns {{ success: boolean, code?: string, displayCode?: string, expiresInSeconds?: number, error?: string }}
    */
+  issueDeviceOtp(folderName, rawApiKey) {
+    if (!folderName || !rawApiKey) {
+      return { success: false, error: '인증 정보가 부족합니다.' };
+    }
+
+    // 6자리 난수 번호 생성 (100000 ~ 999999)
+    let code = '';
+    let exists = true;
+    let attempts = 0;
+
+    while (exists && attempts < 20) {
+      code = String(Math.floor(100000 + Math.random() * 900000));
+      exists = deviceOtpStore.has(code);
+      attempts++;
+    }
+
+    const now = Date.now();
+    const expiresAt = now + OTP_TTL_MS;
+
+    deviceOtpStore.set(code, {
+      code,
+      folderName,
+      apiKey: rawApiKey,
+      expiresAt
+    });
+
+    const displayCode = `${code.substring(0, 3)}-${code.substring(3)}`;
+    console.log(`🔢 [ApiKeyManager:OTP] 6자리 연결 번호 발급 완료: [${displayCode}] ➔ 서재: '${folderName}' (3분 유효)`);
+
+    return {
+      success: true,
+      code,
+      displayCode,
+      expiresInSeconds: 180
+    };
+  },
+
+  /**
+   * 🔢 [Guest 기기] 6자리 연결 번호 검증 및 API 키 교환 (1회성 파쇄)
+   * @param {string} inputCode - 6자리 숫자 코드 (하이픈 허용)
+   * @returns {{ success: boolean, folderName?: string, apiKey?: string, error?: string }}
+   */
+  verifyAndExchangeDeviceOtp(inputCode) {
+    if (!inputCode) return { success: false, error: '연결 번호를 입력해 주세요.' };
+
+    const cleanCode = String(inputCode).replace(/[^0-9]/g, '').trim();
+    if (cleanCode.length !== 6) {
+      return { success: false, error: '6자리 숫자를 올바르게 입력해 주세요.' };
+    }
+
+    const item = deviceOtpStore.get(cleanCode);
+    if (!item) {
+      return { success: false, error: '유효하지 않거나 이미 만료된 연결 번호입니다.' };
+    }
+
+    const now = Date.now();
+    if (now > item.expiresAt) {
+      deviceOtpStore.delete(cleanCode);
+      return { success: false, error: '유효 시간(3분)이 초과되었습니다. 번호를 다시 발급받으세요.' };
+    }
+
+    // 🌟 1회성 즉시 파기 (Replay Attack 원천 방어)
+    deviceOtpStore.delete(cleanCode);
+    console.log(`✨ [ApiKeyManager:OTP] 6자리 번호 교환 성공 및 파기 완료: [${cleanCode}] ➔ 서재: '${item.folderName}'`);
+
+    return {
+      success: true,
+      folderName: item.folderName,
+      apiKey: item.apiKey
+    };
+  },
+
+  /* ========================================================================= */
+  /* 📱 기기(Device ID) 식별, 6대 슬롯 한도 검증 및 개별 차단(Ban) 거버넌스      */
+  /* ========================================================================= */
+
   verifyAndTouchDevice(folderName, { deviceId, deviceName = '', clientIp = '' } = {}) {
     if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
 
-    // 기기 식별자가 없는 구버전 클라이언트의 경우 과도기 호환을 위해 통과
     if (!deviceId || typeof deviceId !== 'string' || !deviceId.trim()) {
       return { allowed: true, device: null };
     }
@@ -334,9 +419,7 @@ export const apiKeyManager = {
 
     let device = user.devices[cleanDeviceId];
 
-    // 1. 이미 등록된 기기인 경우
     if (device) {
-      // 1-1. 차단된 기기인 경우 접근 차단
       if (device.status === 'blocked') {
         device.lastSeen = now;
         device.lastIp = cleanIp;
@@ -344,7 +427,6 @@ export const apiKeyManager = {
         return { allowed: false, reason: 'DEVICE_BLOCKED', device };
       }
 
-      // 1-2. 정상 활성 기기 정보 최신화
       device.lastSeen = now;
       device.lastIp = cleanIp;
       if (cleanDeviceName && cleanDeviceName !== '웹 리더 기기') {
@@ -354,14 +436,12 @@ export const apiKeyManager = {
       return { allowed: true, device };
     }
 
-    // 2. 신규 기기 등록 시도: 슬롯 한도 초과 검사
     const currentDeviceCount = Object.keys(user.devices).length;
     if (currentDeviceCount >= maxLimit) {
       console.warn(`⛔ [ApiKeyManager:DeviceLimit] 기기 슬롯 한도(${maxLimit}대) 초과 차단: 폴더='${folderName}', 신규기기='${cleanDeviceId}'`);
       return { allowed: false, reason: 'DEVICE_LIMIT_EXCEEDED', maxDevices: maxLimit };
     }
 
-    // 3. 신규 기기 자동 등록
     device = {
       deviceId: cleanDeviceId,
       deviceName: cleanDeviceName,
@@ -377,11 +457,6 @@ export const apiKeyManager = {
     return { allowed: true, device };
   },
 
-  /**
-   * 특정 사용자의 기기 목록 조회 (최신 접속순 정렬)
-   * @param {string} folderName 
-   * @returns {Array<DeviceRecord>}
-   */
   getUserDevices(folderName = '') {
     if (!folderName) return [];
     const list = readApiKeysData();
@@ -391,12 +466,6 @@ export const apiKeyManager = {
     return Object.values(user.devices).sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
   },
 
-  /**
-   * 특정 기기 차단 (Ban)
-   * @param {string} folderName 
-   * @param {string} deviceId 
-   * @returns {{ success: boolean, device?: DeviceRecord, error?: string }}
-   */
   blockDevice(folderName, deviceId) {
     if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
 
@@ -413,12 +482,6 @@ export const apiKeyManager = {
     return { success: true, device: user.devices[deviceId] };
   },
 
-  /**
-   * 특정 기기 차단 해제 (Unban)
-   * @param {string} folderName 
-   * @param {string} deviceId 
-   * @returns {{ success: boolean, device?: DeviceRecord, error?: string }}
-   */
   unblockDevice(folderName, deviceId) {
     if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
 
@@ -435,12 +498,6 @@ export const apiKeyManager = {
     return { success: true, device: user.devices[deviceId] };
   },
 
-  /**
-   * 특정 기기 등록 영구 삭제 (기기 슬롯 반환)
-   * @param {string} folderName 
-   * @param {string} deviceId 
-   * @returns {{ success: boolean, error?: string }}
-   */
   deleteDevice(folderName, deviceId) {
     if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
 
@@ -457,12 +514,6 @@ export const apiKeyManager = {
     return { success: true };
   },
 
-  /**
-   * 계정별 최대 허용 기기 수 변경
-   * @param {string} folderName 
-   * @param {number} maxDevices 
-   * @returns {{ success: boolean, maxDevices?: number, error?: string }}
-   */
   updateUserMaxDevices(folderName = '', maxDevices = DEFAULT_MAX_DEVICES) {
     if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
 
@@ -481,11 +532,6 @@ export const apiKeyManager = {
     return { success: true, folderName, maxDevices: validLimit, memo: list[index].memo };
   },
 
-  /**
-   * 🔄 [무손실 키 재발급] 기존 도서/설정 폴더를 100% 보존하면서 새 API 키로 교체 발급
-   * @param {string} folderName - 대상 사용자 폴더명
-   * @returns {{ success: boolean, newApiKey?: string, folderName?: string, memo?: string, expiresAt?: string, error?: string }}
-   */
   reissueApiKey(folderName = '') {
     if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
 
@@ -502,7 +548,6 @@ export const apiKeyManager = {
     const now = Date.now();
     const expiresAt = new Date(now + ACTIVATION_WINDOW_MS).toISOString();
 
-    // 기존 도서 및 설정 폴더는 그대로 보존하고 키와 24시간 활성화 기한만 갱신
     list[index].keyHash = newHash;
     list[index].status = 'PENDING';
     list[index].expiresAt = expiresAt;
@@ -520,12 +565,6 @@ export const apiKeyManager = {
     };
   },
 
-  /**
-   * ⚙️ [사용자별 도서 저장 용량 실시간 변경]
-   * @param {string} folderName - 대상 사용자 폴더명
-   * @param {number} quotaMb - 변경할 새 할당 용량 (MB 단위)
-   * @returns {{ success: boolean, folderName?: string, quotaMb?: number, memo?: string, error?: string }}
-   */
   updateUserQuota(folderName = '', quotaMb = 1024) {
     if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
 
@@ -549,12 +588,6 @@ export const apiKeyManager = {
     };
   },
 
-  /**
-   * 🗑️ [API 키 폐기 및 선택적 도서 폴더 영구 삭제]
-   * @param {string} folderName - 삭제할 사용자 폴더명
-   * @param {boolean} [deleteFolder=false] - 도서/설정 폴더 디스크 물리 삭제 여부
-   * @returns {{ success: boolean, error?: string }}
-   */
   revokeApiKey(folderName = '', deleteFolder = false) {
     if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
 
@@ -564,11 +597,9 @@ export const apiKeyManager = {
       return { success: false, error: '해당 사용자를 찾을 수 없습니다.' };
     }
 
-    // 1. 메타데이터에서 제거
     list.splice(index, 1);
     writeJsonAtomic(API_KEYS_FILE, list);
 
-    // 2. 도서 폴더 디스크 파쇄 (관리자 선택 시)
     if (deleteFolder) {
       const userRoot = path.join(USERS_DIR, folderName);
       const safeCheck = validateSafePath(USERS_DIR, folderName);
@@ -587,10 +618,6 @@ export const apiKeyManager = {
     return { success: true };
   },
 
-  /**
-   * 🧹 [24시간 미등록 고아 폴더 자동 정리]
-   * 24시간 동안 활성화되지 않고 만료된 PENDING 키 및 빈 폴더 디스크 청소
-   */
   cleanupExpiredPendingKeys() {
     const list = readApiKeysData();
     const now = Date.now();
@@ -620,10 +647,6 @@ export const apiKeyManager = {
     }
   },
 
-  /**
-   * 📊 [관리자 대시보드 표출용 사용자 목록 및 실측 용량/기기 현황 조회]
-   * @returns {Array<Object>}
-   */
   getUserListForAdmin() {
     this.cleanupExpiredPendingKeys();
     const list = readApiKeysData();
@@ -656,7 +679,6 @@ export const apiKeyManager = {
         remainingHours = diffMs > 0 ? (diffMs / (1000 * 60 * 60)).toFixed(1) : '0.0';
       }
 
-      // 기기 통계 산출
       const devicesMap = u.devices || {};
       const devicesList = Object.values(devicesMap);
       const blockedDeviceCount = devicesList.filter(d => d.status === 'blocked').length;

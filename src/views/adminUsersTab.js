@@ -41,7 +41,6 @@ export function renderUsersTab(env = {}) {
   const users = apiKeyManager.getUserListForAdmin();
 
   let userRowsHtml = '';
-  // 기기 목록을 클라이언트 JS로 안전하게 넘기기 위한 딕셔너리 맵
   const userDevicesDataMap = {};
 
   if (!users || users.length === 0) {
@@ -71,7 +70,6 @@ export function renderUsersTab(env = {}) {
       const devCount = u.deviceCount || 0;
       const blockedCount = u.blockedDeviceCount || 0;
 
-      // 안전한 데이터 맵핑 (특수문자/따옴표 충돌 방어)
       userDevicesDataMap[u.folderName] = {
         folderName: u.folderName,
         memo: u.memo,
@@ -81,7 +79,6 @@ export function renderUsersTab(env = {}) {
         devices: u.devices || []
       };
 
-      // 기기 수 배지 구성
       let deviceBadge = `<span style="font-size: 12.5px; font-weight: 700; color: #38bdf8;">${devCount}</span><span style="font-size: 11px; color: var(--text-muted);">/${maxDev}대</span>`;
       if (blockedCount > 0) {
         deviceBadge += ` <span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-weight: 700;">${blockedCount}차단</span>`;
@@ -126,7 +123,6 @@ export function renderUsersTab(env = {}) {
     }).join('');
   }
 
-  // 서버에서 클라이언트로 넘길 JSON 데이터 문자열
   const clientDataScript = `<script>window.__USER_DEVICES_MAP__ = ${JSON.stringify(userDevicesDataMap)};</script>`;
 
   return `
@@ -137,7 +133,6 @@ export function renderUsersTab(env = {}) {
         <span class="badge badge-success">샌드박스 격리 중</span>
       </div>
 
-      <!-- 🌟 [상단 일괄 액션 제어 툴바] -->
       <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; background: #0f172a; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 14px;">
         <div style="font-size: 12.5px; color: var(--text-muted); display: flex; align-items: center; gap: 6px;">
           <span>선택:</span>
@@ -163,7 +158,6 @@ export function renderUsersTab(env = {}) {
         </div>
       </div>
 
-      <!-- 행 내부 버튼 제거로 가로폭 100% 확보된 깔끔한 관제 테이블 -->
       <div style="overflow-x: auto; border: 1px solid var(--border); border-radius: 8px;">
         <table class="data-table" style="margin: 0; min-width: 680px;">
           <thead>
@@ -185,12 +179,11 @@ export function renderUsersTab(env = {}) {
       </div>
     </div>
 
-    <!-- 숨겨진 재발급 제출 전용 폼 -->
     <form id="form-reissue-hidden" method="POST" action="/admin/users/reissue" style="display: none;">
       <input type="hidden" id="hidden-reissue-folder" name="folderName" value="">
     </form>
 
-    <!-- 1. 신규 사용자 발급 모달 (기기 기본 한도 6대 탑재) -->
+    <!-- 1. 신규 사용자 발급 모달 -->
     <div class="modal-overlay" id="modal-create-user">
       <div class="modal-box" style="max-width: 440px;">
         <div class="modal-header">
@@ -305,7 +298,7 @@ export function renderUsersTab(env = {}) {
       </div>
     </div>
 
-    <!-- 4. 📱 [신규] 등록 기기 관리 및 개별 차단 모달 -->
+    <!-- 4. 📱 등록 기기 관리 및 개별 차단 모달 -->
     <div class="modal-overlay" id="modal-user-devices">
       <div class="modal-box" style="max-width: 620px;">
         <div class="modal-header">
@@ -329,7 +322,6 @@ export function renderUsersTab(env = {}) {
           </div>
 
           <div id="devices-list-container" style="max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
-            <!-- 자바스크립트로 기기 테이블 동적 렌더링 -->
           </div>
         </div>
         <div class="modal-footer">
@@ -479,13 +471,8 @@ export function renderUsersTab(env = {}) {
           });
 
           if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
-          const data = await res.json();
-
-          // 메모리 객체 갱신
           const d = activeSelectedUser.devices.find(function(item) { return item.deviceId === deviceId; });
           if (d) d.status = shouldBlock ? 'blocked' : 'active';
-
-          // UI 인플레이스 갱신
           renderDevicesTableInModal();
         } catch (err) {
           alert('기기 상태 변경 실패: ' + err.message);
@@ -510,8 +497,6 @@ export function renderUsersTab(env = {}) {
           });
 
           if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
-          
-          // 메모리 객체에서 제거
           activeSelectedUser.devices = activeSelectedUser.devices.filter(function(item) { return item.deviceId !== deviceId; });
           renderDevicesTableInModal();
         } catch (err) {
@@ -547,7 +532,7 @@ export function renderUsersTab(env = {}) {
           if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
           activeSelectedUser.maxDevices = newLimit;
           renderDevicesTableInModal();
-          alert('✔ 최대 기기 한도가 ' + newLimit + '대로 변경되었습니다.\\n(페이지 새로고침 시 메인 테이블에도 반영됩니다)');
+          alert('✔ 최대 기기 한도가 ' + newLimit + '대로 변경되었습니다.');
         } catch (err) {
           alert('한도 변경 실패: ' + err.message);
         }
