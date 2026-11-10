@@ -1,6 +1,7 @@
 /**
  * @file src/adminViews.js
  * @description 관리자 제어 센터 메인 뷰 오케스트레이터 및 파사드 모듈 (Facade)
+ * - 🎨 [슬림 다크 스크롤바] 전역 6px 커스텀 스크롤바 CSS 적용으로 세로/가로 스크롤 디자인 일체화
  * - 👥 [3단 탭 네비게이션] STORAGE_MODE=true 시 [📊 관제 대시보드] | [👥 사용자 관리] | [⚙️ 시스템 설정] 3단 탭 지원
  * - 🔑 [신규 발급 키 1회 복사 팝업] newIssuedKey 전달 시 화면 로딩 즉시 복사 모달 자동 팝업
  * - 🔒 [인증 뷰 위임] renderAuthGateHtml, renderLoginPageHtml ➔ adminAuthViews.js
@@ -30,8 +31,8 @@ export { renderAuthGateHtml, renderLoginPageHtml };
  * @param {import('http').IncomingMessage} req 
  * @param {string|null} [successMessage=null] 
  * @param {string|null} [errorMessage=null] 
- * @param {Object|null} [newIssuedKeyInfo=null] - 신규 발급 또는 재발급된 API 키 정보 { apiKey, folderName, memo, expiresAt }
- * @returns {string} 완성된 관리자 대시보드 전체 HTML 문자열
+ * @param {Object|null} [newIssuedKeyInfo=null] - 신규 발급 또는 재발급된 API 키 정보
+ * @returns {string}
  */
 export function renderAdminSettingsHtml(req, successMessage = null, errorMessage = null, newIssuedKeyInfo = null) {
   const env = readEnvFile();
@@ -49,7 +50,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
   const recentLogs = auditLogger.getRecentLogs();
   const crashReports = storageService.getCrashReportsList();
 
-  // 현재 공유 폴더 권한 상태 실측
   let sharedDirBadge = '<span class="badge badge-warning">미설정</span>';
   if (sharedBooksDir) {
     const perm = storageService.testDirectoryPermissions(sharedBooksDir);
@@ -67,13 +67,8 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     alertBanner = `<div class="alert alert-error">❌ ${errorMessage}</div>`;
   }
 
-  // 1. [탭 1: 관제 대시보드] 조각 렌더링
   const dashboardTabContent = renderDashboardTab(metrics, recentLogs, crashReports, env);
-
-  // 2. [탭 2: 사용자 & API 관리] 조각 렌더링 (신규 탑재)
   const usersTabContent = renderUsersTab(env);
-
-  // 3. [탭 3: 시스템 설정] 조각 렌더링
   const settingsTabContent = renderSettingsTab({
     env,
     config,
@@ -82,11 +77,8 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     hasToken,
     sharedDirBadge
   });
-
-  // 4. [간이 파일 탐색기 모달 및 클라이언트 스크립트] 조각 렌더링
   const modalAndScriptContent = renderFolderModalAndScript();
 
-  // 🌟 [신규 발급 키 1회 복사 모달 HTML]
   let keyModalHtml = '';
   if (newIssuedKeyInfo && newIssuedKeyInfo.apiKey) {
     keyModalHtml = `
@@ -145,6 +137,27 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       --warning: #f59e0b;
       --danger: #ef4444;
     }
+
+    /* 🌟 [슬림 다크 커스텀 스크롤바 - 두께 6px] */
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: #334155 transparent;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg);
@@ -157,7 +170,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       box-sizing: border-box;
     }
     .container {
-      max-width: 720px;
+      max-width: 760px;
       width: 100%;
     }
     .header {
@@ -290,7 +303,7 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     }
     .data-table th {
       border-bottom: 1px solid var(--border);
-      padding: 8px;
+      padding: 10px 8px;
       font-size: 11.5px;
       color: var(--text-muted);
       text-transform: uppercase;
@@ -653,7 +666,6 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
 
     ${alertBanner}
 
-    <!-- 상단 네비게이션 탭 바 (STORAGE_MODE에 따라 2단 또는 3단 동적 활성화) -->
     <div class="tab-nav">
       <button type="button" class="tab-btn active" id="tab-btn-dashboard" onclick="switchAdminTab('dashboard')">
         <span>📊</span> 관제 대시보드
@@ -668,19 +680,16 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
       </button>
     </div>
 
-    <!-- 📊 [탭 1] 관제 대시보드 -->
     <div id="tab-content-dashboard" class="tab-content active">
       ${dashboardTabContent}
     </div>
 
-    <!-- 👥 [탭 2] 사용자 & API 저장소 관리 (개인 서버 모드 전용) -->
     ${isStorageMode ? `
     <div id="tab-content-users" class="tab-content">
       ${usersTabContent}
     </div>
     ` : ''}
 
-    <!-- ⚙️ [탭 3] 시스템 설정 -->
     <div id="tab-content-settings" class="tab-content">
       ${settingsTabContent}
     </div>
@@ -688,14 +697,10 @@ export function renderAdminSettingsHtml(req, successMessage = null, errorMessage
     <a href="${readerUrl}" class="btn-return">📖 EPUB 웹 서재로 돌아가기</a>
   </div>
 
-  <!-- 📁 간이 파일 탐색기 모달 다이얼로그 및 제어 스크립트 -->
   ${modalAndScriptContent}
-
-  <!-- 🌟 [신규 발급 키 1회 복사 모달] -->
   ${keyModalHtml}
 
   <script>
-    // 3단 탭 전환 헬퍼 확장
     function switchAdminTab(tabName) {
       const tabs = ['dashboard', 'users', 'settings'];
       tabs.forEach(t => {

@@ -1,34 +1,48 @@
 /**
  * @file src/views/adminDashboardTab.js
  * @description 관리자 제어 센터 [탭 1: 📊 관제 대시보드] HTML 렌더러 모듈
+ * - 👥 [사용자 칼럼 신설] 활동 로그 테이블에 사용자 메모/서재 칼럼 표출
+ * - ↔️ [가로/세로 2D 스크롤 박스] max-height: 400px (10행 기준) + overflow: auto 로 오른쪽 끝 잘림 방지
+ * - 📌 [스티키 헤더 탑재] 스크롤을 내려도 thead th가 상단에 고정되어 가독성 극대화
  * - 💾 [디스크 및 도서 메트릭] 활성/보관 도서 권수 및 실측 디스크 용량 현황 카드
- * - 🚨 [동적 보안 위협 감지 배지] 403 차단, 429 락 발생 시 실시간 경고 배지 및 차단 건수 카운터 작동
- * - 📁 [일자별 감사 로그 다운로드 센터] data/logs/YYYY/MM/DD/ 영구 저장 파일 목록 표출 및 즉시 다운로드/삭제
- * - 📋 [실시간 활동 로그] 최근 30건 FIFO 링 버퍼 활동 내역 및 상태 코드 표출
- * - 🔬 [크래시 리포트 센터] 뷰어 조판 결함 진단 리포트 목록 및 다운로드/일괄 정리
+ * - 📁 [일자별 감사 로그 다운로드 센터] 일자별 영구 저장 파일 목록 및 스크롤 박스
+ * - 🔬 [크래시 리포트 센터] 뷰어 조판 결함 진단 리포트 스크롤 테이블
  */
 
 import { auditLogger } from '../auditLogger.js';
 
 /**
- * 📊 [탭 1] 관제 대시보드 HTML 템플릿 렌더러 (동적 위협 감지 및 일자별 로그 아카이브 통합)
- * @param {Object} metrics - auditLogger 저장소 메트릭 객체
- * @param {Array} recentLogs - auditLogger 최근 활동 로그 배열
- * @param {Array} crashReports - storageService 크래시 리포트 목록
- * @param {Object} env - readEnvFile() 환경변수 객체
- * @returns {string} 탭 1 본문 HTML 문자열
+ * HTML 특수문자 이스케이프 헬퍼
+ * @param {string} str 
+ * @returns {string}
+ */
+function escapeHtml(str = '') {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * 📊 [탭 1] 관제 대시보드 HTML 템플릿 렌더러
+ * @param {Object} metrics 
+ * @param {Array} recentLogs 
+ * @param {Array} crashReports 
+ * @param {Object} env 
+ * @returns {string}
  */
 export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports = [], env = {}) {
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
   const isOriginStrict = allowedOrigin !== '*';
 
-  // 🛡️ 실시간 위협 및 차단 건수 동적 집계
   const count403 = recentLogs.filter(l => l.status === 403 || l.status === 405).length;
   const count429 = recentLogs.filter(l => l.status === 429).length;
   const count500 = recentLogs.filter(l => l.status >= 500).length;
   const totalThreats = count403 + count429;
 
-  // 동적 상태 배지 결정
   let securityBadgeHtml = '<span class="badge badge-success">✔ 실시간 보호 중 (위협 0건)</span>';
   if (totalThreats > 0) {
     securityBadgeHtml = `<span class="badge badge-error" style="background:rgba(239,68,68,0.25);color:#f87171;border:1px solid #ef4444;font-weight:700;">🚨 최근 차단 ${totalThreats}건 감지</span>`;
@@ -36,7 +50,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     securityBadgeHtml = `<span class="badge badge-warning">⚠️ 서버 오류 ${count500}건 발생</span>`;
   }
 
-  // 1. 최근 30건 활동 로그 테이블 마크업
+  // 1. 최근 30건 활동 로그 테이블 (사용자 열 추가 및 오른쪽 끝 잘림 방지 스타일)
   let activityLogsHtml = '';
   if (!recentLogs || recentLogs.length === 0) {
     activityLogsHtml = `
@@ -54,29 +68,37 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       else if (l.status === 404) statusBadge = '<span class="status-pill status-404">404 없음</span>';
       else if (l.status >= 500) statusBadge = `<span class="status-pill status-500">${l.status} 에러</span>`;
 
+      const safeUser = escapeHtml(l.user || '-');
+      const userBadge = safeUser.includes('Root') || safeUser === '-'
+        ? `<span style="color:var(--text-muted); font-size:11.5px;">${safeUser}</span>`
+        : `<span style="color:#38bdf8; font-weight:600; font-size:12px;">👤 ${safeUser}</span>`;
+
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted);">${l.timestamp}</td>
-          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8;">${l.ip}</td>
-          <td style="font-size: 12px; color: #e2e8f0;">${l.device}</td>
-          <td style="font-size: 12px; font-weight: 600;">${l.action}</td>
-          <td style="font-size: 11.5px; color: var(--text-muted); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${l.target}</td>
-          <td style="text-align: right;">${statusBadge}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">${l.timestamp}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: #a78bfa; white-space: nowrap;">${l.ip}</td>
+          <td style="white-space: nowrap;">${userBadge}</td>
+          <td style="font-size: 11.5px; color: #e2e8f0; white-space: nowrap;">${l.device}</td>
+          <td style="font-size: 12px; font-weight: 600; white-space: nowrap;">${l.action}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(l.target)}">${escapeHtml(l.target)}</td>
+          <td style="text-align: right; white-space: nowrap;">${statusBadge}</td>
         </tr>
       `;
     }).join('');
 
+    // 🌟 [핵심 개선] max-height: 400px (10행 기준) 세로 스크롤 + overflow-x: auto (가로 스크롤로 오른쪽 끝 보장) + sticky 헤더
     activityLogsHtml = `
-      <div style="overflow-x: auto; margin-top: 8px;">
-        <table class="data-table">
-          <thead>
+      <div style="max-height: 400px; overflow: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: #0f172a;">
+        <table class="data-table" style="min-width: 720px; border-collapse: separate; border-spacing: 0;">
+          <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
-              <th>시각</th>
-              <th>IP</th>
-              <th>기기 / 환경</th>
-              <th>동작</th>
-              <th>대상</th>
-              <th style="text-align: right;">상태</th>
+              <th style="background: #1e293b;">시각</th>
+              <th style="background: #1e293b;">IP</th>
+              <th style="background: #1e293b;">사용자 (서재)</th>
+              <th style="background: #1e293b;">기기 / 환경</th>
+              <th style="background: #1e293b;">동작</th>
+              <th style="background: #1e293b;">대상</th>
+              <th style="background: #1e293b; text-align: right;">상태</th>
             </tr>
           </thead>
           <tbody>
@@ -87,7 +109,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 2. 📁 [신규] 일자별 감사 로그 아카이브 목록 조회 및 마크업
+  // 2. 일자별 감사 로그 아카이브 목록 (스크롤 컨테이너 적용)
   const logFiles = auditLogger.getLogFilesList();
   let logFilesHtml = '';
   if (!logFiles || logFiles.length === 0) {
@@ -102,18 +124,18 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       const encodedRelPath = encodeURIComponent(f.relativePath);
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8;">
+          <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8; white-space: nowrap;">
             📅 ${f.date}
           </td>
-          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted);">
+          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">
             ${f.relativePath}
           </td>
-          <td style="text-align: center;">
+          <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
               ${f.linesCount}건 기록
             </span>
           </td>
-          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right;">${f.sizeKb}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${f.sizeKb}</td>
           <td style="text-align: right; white-space: nowrap;">
             <a href="/admin/logs/download?file=${encodedRelPath}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
             <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" onclick="return confirm('${f.date} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
@@ -123,15 +145,15 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     }).join('');
 
     logFilesHtml = `
-      <div style="overflow-x: auto; margin-top: 8px;">
-        <table class="data-table">
-          <thead>
+      <div style="max-height: 380px; overflow: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: #0f172a;">
+        <table class="data-table" style="min-width: 600px; border-collapse: separate; border-spacing: 0;">
+          <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
-              <th>기록 일자</th>
-              <th>저장 경로</th>
-              <th style="text-align: center;">활동/접근 수</th>
-              <th style="text-align: right;">용량</th>
-              <th style="text-align: right;">작업</th>
+              <th style="background: #1e293b;">기록 일자</th>
+              <th style="background: #1e293b;">저장 경로</th>
+              <th style="background: #1e293b; text-align: center;">활동/접근 수</th>
+              <th style="background: #1e293b; text-align: right;">용량</th>
+              <th style="background: #1e293b; text-align: right;">작업</th>
             </tr>
           </thead>
           <tbody>
@@ -142,7 +164,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 3. 크래시 리포트 테이블 마크업
+  // 3. 크래시 리포트 테이블 (10개 스크롤 컨테이너 적용)
   let crashReportsHtml = '';
   if (!crashReports || crashReports.length === 0) {
     crashReportsHtml = `
@@ -161,14 +183,14 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8;">${r.fileName}</td>
-          <td style="font-size: 12px; color: var(--text-muted);">${dateStr}</td>
-          <td style="text-align: center;">
+          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8; white-space: nowrap;">${r.fileName}</td>
+          <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">${dateStr}</td>
+          <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
               ${r.totalAnomalies}건
             </span>
           </td>
-          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right;">${r.sizeKb}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${r.sizeKb}</td>
           <td style="text-align: right; white-space: nowrap;">
             <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
             <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
@@ -178,15 +200,15 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     }).join('');
 
     crashReportsHtml = `
-      <div style="overflow-x: auto; margin-top: 8px;">
-        <table class="data-table">
-          <thead>
+      <div style="max-height: 380px; overflow: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: #0f172a;">
+        <table class="data-table" style="min-width: 580px; border-collapse: separate; border-spacing: 0;">
+          <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
-              <th>파일명</th>
-              <th>발생 시각</th>
-              <th style="text-align: center;">결함 수</th>
-              <th style="text-align: right;">크기</th>
-              <th style="text-align: right;">작업</th>
+              <th style="background: #1e293b;">파일명</th>
+              <th style="background: #1e293b;">발생 시각</th>
+              <th style="background: #1e293b; text-align: center;">결함 수</th>
+              <th style="background: #1e293b; text-align: right;">크기</th>
+              <th style="background: #1e293b; text-align: right;">작업</th>
             </tr>
           </thead>
           <tbody>
@@ -223,7 +245,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </p>
     </div>
 
-    <!-- 2. 🛡️ 서버 보안 거버넌스 및 동적 방어선 상태 카드 -->
+    <!-- 2. 서버 보안 거버넌스 및 방어선 상태 카드 -->
     <div class="card">
       <div class="section-title">
         <span>🛡️ 서버 보안 거버넌스 및 방어선 상태</span>
@@ -275,7 +297,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </div>
     </div>
 
-    <!-- 3. 📁 [신규] 일자별 보안 감사 로그 다운로드 센터 -->
+    <!-- 3. 일자별 보안 감사 로그 다운로드 센터 (스크롤 박스 적용) -->
     <div class="card">
       <div class="section-title">
         <span>📁 일자별 보안 감사 로그 다운로드 센터 (${logFiles.length}일분 보관 중)</span>
@@ -286,19 +308,19 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       ${logFilesHtml}
     </div>
 
-    <!-- 4. 최근 30건 실시간 기기/IP 활동 로그 위젯 (RAM) -->
+    <!-- 4. 최근 30건 실시간 기기/IP 활동 로그 위젯 (사용자 열 추가 및 10행 세로/가로 스크롤 적용) -->
     <div class="card">
       <div class="section-title">
         <span>📋 최근 실시간 활동 로그 (최근 30건 FIFO 링 버퍼)</span>
         <span class="badge badge-success">실시간 관제 중</span>
       </div>
       <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        웹 뷰어의 도서 동기화, 다운로드 및 비인가 접근 차단 이력이 서버 RAM에 최신순으로 표출됩니다.
+        사용자별 도서 동기화, 다운로드 및 접근 이력이 표출됩니다. (10행 이상 시 세로 및 좌우 스크롤 지원)
       </p>
       ${activityLogsHtml}
     </div>
 
-    <!-- 5. 조판 결함 및 크래시 리포트 다운로드 센터 -->
+    <!-- 5. 조판 결함 및 크래시 리포트 다운로드 센터 (10행 스크롤 적용) -->
     <div class="card">
       <div class="section-title">
         <span>🔬 조판 결함 및 크래시 리포트 (${crashReports ? crashReports.length : 0}건)</span>

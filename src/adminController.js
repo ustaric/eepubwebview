@@ -1,6 +1,7 @@
 /**
  * @file src/adminController.js
  * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 다중 사용자 API 관리 및 설정 저장 전담 컨트롤러
+ * - ⚙️ [용량 변경 라우트 탑재] POST /admin/users/update-quota 지원으로 사용자별 도서 할당 용량 실시간 갱신
  * - 👥 [다중 사용자 관리 라우트 탑재] /admin/users/create, /admin/users/reissue, /admin/users/delete 핸들러
  * - 🔑 [발급 키 1회 복사 지원] 신규/재발급 성공 시 원문 API 키를 관리자 화면에 즉시 모달로 표출
  * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 직통 위임 유지
@@ -149,7 +150,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     const loginGuard = checkLoginRateLimit(clientIp);
     if (!loginGuard.allowed) {
       console.warn(`⛔ [Login Lock] 무차별 대입 방어로 IP ${clientIp} 차단 중 (${loginGuard.waitMinutes}분 남음)`);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 시도', target: '차단 잠금', status: 429 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 시도', target: '차단 잠금', status: 429, user: 'Root Admin' });
       const html = renderLoginPageHtml(`로그인 시도 횟수가 초과되었습니다. ${loginGuard.waitMinutes}분 후에 다시 시도해 주세요.`, false);
       res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html);
@@ -174,7 +175,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
         writeEnvFile({ ADMIN_PASSWORD: inputPass });
         clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200, user: 'Root Admin' });
 
         const sessionToken = createAdminSession();
         res.writeHead(302, {
@@ -187,7 +188,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
       if (inputPass === currentPass) {
         clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200, user: 'Root Admin' });
         const sessionToken = createAdminSession();
         res.writeHead(302, {
           'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
@@ -197,7 +198,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       } else {
         recordLoginFailure(clientIp);
         const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401, user: 'Root Admin' });
         const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
@@ -210,7 +211,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
   if (req.method === 'GET' && pathname === '/admin/logout') {
     const cookies = parseCookies(req);
     destroyAdminSession(cookies['admin_session']);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그아웃', target: '세션 파기', status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그아웃', target: '세션 파기', status: 200, user: 'Root Admin' });
     res.writeHead(302, {
       'Set-Cookie': 'admin_session=; Path=/; HttpOnly; Max-Age=0',
       'Location': '/admin'
@@ -238,7 +239,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
   }
 
   // =========================================================================
-  // 👥 4. 다중 사용자 API 키 관리 라우트 (신규 탑재)
+  // 👥 4. 다중 사용자 API 키 관리 라우트
   // =========================================================================
 
   // 1) [새 사용자 키 발급] POST /admin/users/create
@@ -263,10 +264,10 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
           userAgent,
           action: '👥 새 사용자 키 발급',
           target: `${memo} (${result.folderName})`,
-          status: 200
+          status: 200,
+          user: `${memo} (${result.folderName})`
         });
 
-        // 🌟 새로 발급된 API 키 정보를 포함하여 대시보드 렌더링 (모달 즉시 표출)
         const html = renderAdminSettingsHtml(req, '새 사용자 API 키가 발급되었습니다!', null, {
           type: 'CREATE',
           apiKey: result.apiKey,
@@ -311,10 +312,10 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
           userAgent,
           action: '🔄 사용자 키 재발급',
           target: `${result.memo} (${folderName})`,
-          status: 200
+          status: 200,
+          user: `${result.memo} (${folderName})`
         });
 
-        // 🌟 재발급된 새 API 키 정보를 포함하여 모달 표출
         const html = renderAdminSettingsHtml(req, `'${result.memo}' 사용자의 새 API 키가 발급되었습니다. (기존 책 100% 보존)`, null, {
           type: 'REISSUE',
           apiKey: result.newApiKey,
@@ -334,7 +335,49 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 3) [사용자 삭제] POST /admin/users/delete
+  // 3) [사용자 도서 저장 용량 변경] POST /admin/users/update-quota (신규 탑재)
+  if (req.method === 'POST' && pathname === '/admin/users/update-quota') {
+    if (!isAuthenticated(req)) {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const quotaMb = parseInt(params.get('quotaMb') || '1024', 10);
+
+        const result = apiKeyManager.updateUserQuota(folderName, quotaMb);
+        if (!result.success) {
+          throw new Error(result.error || '용량 변경 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '⚙️ 서재 용량 변경',
+          target: `${result.memo} ➔ ${result.quotaMb}MB`,
+          status: 200,
+          user: `${result.memo} (${folderName})`
+        });
+
+        const html = renderAdminSettingsHtml(req, `'${result.memo}' (${folderName}) 서재의 저장 용량이 ${result.quotaMb}MB로 변경되었습니다.`);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      } catch (err) {
+        const html = renderAdminSettingsHtml(req, null, '용량 변경 실패: ' + err.message);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      }
+    });
+    return true;
+  }
+
+  // 4) [사용자 삭제] POST /admin/users/delete
   if (req.method === 'POST' && pathname === '/admin/users/delete') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -360,7 +403,8 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
           userAgent,
           action: deleteFolder ? '🗑️ 사용자 및 도서 완전 삭제' : '🔒 사용자 API 키 폐기',
           target: folderName,
-          status: 200
+          status: 200,
+          user: folderName
         });
 
         const successMsg = deleteFolder
@@ -454,7 +498,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     }
 
     const downloadFileName = path.basename(relFile).replace(/\.jsonl$/i, '.json');
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📥 감사 로그 다운로드', target: downloadFileName, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📥 감사 로그 다운로드', target: downloadFileName, status: 200, user: 'Root Admin' });
 
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
@@ -479,7 +523,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       const pathCheck = validateSafePath(LOGS_DIR, relFile);
       if (pathCheck.safe) {
         auditLogger.deleteLogFile(relFile);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🗑️ 감사 로그 삭제', target: relFile, status: 200 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🗑️ 감사 로그 삭제', target: relFile, status: 200, user: 'Root Admin' });
       }
     }
 
@@ -504,7 +548,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       return true;
     }
 
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 다운로드', target: fileName, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 다운로드', target: fileName, status: 200, user: 'Root Admin' });
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Length': info.size,
@@ -525,7 +569,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
     const fileName = decodeURIComponent(pathname.replace('/admin/crash-reports/delete/', ''));
     storageService.deleteCrashReport(fileName);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 삭제', target: fileName, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 삭제', target: fileName, status: 200, user: 'Root Admin' });
     res.writeHead(302, { Location: '/admin' });
     res.end();
     return true;
@@ -540,7 +584,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     }
 
     storageService.clearAllCrashReports();
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 전체 삭제', target: 'all', status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 전체 삭제', target: 'all', status: 200, user: 'Root Admin' });
     res.writeHead(302, { Location: '/admin' });
     res.end();
     return true;
@@ -611,7 +655,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
           ensureStorageDirectories();
         }
 
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 설정 저장', target: '.env 전체 갱신', status: 200, user: 'Root Admin' });
 
         const html = renderAdminSettingsHtml(req, '설정이 성공적으로 저장되었습니다!');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

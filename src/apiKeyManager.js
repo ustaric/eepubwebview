@@ -1,6 +1,7 @@
 /**
  * @file src/apiKeyManager.js
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 사용자 디렉터리 생명주기 관리 엔진
+ * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
  * - 👥 [보관 도서 합산 집계] getUserListForAdmin에서 books/ 및 archive/ 도서 권수 동시 실측
  * - 🔑 [SHA-256 단방향 해싱] 서버 디스크에는 해시값만 저장하여 비밀 키 원문 유출 원천 차단
  * - ⏳ [24시간 활성화 윈도우] 발급 후 24시간 내 미접속 시 EXPIRED 자동 만료 및 고아 폴더 회수
@@ -312,6 +313,35 @@ export const apiKeyManager = {
   },
 
   /**
+   * ⚙️ [사용자별 도서 저장 용량 실시간 변경]
+   * @param {string} folderName - 대상 사용자 폴더명
+   * @param {number} quotaMb - 변경할 새 할당 용량 (MB 단위)
+   * @returns {{ success: boolean, folderName?: string, quotaMb?: number, memo?: string, error?: string }}
+   */
+  updateUserQuota(folderName = '', quotaMb = 1024) {
+    if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
+
+    const list = readApiKeysData();
+    const index = list.findIndex(item => item.folderName === folderName);
+    if (index === -1) {
+      return { success: false, error: '해당 사용자를 찾을 수 없습니다.' };
+    }
+
+    const validMb = Math.max(50, Math.min(1024000, parseInt(quotaMb, 10) || 1024));
+    list[index].storageQuotaBytes = validMb * 1024 * 1024;
+
+    writeJsonAtomic(API_KEYS_FILE, list);
+    console.log(`⚙️ [ApiKeyManager:QuotaUpdated] 사용자('${folderName}') 저장 용량 변경 완료: ${validMb} MB`);
+
+    return {
+      success: true,
+      folderName,
+      quotaMb: validMb,
+      memo: list[index].memo
+    };
+  },
+
+  /**
    * 🗑️ [API 키 폐기 및 선택적 도서 폴더 영구 삭제]
    * @param {string} folderName - 삭제할 사용자 폴더명
    * @param {boolean} [deleteFolder=false] - 도서/설정 폴더 디스크 물리 삭제 여부
@@ -398,7 +428,6 @@ export const apiKeyManager = {
       const usedBytes = getDirectorySize(userRoot);
       const quotaBytes = u.storageQuotaBytes || (1024 * 1024 * 1024);
 
-      // 🌟 [핵심 수정] books/ 뿐만 아니라 archive/ 폴더의 도서 권수까지 정확히 합산 집계!
       let activeCount = 0;
       let archivedCount = 0;
       if (fs.existsSync(booksDir)) {
