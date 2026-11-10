@@ -1,6 +1,8 @@
 /**
  * @file src/adminController.js
  * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 다중 사용자 API 관리 및 설정 저장 전담 컨트롤러
+ * - 📱 [기기 관리 라우트 탑재] /admin/users/devices/block, unblock, delete 지원으로 특정 기기 핀포인트 밴 및 슬롯 반환
+ * - 📱 [기기 한도 변경 라우트] POST /admin/users/update-max-devices 지원으로 계정별 최대 허용 기기 수(기본 6대) 조절
  * - ⚙️ [용량 변경 라우트 탑재] POST /admin/users/update-quota 지원으로 사용자별 도서 할당 용량 실시간 갱신
  * - 👥 [다중 사용자 관리 라우트 탑재] /admin/users/create, /admin/users/reissue, /admin/users/delete 핸들러
  * - 🔑 [발급 키 1회 복사 지원] 신규/재발급 성공 시 원문 API 키를 관리자 화면에 즉시 모달로 표출
@@ -239,10 +241,10 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
   }
 
   // =========================================================================
-  // 👥 4. 다중 사용자 API 키 관리 라우트
+  // 👥 4. 다중 사용자 API 키 & 기기 관리 라우트
   // =========================================================================
 
-  // 1) [새 사용자 키 발급] POST /admin/users/create
+  // 1) [새 사용자 키 발급] POST /admin/users/create (기기 기본 한도 6대 탑재)
   if (req.method === 'POST' && pathname === '/admin/users/create') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -257,13 +259,14 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const params = new URLSearchParams(body);
         const memo = params.get('memo')?.trim() || '새 사용자';
         const quotaMb = parseInt(params.get('quotaMb') || '1024', 10);
+        const maxDevices = parseInt(params.get('maxDevices') || '6', 10);
 
-        const result = apiKeyManager.issueApiKey({ memo, quotaMb, role: 'user' });
+        const result = apiKeyManager.issueApiKey({ memo, quotaMb, maxDevices, role: 'user' });
         auditLogger.recordAccessLog({
           ip: clientIp,
           userAgent,
           action: '👥 새 사용자 키 발급',
-          target: `${memo} (${result.folderName})`,
+          target: `${memo} (${result.folderName}, 기기한도: ${result.maxDevices}대)`,
           status: 200,
           user: `${memo} (${result.folderName})`
         });
@@ -316,7 +319,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
           user: `${result.memo} (${folderName})`
         });
 
-        const html = renderAdminSettingsHtml(req, `'${result.memo}' 사용자의 새 API 키가 발급되었습니다. (기존 책 100% 보존)`, null, {
+        const html = renderAdminSettingsHtml(req, `'${result.memo}' 사용자의 새 API 키가 발급되었습니다. (기존 책/기기 100% 보존)`, null, {
           type: 'REISSUE',
           apiKey: result.newApiKey,
           folderName: result.folderName,
@@ -335,7 +338,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 3) [사용자 도서 저장 용량 변경] POST /admin/users/update-quota (신규 탑재)
+  // 3) [사용자 도서 저장 용량 변경] POST /admin/users/update-quota
   if (req.method === 'POST' && pathname === '/admin/users/update-quota') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -377,7 +380,243 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 4) [사용자 삭제] POST /admin/users/delete
+  // 4) [사용자 최대 기기 한도 변경] POST /admin/users/update-max-devices (신규 탑재)
+  if (req.method === 'POST' && pathname === '/admin/users/update-max-devices') {
+    const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
+
+    if (!isAuthenticated(req)) {
+      if (isAjax) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const maxDevices = parseInt(params.get('maxDevices') || '6', 10);
+
+        const result = apiKeyManager.updateUserMaxDevices(folderName, maxDevices);
+        if (!result.success) {
+          throw new Error(result.error || '기기 한도 변경 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '📱 기기 한도 변경',
+          target: `${result.memo} ➔ 최대 ${result.maxDevices}대`,
+          status: 200,
+          user: `${result.memo} (${folderName})`
+        });
+
+        if (isAjax) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, maxDevices: result.maxDevices }));
+        } else {
+          const html = renderAdminSettingsHtml(req, `'${result.memo}' (${folderName}) 사용자의 최대 기기 한도가 ${result.maxDevices}대로 변경되었습니다.`);
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      } catch (err) {
+        if (isAjax) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          const html = renderAdminSettingsHtml(req, null, '기기 한도 변경 실패: ' + err.message);
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      }
+    });
+    return true;
+  }
+
+  // 5) [특정 기기 차단 (Ban)] POST /admin/users/devices/block (신규 탑재)
+  if (req.method === 'POST' && pathname === '/admin/users/devices/block') {
+    const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
+
+    if (!isAuthenticated(req)) {
+      if (isAjax) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const deviceId = params.get('deviceId')?.trim() || '';
+
+        const result = apiKeyManager.blockDevice(folderName, deviceId);
+        if (!result.success) {
+          throw new Error(result.error || '기기 차단 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '🚫 기기 차단 (Ban)',
+          target: `${result.device?.deviceName || deviceId} (${folderName})`,
+          status: 200,
+          user: 'Root Admin'
+        });
+
+        if (isAjax) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, device: result.device }));
+        } else {
+          const html = renderAdminSettingsHtml(req, `기기('${result.device?.deviceName || deviceId}')가 성공적으로 차단되었습니다.`);
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      } catch (err) {
+        if (isAjax) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          const html = renderAdminSettingsHtml(req, null, '기기 차단 실패: ' + err.message);
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      }
+    });
+    return true;
+  }
+
+  // 6) [특정 기기 차단 해제 (Unban)] POST /admin/users/devices/unblock (신규 탑재)
+  if (req.method === 'POST' && pathname === '/admin/users/devices/unblock') {
+    const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
+
+    if (!isAuthenticated(req)) {
+      if (isAjax) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const deviceId = params.get('deviceId')?.trim() || '';
+
+        const result = apiKeyManager.unblockDevice(folderName, deviceId);
+        if (!result.success) {
+          throw new Error(result.error || '기기 차단 해제 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '🟢 기기 차단 해제 (Unban)',
+          target: `${result.device?.deviceName || deviceId} (${folderName})`,
+          status: 200,
+          user: 'Root Admin'
+        });
+
+        if (isAjax) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, device: result.device }));
+        } else {
+          const html = renderAdminSettingsHtml(req, `기기('${result.device?.deviceName || deviceId}')의 차단이 해제되었습니다.`);
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      } catch (err) {
+        if (isAjax) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          const html = renderAdminSettingsHtml(req, null, '기기 차단 해제 실패: ' + err.message);
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      }
+    });
+    return true;
+  }
+
+  // 7) [특정 기기 삭제 (슬롯 반환)] POST /admin/users/devices/delete (신규 탑재)
+  if (req.method === 'POST' && pathname === '/admin/users/devices/delete') {
+    const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
+
+    if (!isAuthenticated(req)) {
+      if (isAjax) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
+      return true;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const params = new URLSearchParams(body);
+        const folderName = params.get('folderName')?.trim() || '';
+        const deviceId = params.get('deviceId')?.trim() || '';
+
+        const result = apiKeyManager.deleteDevice(folderName, deviceId);
+        if (!result.success) {
+          throw new Error(result.error || '기기 삭제 실패');
+        }
+
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '🗑️ 등록 기기 삭제 (슬롯 반환)',
+          target: `${deviceId} (${folderName})`,
+          status: 200,
+          user: 'Root Admin'
+        });
+
+        if (isAjax) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, deletedDeviceId: deviceId }));
+        } else {
+          const html = renderAdminSettingsHtml(req, `기기가 등록 목록에서 삭제되어 슬롯이 확보되었습니다.`);
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      } catch (err) {
+        if (isAjax) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          const html = renderAdminSettingsHtml(req, null, '기기 삭제 실패: ' + err.message);
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      }
+    });
+    return true;
+  }
+
+  // 8) [사용자 삭제] POST /admin/users/delete
   if (req.method === 'POST' && pathname === '/admin/users/delete') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });

@@ -1,6 +1,7 @@
 /**
  * @file server.js
  * @description 개인용 Google Drive Refresh Token 및 다중 사용자 자체 스토리지 제어 통합 HTTP 서버
+ * - 📱 [기기 식별 및 차단 미들웨어 탑재] X-Device-Id 헤더 검증으로 차단 기기(403) 및 6대 슬롯 초과(403) 실시간 차단
  * - 👥 [다중 사용자 샌드박스 직통 라우팅] apiKeyManager 연동으로 사용자별 data/users/{folderName}/ 투명 연결
  * - 🔑 [지능형 듀얼 API 키 가드] 루트 관리자 마스터 키(data/books) + 다중 사용자 키(data/users) 완벽 공존
  * - 🚦 [용량 초과 사전 차단] Content-Length 사전 검사로 잔여 용량 초과 시 바디 수신 전 413 즉시 거부
@@ -115,6 +116,28 @@ function extractApiKey(req, reqUrl) {
 }
 
 /**
+ * 📱 [기기 식별자 추출 헬퍼] 요청 헤더 및 쿼리에서 deviceId와 deviceName 파싱
+ * @param {http.IncomingMessage} req 
+ * @param {URL} reqUrl 
+ * @returns {{ deviceId: string, deviceName: string }}
+ */
+function extractDeviceInfo(req, reqUrl) {
+  let deviceId = req.headers['x-device-id'] || reqUrl.searchParams.get('deviceId') || '';
+  let deviceName = req.headers['x-device-name'] || reqUrl.searchParams.get('deviceName') || '';
+
+  if (deviceId) deviceId = String(deviceId).trim();
+  if (deviceName) {
+    try {
+      deviceName = decodeURIComponent(String(deviceName).trim());
+    } catch (_) {
+      deviceName = String(deviceName).trim();
+    }
+  }
+
+  return { deviceId, deviceName };
+}
+
+/**
  * 🛡️ [출처 검증 가드] ALLOWED_ORIGIN 기반 웹 뷰어 Origin / Referer 검증
  * @param {http.IncomingMessage} req 
  * @returns {boolean}
@@ -175,7 +198,8 @@ function setCorsHeaders(req, res) {
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY');
+  // 🌟 [기기 헤더 허용 추가] X-Device-Id, X-Device-Name 허용하여 브라우저 CORS 프리플라이트 통과 보장
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY, X-Device-Id, X-Device-Name');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
@@ -335,8 +359,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/health') {
     const env = readEnvFile();
     const providedApiKey = extractApiKey(req, reqUrl);
+    const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
 
-    // 🌟 [핵심 보강] 웹 뷰어 연결 테스트 시 API 키가 있으면 즉시 활성화(ACTIVE) 전환 및 접속 기록!
+    // 🌟 [핵심 보강] 웹 뷰어 연결 테스트 시 API 키가 있으면 즉시 활성화(ACTIVE) 전환 및 기기 접속 갱신!
     if (providedApiKey) {
       const rootMasterKey = env.STORAGE_API_KEY?.trim();
       if (rootMasterKey && providedApiKey === rootMasterKey) {
@@ -345,6 +370,9 @@ const server = http.createServer(async (req, res) => {
         const auth = apiKeyManager.authenticateApiKey(providedApiKey);
         if (auth.authenticated && auth.user) {
           auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
+          if (deviceId) {
+            apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
+          }
         }
       }
     }
@@ -419,24 +447,28 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 🛡️ [스토리지 엔드포인트 보안 가드 3] 🔑 지능형 듀얼 API 키 및 다중 사용자 샌드박스 인증
+  // 🛡️ [스토리지 엔드포인트 보안 가드 3] 🔑 지능형 듀얼 API 키 및 다중 사용자 샌드박스 + 📱 기기 식별/차단 거버넌스
   let targetUserFolder = null; // null이면 루트 관리자 fallback (data/books)
   let userQuotaBytes = 1073741824; // 기본 1GB
+  let authenticatedUserMemo = 'Root Admin';
 
   if (pathname.startsWith('/api/storage/')) {
     const env = readEnvFile();
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
     const providedApiKey = extractApiKey(req, reqUrl);
+    const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
 
     // 1순위: 루트 관리자 마스터 키 일치 검증 (기존 단일 서재 data/books 100% 무회귀)
     if (rootMasterKey && providedApiKey && providedApiKey === rootMasterKey) {
       targetUserFolder = null; // 루트 서재 직통
+      authenticatedUserMemo = 'Root Admin';
       auditLogger.recordApiKeyUsage({
         ip: clientIp,
         userAgent,
         path: pathname,
-        method: req.method
+        method: req.method,
+        userMemo: 'Root Admin'
       });
     }
     // 2순위: 다중 사용자 API 키 검증 (apiKeyManager 연동 ➔ data/users/{folderName}/ 샌드박스)
@@ -445,12 +477,57 @@ const server = http.createServer(async (req, res) => {
       if (auth.authenticated && auth.user) {
         targetUserFolder = auth.user.folderName;
         userQuotaBytes = auth.user.storageQuotaBytes || (1024 * 1024 * 1024);
+        authenticatedUserMemo = `${auth.user.memo} (${auth.user.folderName})`;
+
+        // 📱 [핵심 기기 식별 & 차단 검사]
+        if (deviceId) {
+          const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
+            deviceId,
+            deviceName,
+            clientIp
+          });
+
+          // 1. 차단된 기기인 경우 403 Forbidden 반환
+          if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_BLOCKED') {
+            console.warn(`⛔ [Device Blocked] 차단된 기기 접근 거부: deviceId='${deviceId}', 유저='${auth.user.memo}'`);
+            auditLogger.recordAccessLog({
+              ip: clientIp,
+              userAgent,
+              action: '🚫 차단된 기기 접근 차단',
+              target: `${deviceName || deviceId} (${auth.user.memo})`,
+              status: 403,
+              user: authenticatedUserMemo
+            });
+            return sendJsonResponse(req, res, 403, {
+              error: 'DEVICE_BLOCKED: 관리자에 의해 차단된 기기입니다. 관리자에게 문의하세요.',
+              deviceId
+            });
+          }
+
+          // 2. 최대 기기 한도(6대) 초과 차단인 경우 403 Forbidden 반환
+          if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_LIMIT_EXCEEDED') {
+            console.warn(`⛔ [Device Limit Exceeded] 등록 가능 기기 한도 초과: 유저='${auth.user.memo}'`);
+            auditLogger.recordAccessLog({
+              ip: clientIp,
+              userAgent,
+              action: '🚫 기기 등록 한도 초과',
+              target: `${deviceName || deviceId} (${deviceResult.maxDevices || 6}대 한도 초과)`,
+              status: 403,
+              user: authenticatedUserMemo
+            });
+            return sendJsonResponse(req, res, 403, {
+              error: `DEVICE_LIMIT_EXCEEDED: 허용된 최대 등록 기기 수(${deviceResult.maxDevices || 6}대)를 초과했습니다. 관리자 페이지에서 기존 기기를 정리해 주세요.`,
+              maxDevices: deviceResult.maxDevices || 6
+            });
+          }
+        }
 
         auditLogger.recordApiKeyUsage({
           ip: clientIp,
           userAgent,
           path: pathname,
-          method: req.method
+          method: req.method,
+          userMemo: auth.user.memo
         });
       } else if (auth.reason === 'API_KEY_EXPIRED') {
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '만료된 API 키 차단', target: pathname, status: 401 });
@@ -522,13 +599,14 @@ const server = http.createServer(async (req, res) => {
         userAgent,
         action: '⚡ 공유 도서 내부 복사',
         target: `${importResult.fileName} ➔ ${targetUserFolder || 'root'}`,
-        status: 200
+        status: 200,
+        user: authenticatedUserMemo
       });
 
       return sendJsonResponse(req, res, 200, importResult);
     } catch (err) {
       console.error(`❌ [API:Import] 공유 도서 복사 실패:`, err.message);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 복사 실패', target: err.message, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 복사 실패', target: err.message, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -558,7 +636,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const books = storageService.getRemoteBooks(sharedDir);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📚 공유 서재 목록 조회', target: `${books.length}권`, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '📚 공유 서재 목록 조회', target: `${books.length}권`, status: 200, user: authenticatedUserMemo });
     return sendJsonResponse(req, res, 200, {
       ok: true,
       sharedDir,
@@ -581,7 +659,7 @@ const server = http.createServer(async (req, res) => {
 
     const fileInfo = storageService.getRemoteBookFilePath(sharedDir, reqFile);
     if (!fileInfo) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: reqFile, status: 404 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: reqFile, status: 404, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 404, { error: '도서 파일을 찾을 수 없거나 접근이 거부되었습니다.' });
     }
 
@@ -593,7 +671,8 @@ const server = http.createServer(async (req, res) => {
       userAgent,
       action: isTxt ? '📄 TXT 도서 스트리밍' : '📖 EPUB 도서 스트리밍',
       target: fileInfo.fileName,
-      status: 200
+      status: 200,
+      user: authenticatedUserMemo
     });
 
     setCorsHeaders(req, res);
@@ -617,11 +696,12 @@ const server = http.createServer(async (req, res) => {
         userAgent,
         action: '📚 서재 스냅샷 조회',
         target: `${targetUserFolder || 'root'} (활성 ${snapshot.cloudBooks.length}권 / 보관 ${snapshot.cloudArchivedBooks.length}권)`,
-        status: 200
+        status: 200,
+        user: authenticatedUserMemo
       });
       return sendJsonResponse(req, res, 200, snapshot);
     } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '서재 스냅샷 실패', target: err.message, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '서재 스냅샷 실패', target: err.message, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -640,11 +720,12 @@ const server = http.createServer(async (req, res) => {
         userAgent,
         action: actionName,
         target: `${bookData.title || bookId} (${targetUserFolder || 'root'})`,
-        status: 200
+        status: 200,
+        user: authenticatedUserMemo
       });
       return sendJsonResponse(req, res, 200, { ok: true, bookId });
     } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 저장 실패', target: bookId, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 저장 실패', target: bookId, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -654,10 +735,10 @@ const server = http.createServer(async (req, res) => {
     const bookId = decodeURIComponent(pathname.replace('/api/storage/books/', ''));
     const meta = storageService.getBookMetadata(bookId, targetUserFolder);
     if (!meta) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회 실패', target: bookId, status: 404 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회 실패', target: bookId, status: 404, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 404, { error: '도서를 찾을 수 없습니다.' });
     }
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회', target: `${meta.title || bookId} (${targetUserFolder || 'root'})`, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회', target: `${meta.title || bookId} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
     return sendJsonResponse(req, res, 200, meta);
   }
 
@@ -671,7 +752,7 @@ const server = http.createServer(async (req, res) => {
       const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes);
       if (!quotaCheck.allowed) {
         console.warn(`⛔ [Quota Exceeded] 사용자('${targetUserFolder}') 저장 용량 초과 거절 (요청: ${(contentLength / 1024 / 1024).toFixed(1)}MB, 잔여: ${(quotaCheck.remainingBytes / 1024 / 1024).toFixed(1)}MB)`);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 업로드 차단', target: `${bookId} (${targetUserFolder})`, status: 413 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 업로드 차단', target: `${bookId} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
         return sendJsonResponse(req, res, 413, {
           error: 'STORAGE_QUOTA_EXCEEDED: 할당된 저장 용량을 초과하여 도서를 업로드할 수 없습니다.'
         });
@@ -688,11 +769,12 @@ const server = http.createServer(async (req, res) => {
         userAgent,
         action: '📦 EPUB 업로드',
         target: `${bookId} (${sizeMb}MB / ${targetUserFolder || 'root'})`,
-        status: 200
+        status: 200,
+        user: authenticatedUserMemo
       });
       return sendJsonResponse(req, res, 200, { ok: true, bookId, size: buffer.length });
     } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 업로드 실패', target: bookId, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 업로드 실패', target: bookId, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -706,7 +788,7 @@ const server = http.createServer(async (req, res) => {
 
     const info = storageService.getBookEpubPath(bookId, targetUserFolder);
     if (!info) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 다운로드 실패', target: bookId, status: 404 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 다운로드 실패', target: bookId, status: 404, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
     }
 
@@ -716,7 +798,8 @@ const server = http.createServer(async (req, res) => {
       userAgent,
       action: '📖 EPUB 다운로드',
       target: `${bookId} (${sizeMb}MB / ${targetUserFolder || 'root'})`,
-      status: 200
+      status: 200,
+      user: authenticatedUserMemo
     });
 
     setCorsHeaders(req, res);
@@ -736,10 +819,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const buffer = await readRequestBodyBuffer(req, 10 * 1024 * 1024);
       storageService.saveCoverImage(fileName, buffer, targetUserFolder);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 업로드', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 업로드', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 200, { ok: true, fileName });
     } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '표지 업로드 실패', target: fileName, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '표지 업로드 실패', target: fileName, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -773,7 +856,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
     storageService.deleteCoverImage(fileName, targetUserFolder);
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 단일 삭제', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200 });
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 단일 삭제', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
     return sendJsonResponse(req, res, 200, { ok: true, fileName });
   }
 
@@ -786,7 +869,8 @@ const server = http.createServer(async (req, res) => {
       userAgent,
       action: '🗑️ 도서 완전 삭제',
       target: `${bookId} (${count}개 파일 파쇄 / ${targetUserFolder || 'root'})`,
-      status: 200
+      status: 200,
+      user: authenticatedUserMemo
     });
     return sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
   }
@@ -798,10 +882,10 @@ const server = http.createServer(async (req, res) => {
       const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const data = JSON.parse(buffer.toString('utf-8'));
       storageService.saveSettingsFile(fileName, data, targetUserFolder);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '⚙️ 시스템 데이터 동기화', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '⚙️ 시스템 데이터 동기화', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 200, { ok: true, fileName });
     } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 동기화 실패', target: fileName, status: 500 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '시스템 동기화 실패', target: fileName, status: 500, user: authenticatedUserMemo });
       return sendJsonResponse(req, res, 500, { error: err.message });
     }
   }
@@ -823,7 +907,7 @@ const server = http.createServer(async (req, res) => {
     if (isAuthenticated(req)) {
       try {
         const authUrl = generateAuthUrl();
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 계정 연동 시작', target: '관리자 인증 통과 ➔ 구글 이동', status: 302 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 계정 연동 시작', target: '관리자 인증 통과 ➔ 구글 이동', status: 302, user: 'Root Admin' });
         res.writeHead(302, { Location: authUrl });
         res.end();
         return;
@@ -853,7 +937,7 @@ const server = http.createServer(async (req, res) => {
         const sessionToken = createAdminSession();
         try {
           const authUrl = generateAuthUrl();
-          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 인증 성공', target: '구글 로그인 화면 점프', status: 302 });
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 인증 성공', target: '구글 로그인 화면 점프', status: 302, user: 'Root Admin' });
           res.writeHead(302, {
             'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
             'Location': authUrl
@@ -864,7 +948,7 @@ const server = http.createServer(async (req, res) => {
           return sendHtmlResponse(req, res, 500, '로그인 시작 오류', 'Google 로그인 URL을 생성하지 못했습니다.', false);
         }
       } else {
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 오류', target: '접근 차단', status: 401 });
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '구글 게이트 비밀번호 오류', target: '접근 차단', status: 401, user: 'Root Admin' });
         const html = renderAuthGateHtml('관리자 비밀번호가 올바르지 않습니다.');
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
@@ -896,7 +980,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       await exchangeCodeForTokens(code);
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'Google OAuth 토큰 교환 성공', target: '토큰 암호화 저장 완료', status: 200 });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'Google OAuth 토큰 교환 성공', target: '토큰 암호화 저장 완료', status: 200, user: 'Root Admin' });
       return sendHtmlResponse(
         req,
         res,

@@ -1,6 +1,8 @@
 /**
  * @file src/apiKeyManager.js
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 사용자 디렉터리 생명주기 관리 엔진
+ * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
+ * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
  * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
  * - 👥 [보관 도서 합산 집계] getUserListForAdmin에서 books/ 및 archive/ 도서 권수 동시 실측
  * - 🔑 [SHA-256 단방향 해싱] 서버 디스크에는 해시값만 저장하여 비밀 키 원문 유출 원천 차단
@@ -27,6 +29,19 @@ const API_KEYS_FILE = path.resolve(ROOT_DIR, 'data/api/api-keys.json');
 // 기본 24시간 활성화 윈도우 (밀리초 단위: 24시간)
 const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// 기본 계정당 최대 허용 기기 수
+const DEFAULT_MAX_DEVICES = 6;
+
+/**
+ * @typedef {Object} DeviceRecord
+ * @property {string} deviceId - 클라이언트 고유 기기 식별자
+ * @property {string} deviceName - 기기 모델/브라우저 라벨
+ * @property {string} firstSeen - 최초 등록 일시 (ISO)
+ * @property {string} lastSeen - 마지막 접속 일시 (ISO)
+ * @property {string} lastIp - 마지막 접속 IP
+ * @property {'active' | 'blocked'} status - 기기 접근 상태
+ */
+
 /**
  * @typedef {Object} ApiKeyRecord
  * @property {string} folderName - 할당된 고유 폴더명 (예: user_a7b8c9d0)
@@ -35,6 +50,8 @@ const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000;
  * @property {'admin' | 'user'} role - 사용자 권한
  * @property {'PENDING' | 'ACTIVE' | 'EXPIRED' | 'REVOKED'} status - 현재 키 상태
  * @property {number} storageQuotaBytes - 최대 허용 저장 용량 (Byte)
+ * @property {number} [maxDevices=6] - 최대 등록 허용 기기 수
+ * @property {Record<string, DeviceRecord>} [devices={}] - 등록된 기기 목록
  * @property {string} createdAt - 발급 시각 (ISO)
  * @property {string|null} activatedAt - 최초 접속 활성화 시각 (ISO)
  * @property {string|null} expiresAt - 24시간 활성화 마감 시각 (ISO)
@@ -51,6 +68,7 @@ const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000;
  * @property {string} user.role - 사용자 역할
  * @property {number} user.storageQuotaBytes - 할당 용량 (Byte)
  * @property {string} user.userRootPath - 사용자 물리 디렉터리 절대 경로
+ * @property {number} user.maxDevices - 최대 허용 기기 수
  */
 
 /**
@@ -154,10 +172,11 @@ export const apiKeyManager = {
    * @param {Object} options
    * @param {string} [options.memo="새 사용자"] - 사용자 식별 메모/이름
    * @param {number} [options.quotaMb=1024] - 할당 도서 저장 용량 (MB 단위, 기본 1GB)
+   * @param {number} [options.maxDevices=6] - 최대 등록 허용 기기 수 (기본 6대)
    * @param {string} [options.role="user"] - 역할 ("admin" | "user")
-   * @returns {{ apiKey: string, folderName: string, memo: string, expiresAt: string, quotaMb: number }}
+   * @returns {{ apiKey: string, folderName: string, memo: string, expiresAt: string, quotaMb: number, maxDevices: number }}
    */
-  issueApiKey({ memo = '새 사용자', quotaMb = 1024, role = 'user' } = {}) {
+  issueApiKey({ memo = '새 사용자', quotaMb = 1024, maxDevices = DEFAULT_MAX_DEVICES, role = 'user' } = {}) {
     ensureDir(USERS_DIR);
     ensureDir(path.dirname(API_KEYS_FILE));
 
@@ -183,6 +202,8 @@ export const apiKeyManager = {
       role: role === 'admin' ? 'admin' : 'user',
       status: 'PENDING', // PENDING (24시간 내 활성화 대기) ➔ ACTIVE (인증 성공)
       storageQuotaBytes: Math.max(10, Number(quotaMb) || 1024) * 1024 * 1024,
+      maxDevices: Math.max(1, parseInt(maxDevices, 10) || DEFAULT_MAX_DEVICES),
+      devices: {}, // 기기 맵 { [deviceId]: DeviceRecord }
       createdAt: new Date(now).toISOString(),
       activatedAt: null,
       expiresAt: expiresAt, // 등록 마감 시각 (24시간 후)
@@ -193,14 +214,15 @@ export const apiKeyManager = {
     list.push(record);
     writeJsonAtomic(API_KEYS_FILE, list);
 
-    console.log(`🔑 [ApiKeyManager:Issued] 새 API 키 발급 완료: 폴더='${folderName}', 메모='${record.memo}', 마감='${expiresAt}'`);
+    console.log(`🔑 [ApiKeyManager:Issued] 새 API 키 발급 완료: 폴더='${folderName}', 메모='${record.memo}', 마감='${expiresAt}', 기기한도=${record.maxDevices}대`);
 
     return {
       apiKey,
       folderName,
       memo: record.memo,
       expiresAt: record.expiresAt,
-      quotaMb: Math.round(record.storageQuotaBytes / 1024 / 1024)
+      quotaMb: Math.round(record.storageQuotaBytes / 1024 / 1024),
+      maxDevices: record.maxDevices
     };
   },
 
@@ -268,9 +290,195 @@ export const apiKeyManager = {
         memo: user.memo,
         role: user.role,
         storageQuotaBytes: user.storageQuotaBytes,
-        userRootPath: safeCheck.realPath
+        userRootPath: safeCheck.realPath,
+        maxDevices: user.maxDevices || DEFAULT_MAX_DEVICES
       }
     };
+  },
+
+  /* ========================================================================= */
+  /* 📱 기기(Device ID) 식별, 6대 슬롯 한도 검증 및 개별 차단(Ban) 거버넌스      */
+  /* ========================================================================= */
+
+  /**
+   * 기기 접속 검증, 등록 및 최근 접속 갱신 (Heartbeat)
+   * @param {string} folderName - 대상 사용자 폴더명
+   * @param {Object} deviceInfo
+   * @param {string} deviceInfo.deviceId - 클라이언트 기기 고유 ID
+   * @param {string} [deviceInfo.deviceName=""] - 기기 모델/브라우저 라벨
+   * @param {string} [deviceInfo.clientIp=""] - 접속 IP
+   * @returns {{ allowed: boolean, reason?: string, device?: DeviceRecord, maxDevices?: number }}
+   */
+  verifyAndTouchDevice(folderName, { deviceId, deviceName = '', clientIp = '' } = {}) {
+    if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
+
+    // 기기 식별자가 없는 구버전 클라이언트의 경우 과도기 호환을 위해 통과
+    if (!deviceId || typeof deviceId !== 'string' || !deviceId.trim()) {
+      return { allowed: true, device: null };
+    }
+
+    const cleanDeviceId = String(deviceId).trim().slice(0, 64);
+    const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
+    const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
+
+    const list = readApiKeysData();
+    const index = list.findIndex(item => item.folderName === folderName);
+    if (index === -1) {
+      return { allowed: false, reason: 'USER_NOT_FOUND' };
+    }
+
+    const user = list[index];
+    user.devices = user.devices || {};
+    const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
+    const now = new Date().toISOString();
+
+    let device = user.devices[cleanDeviceId];
+
+    // 1. 이미 등록된 기기인 경우
+    if (device) {
+      // 1-1. 차단된 기기인 경우 접근 차단
+      if (device.status === 'blocked') {
+        device.lastSeen = now;
+        device.lastIp = cleanIp;
+        writeJsonAtomic(API_KEYS_FILE, list);
+        return { allowed: false, reason: 'DEVICE_BLOCKED', device };
+      }
+
+      // 1-2. 정상 활성 기기 정보 최신화
+      device.lastSeen = now;
+      device.lastIp = cleanIp;
+      if (cleanDeviceName && cleanDeviceName !== '웹 리더 기기') {
+        device.deviceName = cleanDeviceName;
+      }
+      writeJsonAtomic(API_KEYS_FILE, list);
+      return { allowed: true, device };
+    }
+
+    // 2. 신규 기기 등록 시도: 슬롯 한도 초과 검사
+    const currentDeviceCount = Object.keys(user.devices).length;
+    if (currentDeviceCount >= maxLimit) {
+      console.warn(`⛔ [ApiKeyManager:DeviceLimit] 기기 슬롯 한도(${maxLimit}대) 초과 차단: 폴더='${folderName}', 신규기기='${cleanDeviceId}'`);
+      return { allowed: false, reason: 'DEVICE_LIMIT_EXCEEDED', maxDevices: maxLimit };
+    }
+
+    // 3. 신규 기기 자동 등록
+    device = {
+      deviceId: cleanDeviceId,
+      deviceName: cleanDeviceName,
+      firstSeen: now,
+      lastSeen: now,
+      lastIp: cleanIp,
+      status: 'active'
+    };
+    user.devices[cleanDeviceId] = device;
+    writeJsonAtomic(API_KEYS_FILE, list);
+
+    console.log(`📱 [ApiKeyManager:DeviceRegistered] 신규 기기 등록 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ 사용자: '${user.memo}' (${currentDeviceCount + 1}/${maxLimit}대)`);
+    return { allowed: true, device };
+  },
+
+  /**
+   * 특정 사용자의 기기 목록 조회 (최신 접속순 정렬)
+   * @param {string} folderName 
+   * @returns {Array<DeviceRecord>}
+   */
+  getUserDevices(folderName = '') {
+    if (!folderName) return [];
+    const list = readApiKeysData();
+    const user = list.find(item => item.folderName === folderName);
+    if (!user || !user.devices) return [];
+
+    return Object.values(user.devices).sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+  },
+
+  /**
+   * 특정 기기 차단 (Ban)
+   * @param {string} folderName 
+   * @param {string} deviceId 
+   * @returns {{ success: boolean, device?: DeviceRecord, error?: string }}
+   */
+  blockDevice(folderName, deviceId) {
+    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+
+    const list = readApiKeysData();
+    const user = list.find(item => item.folderName === folderName);
+    if (!user || !user.devices || !user.devices[deviceId]) {
+      return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
+    }
+
+    user.devices[deviceId].status = 'blocked';
+    writeJsonAtomic(API_KEYS_FILE, list);
+    console.log(`⛔ [ApiKeyManager:DeviceBlocked] 기기 차단됨: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+
+    return { success: true, device: user.devices[deviceId] };
+  },
+
+  /**
+   * 특정 기기 차단 해제 (Unban)
+   * @param {string} folderName 
+   * @param {string} deviceId 
+   * @returns {{ success: boolean, device?: DeviceRecord, error?: string }}
+   */
+  unblockDevice(folderName, deviceId) {
+    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+
+    const list = readApiKeysData();
+    const user = list.find(item => item.folderName === folderName);
+    if (!user || !user.devices || !user.devices[deviceId]) {
+      return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
+    }
+
+    user.devices[deviceId].status = 'active';
+    writeJsonAtomic(API_KEYS_FILE, list);
+    console.log(`🟢 [ApiKeyManager:DeviceUnblocked] 기기 차단 해제됨: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+
+    return { success: true, device: user.devices[deviceId] };
+  },
+
+  /**
+   * 특정 기기 등록 영구 삭제 (기기 슬롯 반환)
+   * @param {string} folderName 
+   * @param {string} deviceId 
+   * @returns {{ success: boolean, error?: string }}
+   */
+  deleteDevice(folderName, deviceId) {
+    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+
+    const list = readApiKeysData();
+    const user = list.find(item => item.folderName === folderName);
+    if (!user || !user.devices || !user.devices[deviceId]) {
+      return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
+    }
+
+    delete user.devices[deviceId];
+    writeJsonAtomic(API_KEYS_FILE, list);
+    console.log(`🗑️ [ApiKeyManager:DeviceDeleted] 기기 삭제 및 슬롯 반환: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+
+    return { success: true };
+  },
+
+  /**
+   * 계정별 최대 허용 기기 수 변경
+   * @param {string} folderName 
+   * @param {number} maxDevices 
+   * @returns {{ success: boolean, maxDevices?: number, error?: string }}
+   */
+  updateUserMaxDevices(folderName = '', maxDevices = DEFAULT_MAX_DEVICES) {
+    if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
+
+    const list = readApiKeysData();
+    const index = list.findIndex(item => item.folderName === folderName);
+    if (index === -1) {
+      return { success: false, error: '해당 사용자를 찾을 수 없습니다.' };
+    }
+
+    const validLimit = Math.max(1, Math.min(50, parseInt(maxDevices, 10) || DEFAULT_MAX_DEVICES));
+    list[index].maxDevices = validLimit;
+
+    writeJsonAtomic(API_KEYS_FILE, list);
+    console.log(`⚙️ [ApiKeyManager:MaxDevicesUpdated] 사용자('${folderName}') 최대 기기 한도 변경: ${validLimit} 대`);
+
+    return { success: true, folderName, maxDevices: validLimit, memo: list[index].memo };
   },
 
   /**
@@ -413,7 +621,7 @@ export const apiKeyManager = {
   },
 
   /**
-   * 📊 [관리자 대시보드 표출용 사용자 목록 및 실측 용량 조회]
+   * 📊 [관리자 대시보드 표출용 사용자 목록 및 실측 용량/기기 현황 조회]
    * @returns {Array<Object>}
    */
   getUserListForAdmin() {
@@ -448,6 +656,11 @@ export const apiKeyManager = {
         remainingHours = diffMs > 0 ? (diffMs / (1000 * 60 * 60)).toFixed(1) : '0.0';
       }
 
+      // 기기 통계 산출
+      const devicesMap = u.devices || {};
+      const devicesList = Object.values(devicesMap);
+      const blockedDeviceCount = devicesList.filter(d => d.status === 'blocked').length;
+
       return {
         folderName: u.folderName,
         memo: u.memo,
@@ -460,6 +673,10 @@ export const apiKeyManager = {
         usedMb: (usedBytes / (1024 * 1024)).toFixed(1),
         quotaMb: Math.round(quotaBytes / (1024 * 1024)),
         percent: Math.min(100, Math.round((usedBytes / quotaBytes) * 100)),
+        maxDevices: u.maxDevices || DEFAULT_MAX_DEVICES,
+        deviceCount: devicesList.length,
+        blockedDeviceCount,
+        devices: devicesList.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen)),
         createdAt: u.createdAt,
         activatedAt: u.activatedAt,
         expiresAt: u.expiresAt,
