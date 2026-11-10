@@ -1,7 +1,9 @@
 /**
  * @file src/apiKeyManager.js
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 6자리 단기 기기 연결 OTP 관리 엔진
- * - 🔢 [6자리 단기 기기 연결 OTP 탑재] issueDeviceOtp & verifyAndExchangeDeviceOtp 지원으로 카메라 없는 초간편 번호 로그인
+ * - 🛡️ [2단계 화이트리스트 기기 거버넌스] 유효 API 키 + 서버 정식 승인 기기 2중 검증 (삭제/미승인 기기 자동 재등록 원천 차단)
+ * - 📱 [최초 기기 마스터 자동 안착] 등록 기기가 0대인 최초 상태에서만 1번째 기기로 자동 등록 허용
+ * - 🔢 [6자리 OTP 정식 기기 등록 결속] verifyAndExchangeDeviceOtp 성공 시점에만 게스트 기기를 정식 장부에 등록 (슬롯 6대 한도)
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
  * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
  * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
@@ -313,18 +315,11 @@ export const apiKeyManager = {
   /* 🔢 3분 유효 6자리 일회용 연결 번호 (OTP) 엔진                               */
   /* ========================================================================= */
 
-  /**
-   * 🔢 [Host 기기] 3분 유효 6자리 연결 번호 발급
-   * @param {string} folderName - 사용자 폴더명
-   * @param {string} rawApiKey - 연결할 원본 API 키
-   * @returns {{ success: boolean, code?: string, displayCode?: string, expiresInSeconds?: number, error?: string }}
-   */
   issueDeviceOtp(folderName, rawApiKey) {
     if (!folderName || !rawApiKey) {
       return { success: false, error: '인증 정보가 부족합니다.' };
     }
 
-    // 6자리 난수 번호 생성 (100000 ~ 999999)
     let code = '';
     let exists = true;
     let attempts = 0;
@@ -357,11 +352,15 @@ export const apiKeyManager = {
   },
 
   /**
-   * 🔢 [Guest 기기] 6자리 연결 번호 검증 및 API 키 교환 (1회성 파쇄)
-   * @param {string} inputCode - 6자리 숫자 코드 (하이픈 허용)
+   * 🔢 [Guest 기기] 6자리 연결 번호 검증, 기기 정식 등록 및 API 키 교환 (1회성 파쇄)
+   * @param {string} inputCode - 6자리 숫자 코드
+   * @param {Object} [deviceInfo] - 게스트 기기 식별 정보
+   * @param {string} [deviceInfo.deviceId]
+   * @param {string} [deviceInfo.deviceName]
+   * @param {string} [deviceInfo.clientIp]
    * @returns {{ success: boolean, folderName?: string, apiKey?: string, error?: string }}
    */
-  verifyAndExchangeDeviceOtp(inputCode) {
+  verifyAndExchangeDeviceOtp(inputCode, { deviceId = '', deviceName = '', clientIp = '' } = {}) {
     if (!inputCode) return { success: false, error: '연결 번호를 입력해 주세요.' };
 
     const cleanCode = String(inputCode).replace(/[^0-9]/g, '').trim();
@@ -380,9 +379,44 @@ export const apiKeyManager = {
       return { success: false, error: '유효 시간(3분)이 초과되었습니다. 번호를 다시 발급받으세요.' };
     }
 
-    // 🌟 1회성 즉시 파기 (Replay Attack 원천 방어)
+    // 🌟 [핵심] 번호 인증 성공 시 게스트 기기를 정식 승인 장부에 등록!
+    if (deviceId) {
+      const cleanDeviceId = String(deviceId).trim().slice(0, 64);
+      const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
+      const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
+
+      const list = readApiKeysData();
+      const index = list.findIndex(u => u.folderName === item.folderName);
+      if (index !== -1) {
+        const user = list[index];
+        user.devices = user.devices || {};
+        const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
+        const currentCount = Object.keys(user.devices).length;
+
+        if (!user.devices[cleanDeviceId] && currentCount >= maxLimit) {
+          return {
+            success: false,
+            error: `기기 등록 한도(${maxLimit}대)를 초과했습니다. 기존 기기를 먼저 정리해 주세요.`
+          };
+        }
+
+        const nowIso = new Date().toISOString();
+        user.devices[cleanDeviceId] = {
+          deviceId: cleanDeviceId,
+          deviceName: cleanDeviceName,
+          firstSeen: user.devices[cleanDeviceId]?.firstSeen || nowIso,
+          lastSeen: nowIso,
+          lastIp: cleanIp,
+          status: 'active'
+        };
+
+        writeJsonAtomic(API_KEYS_FILE, list);
+        console.log(`📱 [ApiKeyManager:OTPRegister] OTP 인증을 통한 기기 정식 승인 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
+      }
+    }
+
+    // 1회성 즉시 파기 (Replay Attack 방어)
     deviceOtpStore.delete(cleanCode);
-    console.log(`✨ [ApiKeyManager:OTP] 6자리 번호 교환 성공 및 파기 완료: [${cleanCode}] ➔ 서재: '${item.folderName}'`);
 
     return {
       success: true,
@@ -392,9 +426,16 @@ export const apiKeyManager = {
   },
 
   /* ========================================================================= */
-  /* 📱 기기(Device ID) 식별, 6대 슬롯 한도 검증 및 개별 차단(Ban) 거버넌스      */
+  /* 📱 기기 화이트리스트 검증 & 개별 차단(Ban) 거버넌스 (자동 재등록 원천 차단)  */
   /* ========================================================================= */
 
+  /**
+   * 접속 기기의 유효성을 화이트리스트 기반으로 엄격 검증합니다.
+   * - 기기 0대인 완전 최초 상태: 1번째 기기(Master) 자동 등록 허용
+   * - 이미 기기가 있는 상태: 승인 장부에 없으면 자동 등록 차단(DEVICE_UNREGISTERED)
+   * @param {string} folderName 
+   * @param {Object} params 
+   */
   verifyAndTouchDevice(folderName, { deviceId, deviceName = '', clientIp = '' } = {}) {
     if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
 
@@ -419,6 +460,7 @@ export const apiKeyManager = {
 
     let device = user.devices[cleanDeviceId];
 
+    // 1. 이미 정식 등록된 기기인 경우
     if (device) {
       if (device.status === 'blocked') {
         device.lastSeen = now;
@@ -437,24 +479,31 @@ export const apiKeyManager = {
     }
 
     const currentDeviceCount = Object.keys(user.devices).length;
-    if (currentDeviceCount >= maxLimit) {
-      console.warn(`⛔ [ApiKeyManager:DeviceLimit] 기기 슬롯 한도(${maxLimit}대) 초과 차단: 폴더='${folderName}', 신규기기='${cleanDeviceId}'`);
-      return { allowed: false, reason: 'DEVICE_LIMIT_EXCEEDED', maxDevices: maxLimit };
+
+    // 2. 🌟 [핵심] 등록된 기기가 0대인 완전 최초 상태인 경우에만 1번째 기기(Master) 자동 등록 허용!
+    if (currentDeviceCount === 0) {
+      device = {
+        deviceId: cleanDeviceId,
+        deviceName: cleanDeviceName,
+        firstSeen: now,
+        lastSeen: now,
+        lastIp: cleanIp,
+        status: 'active'
+      };
+      user.devices[cleanDeviceId] = device;
+      writeJsonAtomic(API_KEYS_FILE, list);
+      console.log(`📱 [ApiKeyManager:MasterRegistered] 1번째 마스터 기기 자동 등록 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ 사용자: '${user.memo}' (1/${maxLimit}대)`);
+      return { allowed: true, device };
     }
 
-    device = {
-      deviceId: cleanDeviceId,
-      deviceName: cleanDeviceName,
-      firstSeen: now,
-      lastSeen: now,
-      lastIp: cleanIp,
-      status: 'active'
+    // 3. 🚨 [화이트리스트 방어] 이미 1대 이상 등록되어 있는데 장부에 없는 기기 (삭제된 기기 또는 미승인 기기)
+    // ➔ 자동 등록하지 않고 칼같이 403 차단! (다시 들어오려면 반드시 6자리 OTP 인증 필요)
+    console.warn(`⛔ [ApiKeyManager:UnregisteredDevice] 미등록(또는 삭제된) 기기 접근 차단: 폴더='${folderName}', 기기='${cleanDeviceId}'`);
+    return {
+      allowed: false,
+      reason: 'DEVICE_UNREGISTERED',
+      message: '등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.'
     };
-    user.devices[cleanDeviceId] = device;
-    writeJsonAtomic(API_KEYS_FILE, list);
-
-    console.log(`📱 [ApiKeyManager:DeviceRegistered] 신규 기기 등록 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ 사용자: '${user.memo}' (${currentDeviceCount + 1}/${maxLimit}대)`);
-    return { allowed: true, device };
   },
 
   getUserDevices(folderName = '') {

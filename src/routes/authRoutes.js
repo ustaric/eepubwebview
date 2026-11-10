@@ -5,7 +5,7 @@
  * - 🔄 [Google OAuth 콜백 & 토큰 교환] GET /auth/google/callback 승인 코드 수신 및 암호화 보관
  * - 🕒 [백그라운드 자동 갱신] GET /api/access-token 호출 시 신선한 Google Access Token 즉시 발급
  * - 🔢 [6자리 OTP 번호 발급] POST /api/auth/otp/issue 3분 유효 일회용 번호 생성
- * - ✨ [6자리 OTP 번호 인증] POST /api/auth/otp/verify 무차별 대입 방어(5회 실패 10분 락) 및 1회 교환 후 즉시 폐기
+ * - ✨ [6자리 OTP 기기 등록 결속] POST /api/auth/otp/verify 인증 성공 시 해당 기기를 정식 승인 장부에 자동 각인
  */
 
 import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToken } from '../../googleAuth.js';
@@ -14,6 +14,7 @@ import { auditLogger } from '../auditLogger.js';
 import { readEnvFile } from '../envManager.js';
 import {
   extractApiKey,
+  extractDeviceInfo,
   checkOtpRateLimit,
   recordOtpFailure,
   clearOtpFailure,
@@ -83,7 +84,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     return true;
   }
 
-  // 2. 6자리 일회용 연결 번호(OTP) 검증 및 API 키 교환
+  // 2. 6자리 일회용 연결 번호(OTP) 검증 및 정식 기기 등록 (화이트리스트 각인)
   if (req.method === 'POST' && pathname === '/api/auth/otp/verify') {
     const otpGuard = checkOtpRateLimit(clientIp);
     if (!otpGuard.allowed) {
@@ -98,7 +99,17 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       const payload = JSON.parse(buffer.toString('utf-8') || '{}');
       const inputCode = payload.code;
 
-      const exchangeResult = apiKeyManager.verifyAndExchangeDeviceOtp(inputCode);
+      // 헤더 및 바디에서 게스트 기기 식별 정보 추출
+      const headerDevice = extractDeviceInfo(req, reqUrl);
+      const guestDeviceId = payload.deviceId || headerDevice.deviceId || '';
+      const guestDeviceName = payload.deviceName || headerDevice.deviceName || '';
+
+      const exchangeResult = apiKeyManager.verifyAndExchangeDeviceOtp(inputCode, {
+        deviceId: guestDeviceId,
+        deviceName: guestDeviceName,
+        clientIp
+      });
+
       if (!exchangeResult.success) {
         recordOtpFailure(clientIp);
         sendJsonResponse(req, res, 400, { error: exchangeResult.error });
@@ -112,7 +123,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
         ip: clientIp,
         userAgent,
         action: '✨ 기기 연결 번호 인증 성공',
-        target: inputCode,
+        target: `${inputCode} (${guestDeviceName || guestDeviceId || '신규 기기'})`,
         status: 200,
         user: exchangeResult.folderName
       });

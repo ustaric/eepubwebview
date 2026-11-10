@@ -2,6 +2,7 @@
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
  * - 🔑 [지능형 듀얼 API 키 & 기기 검증] Root 관리자 키 + 다중 사용자 키 실시간 인증 및 차단/슬롯 초과(403) 차단
+ * - 🚫 [미등록/삭제 기기 403 즉시 차단] 장부에서 삭제된 기기의 임의 재접속 원천 거부 및 6자리 번호 재로그인 요구
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🚦 [용량 초과 사전 차단] Content-Length 검사로 사용자 할당량 초과 시 413 즉시 거부
  * - ⚡ [공유 라이브러리 I/O] 목록 조회, 다운로드 스트리밍 및 서버 내부 0초 복사(/import) 지원
@@ -79,7 +80,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 4. API 키 인증 및 사용자/기기 식별 가드
+  // 4. API 키 인증 및 사용자/기기 화이트리스트 가드
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
   let authenticatedUserMemo = 'Root Admin';
@@ -103,6 +104,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       if (deviceId) {
         const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
 
+        // 🚨 [방어선 A] 관리자가 직접 밴(차단)한 기기
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_BLOCKED') {
           auditLogger.recordAccessLog({
             ip: clientIp,
@@ -116,6 +118,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
           return true;
         }
 
+        // 🚨 [방어선 B] 기기 슬롯(6대) 한도 초과
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_LIMIT_EXCEEDED') {
           auditLogger.recordAccessLog({
             ip: clientIp,
@@ -128,6 +131,23 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
           sendJsonResponse(req, res, 403, {
             error: `DEVICE_LIMIT_EXCEEDED: 허용된 최대 등록 기기 수(${deviceResult.maxDevices || 6}대)를 초과했습니다.`,
             maxDevices: deviceResult.maxDevices || 6
+          });
+          return true;
+        }
+
+        // 🚨 [방어선 C - 신규] 삭제되었거나 정식 OTP 등록을 거치지 않은 미등록 기기 원천 차단!
+        if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_UNREGISTERED') {
+          auditLogger.recordAccessLog({
+            ip: clientIp,
+            userAgent,
+            action: '🚫 미등록/삭제된 기기 차단',
+            target: `${deviceName || deviceId} (${auth.user.memo})`,
+            status: 403,
+            user: authenticatedUserMemo
+          });
+          sendJsonResponse(req, res, 403, {
+            error: 'DEVICE_UNREGISTERED: 등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.',
+            deviceId
           });
           return true;
         }
@@ -161,20 +181,19 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 🌟 [신규 5] 등록된 기기 목록 조회 (GET /api/storage/devices)
+  // 5. 등록된 기기 목록 조회 (GET /api/storage/devices)
   if (req.method === 'GET' && pathname === '/api/storage/devices') {
     const devices = targetUserFolder ? apiKeyManager.getUserDevices(targetUserFolder) : [];
-    const maxDevices = 6;
     sendJsonResponse(req, res, 200, {
       ok: true,
-      maxDevices,
+      maxDevices: 6,
       totalDevices: devices.length,
       devices
     });
     return true;
   }
 
-  // 🌟 [신규 6] 안 쓰는 기기 슬롯 삭제 및 반환 (DELETE /api/storage/devices/:deviceId)
+  // 6. 안 쓰는 기기 슬롯 삭제 및 반환 (DELETE /api/storage/devices/:deviceId)
   if (req.method === 'DELETE' && pathname.startsWith('/api/storage/devices/')) {
     const targetDeviceId = decodeURIComponent(pathname.replace('/api/storage/devices/', ''));
     if (!targetUserFolder) {
