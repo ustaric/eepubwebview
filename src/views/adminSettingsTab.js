@@ -1,7 +1,7 @@
 /**
  * @file src/views/adminSettingsTab.js
  * @description 관리자 제어 센터 [탭 2: ⚙️ 시스템 설정] HTML 렌더러 모듈
- * - 🔔 [Discord 관제 알림 센터] 웹훅 URL 입력, 즉시 연결 테스트, 6대 체크박스 필터 및 로그 있을 때만 정기보고 UI 완비
+ * - 🔔 [Discord 관제 알림 센터] 웹훅 URL 입력, 실시간 체크 옵션 포함 연결 테스트, 6대 체크박스 필터 및 로그 있을 때만 정기보고 UI 완비
  * - 📦 [1KB 분기 정책 안내] 1KB 이하 본문 codeblock / 1KB 초과 시 .json 첨부 발송 안내 배지 탑재
  * - 🛡️ [스토리지 API 보안 설정 단일화] 번잡한 박스를 제거하고 엄격 검증 모드 토글만 단정하게 유지
  * - 📋 [주요 접속 정보 복사] GitHub 저장소, 서버 주소, OAuth 리디렉션 URI 원클릭 복사 카드
@@ -87,7 +87,7 @@ export function renderSettingsTab({
       </div>
     </div>
 
-    <!-- 2. 🔔 Discord 실시간 관제 및 보안 알림 센터 (신규 고도화) -->
+    <!-- 2. 🔔 Discord 실시간 관제 및 보안 알림 센터 -->
     <div class="card" id="card-discord-settings">
       <div class="section-title">
         <span>🔔 Discord 실시간 관제 및 보안 알림</span>
@@ -140,7 +140,7 @@ export function renderSettingsTab({
           </label>
         </div>
 
-        <div style="margin-top: 14px; pt: 10px; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 10px;">
+        <div style="margin-top: 14px; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 10px;">
           <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
             <input type="checkbox" id="cb-discord-daily-digest" ${isDailyDigest ? 'checked' : ''}>
             <span>📊 <strong>일일 보안 정기 보고</strong> (당일 차단/오류 로그가 1건 이상 있을 때만 발송)</span>
@@ -317,6 +317,7 @@ export function renderSettingsTab({
         }
       }
 
+      // 🌟 [고도화] 테스트 전송 시 현재 체크된 6대 항목 및 정기보고 옵션을 실시간 수집하여 함께 전송
       async function testDiscordWebhook() {
         const urlInput = document.getElementById('input-discord-webhook');
         const webhookUrl = urlInput.value.trim();
@@ -328,6 +329,10 @@ export function renderSettingsTab({
           return;
         }
 
+        const checkboxes = document.querySelectorAll('.discord-filter-cb:checked');
+        const selectedAlertTypes = Array.from(checkboxes).map(cb => cb.value).join(',');
+        const dailyDigest = document.getElementById('cb-discord-daily-digest').checked;
+
         testBtn.disabled = true;
         testBtn.textContent = '⏳ 전송 중...';
 
@@ -335,7 +340,12 @@ export function renderSettingsTab({
           const res = await fetch('/api/admin/discord-webhook', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'test', webhookUrl })
+            body: JSON.stringify({
+              action: 'test',
+              webhookUrl,
+              alertTypes: selectedAlertTypes,
+              dailyDigest
+            })
           });
           const data = await res.json();
           alert(data.message || (data.ok ? '테스트 알림이 발송되었습니다!' : '발송 실패'));

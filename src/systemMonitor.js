@@ -7,7 +7,7 @@
  * - 🚨 [에러 및 위협 알림 1KB 분기 발송] 1KB 이하 본문 Embed codeblock / 1KB 초과 시 error_log.json 파일 첨부 발송
  * - 🛡️ [HTTP 오류별 5분 쿨다운] 동일 엔드포인트/원인에 대해 5분간 중복 발송 방지 캐시 가드 결속
  * - 📅 [조건부 일일 다이제스트] DISCORD_DAILY_DIGEST 활성 시 당일 침입/오류 로그가 1건 이상일 때만 정기 요약 발송 (위협 0건 시 침묵)
- * - 🧪 [테스트 웹훅 지원] 관리자 대시보드에서 즉시 연동 테스트 전송 지원
+ * - 🧪 [고도화된 테스트 웹훅] 테스트 발송 시 현재 체크된 6대 항목 및 정기보고 On/Off 상태를 디스코드 카드에 시각화 표출
  */
 
 import os from 'os';
@@ -443,11 +443,14 @@ export const systemMonitor = {
   },
 
   /**
-   * 관리자 설정 페이지에서 디스코드 웹훅 연결 테스트 전송
+   * 🧪 [고도화된 테스트 웹훅] 체크된 6대 항목 및 정기보고 On/Off 상태를 포함하여 테스트 전송
    * @param {string} webhookUrl - 테스트할 웹훅 URL
+   * @param {Object} [options={}] - 선택된 알림 필터 및 정기보고 옵션
+   * @param {string|string[]} [options.alertTypes="500,RESOURCE"] - 선택된 6대 알림 필터
+   * @param {boolean} [options.dailyDigest=false] - 조건부 정기보고 활성 여부
    * @returns {Promise<{ ok: boolean, message: string }>}
    */
-  async testDiscordWebhook(webhookUrl) {
+  async testDiscordWebhook(webhookUrl, { alertTypes = '500,RESOURCE', dailyDigest = false } = {}) {
     if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
       return { ok: false, message: '올바른 Discord 웹훅 URL 형식이 아닙니다.' };
     }
@@ -455,26 +458,80 @@ export const systemMonitor = {
     const timeStr = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
     const stats = this.getSystemStats();
 
+    // 1. 체크된 알림 필터 파싱
+    let typesList = [];
+    if (Array.isArray(alertTypes)) {
+      typesList = alertTypes.map(s => String(s).trim());
+    } else if (typeof alertTypes === 'string') {
+      typesList = alertTypes.split(',').map(s => s.trim());
+    }
+
+    const rules = [
+      { key: '500', label: 'HTTP 500 서버 내부 오류' },
+      { key: '401', label: 'HTTP 401 인증 실패 (키 오류)' },
+      { key: '403', label: 'HTTP 403 접근 권한 거부' },
+      { key: '429', label: 'HTTP 429 요청 제한 초과' },
+      { key: 'ATTACK', label: '비정상 접근 및 변칙 메서드 차단' },
+      { key: 'RESOURCE', label: 'CPU/RAM/DISK 80% 초과 경고' }
+    ];
+
+    const rulesFormatted = rules.map(r => {
+      const isEnabled = typesList.includes(r.key);
+      return `${isEnabled ? '✅' : '❌'} **${r.label}** ${isEnabled ? '`(수신)`' : '*(제외)*'}`;
+    }).join('\n');
+
+    const isDailyDigestActive = dailyDigest === true || dailyDigest === 'true';
+    const dailyDigestText = isDailyDigestActive
+      ? '✅ **활성화** (당일 위협 1건 이상 감지 시에만 정기 발송)'
+      : '❌ **비활성화** (정기 보고 미발송)';
+
     const payload = {
       username: 'EPUB Server Guard',
       embeds: [
         {
-          title: '✅ [테스트 성공] Discord 웹훅 알림이 정상 연결되었습니다!',
-          description: '서버 자원이 80%를 넘거나 설정된 보안 이벤트 발생 시 실시간으로 이 채널에 보고됩니다.',
-          color: 0x10b981,
+          title: '✅ [테스트 성공] Discord 관제 채널 연동 확인 완료!',
+          description: '서버 모니터링 및 보안 알림이 정상 연결되었습니다.\n현재 설정된 관제 규칙 및 알림 수신 상태는 다음과 같습니다.',
+          color: 0x10b981, // 초록색
           fields: [
-            { name: '🖥️ 현재 CPU', value: `${stats.cpu}%`, inline: true },
-            { name: '🧠 현재 RAM', value: `${stats.ram}%`, inline: true },
-            { name: '💾 현재 DISK', value: `${stats.disk}%`, inline: true }
+            {
+              name: '🎯 실시간 감시 규칙 설정 현황 (6대 필터)',
+              value: rulesFormatted,
+              inline: false
+            },
+            {
+              name: '📊 일일 보안 정기 보고',
+              value: dailyDigestText,
+              inline: false
+            },
+            {
+              name: '📦 페이로드 분기 정책',
+              value: '• `1KB 이하`: 디스코드 임베드 본문에 즉시 표시\n• `1KB 초과`: `error_log.json` 파일 자동 첨부 발송',
+              inline: false
+            },
+            {
+              name: '🖥️ CPU',
+              value: `${stats.cpu}%`,
+              inline: true
+            },
+            {
+              name: '🧠 RAM',
+              value: `${stats.ram}%`,
+              inline: true
+            },
+            {
+              name: '💾 DISK',
+              value: `${stats.disk}%`,
+              inline: true
+            }
           ],
-          footer: { text: `테스트 발송 시각: ${timeStr}` }
+          footer: { text: `테스트 발송 시각: ${timeStr} • Personal EPUB Server Guard` }
         }
       ]
     };
 
     const success = await postToDiscord(webhookUrl, payload);
     if (success) {
-      return { ok: true, message: '디스코드로 테스트 알림 카드가 정상 발송되었습니다!' };
+      return { ok: true, message: '설정된 관제 규칙이 포함된 테스트 알림 카드가 디스코드로 정상 발송되었습니다!' };
     } else {
       return { ok: false, message: '웹훅 전송에 실패했습니다. URL 주소와 채널 권한을 확인해 주세요.' };
     }

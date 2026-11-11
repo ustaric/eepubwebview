@@ -2,13 +2,13 @@
  * @file src/views/adminDashboardTab.js
  * @description 관리자 제어 센터 [탭 1: 📊 관제 대시보드] HTML 렌더러 모듈
  * - 🖥️ [상단 실시간 가로 1줄 게이지 바] CPU(1분 평균), RAM, DISK 점유율 가로 1줄 콤팩트 실시간 표출 (80% 이상 경고 점멸)
- * - 🔔 [최하단 Discord 웹훅 설정 카드] 웹훅 URL 직접 저장 및 원클릭 테스트 발송(Test Alert) UI 완비
  * - 👥 [사용자 칼럼 표출] 활동 로그 테이블에 사용자 메모/서재 칼럼 완벽 표출
  * - ↔️ [가로/세로 2D 스크롤 박스] max-height: 400px (10행 기준) + overflow: auto 로 오른쪽 끝 잘림 방지
  * - 📌 [스티키 헤더 탑재] 스크롤을 내려도 thead th가 상단에 고정되어 가독성 극대화
  * - 💾 [디스크 및 도서 메트릭] 활성/보관 도서 권수 및 실측 디스크 용량 현황 카드
  * - 📁 [일자별 감사 로그 다운로드 센터] 일자별 영구 저장 파일 목록 및 스크롤 박스
  * - 🔬 [크래시 리포트 센터] 뷰어 조판 결함 진단 리포트 스크롤 테이블
+ * - 🧹 [단일화 조치] 중복된 구형 웹훅 설정 카드를 제거하고 [⚙️ 시스템 설정] 탭으로 일원화
  */
 
 import { auditLogger } from '../auditLogger.js';
@@ -40,7 +40,6 @@ function escapeHtml(str = '') {
 export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports = [], env = {}) {
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
   const isOriginStrict = allowedOrigin !== '*';
-  const currentWebhookUrl = env.DISCORD_WEBHOOK_URL || '';
 
   const initialStats = systemMonitor.getSystemStats();
 
@@ -225,7 +224,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
   }
 
   return `
-    <!-- 🌟 [신규] 상단 가로 1줄 실시간 시스템 자원 게이지 바 (설명 텍스트 대체) -->
+    <!-- 상단 가로 1줄 실시간 시스템 자원 게이지 바 -->
     <div class="card" style="padding: 14px 18px; margin-bottom: 16px; background: #0f172a; border: 1px solid var(--border);">
       <div class="system-gauge-container">
         <!-- CPU 게이지 -->
@@ -383,30 +382,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       ${crashReportsHtml}
     </div>
 
-    <!-- 🌟 [신규 6] 최하단 Discord 웹훅 실시간 관제 및 알림 설정 카드 -->
-    <div class="card" style="border: 1px solid #3b82f6;">
-      <div class="section-title">
-        <span>🔔 Discord 웹훅 실시간 장애 & 자원 관제</span>
-        <span class="badge badge-info">${currentWebhookUrl ? '연결됨 ✅' : '미등록 (알림 꺼짐)'}</span>
-      </div>
-      <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 12px 0;">
-        CPU, RAM, DISK 점유율이 <strong>80%를 초과</strong>하면 30분 주기로 디스코드에 경보 카드를 전송하며, <strong>서버 500 장애</strong> 발생 시 에러 요약이 즉시 발송됩니다.
-      </p>
-
-      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        <input 
-          type="text" 
-          id="discord-webhook-input" 
-          placeholder="https://discord.com/api/webhooks/..." 
-          value="${escapeHtml(currentWebhookUrl)}"
-          style="flex: 1; min-width: 280px; padding: 10px 14px; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #f8fafc; font-size: 13px; font-family: monospace;"
-        />
-        <button type="button" id="btn-save-webhook" class="btn btn-primary" style="padding: 10px 18px; font-size: 13px;">💾 저장</button>
-        <button type="button" id="btn-test-webhook" class="btn" style="padding: 10px 18px; font-size: 13px; background: #475569; color: white;">🔔 테스트 전송</button>
-      </div>
-      <div id="discord-webhook-feedback" style="margin-top: 8px; font-size: 12px; display: none;"></div>
-    </div>
-
     <!-- 🎨 [스타일 & 스크립트] 가로 게이지 바 및 실시간 10초 갱신 클라이언트 루프 -->
     <style>
       .system-gauge-container {
@@ -481,7 +456,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
     <script>
       (function() {
-        // 1. 실시간 10초 자원 갱신 루프
+        // 실시간 10초 자원 갱신 루프 (디스코드 구형 이벤트 바인딩은 완전히 제거됨)
         async function fetchSystemStats() {
           try {
             const res = await fetch('/api/admin/system-stats');
@@ -518,78 +493,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
         }
 
         setInterval(fetchSystemStats, 10000);
-
-        // 2. 디스코드 웹훅 저장 & 테스트 발송 이벤트 바인딩
-        const saveBtn = document.getElementById('btn-save-webhook');
-        const testBtn = document.getElementById('btn-test-webhook');
-        const inputEl = document.getElementById('discord-webhook-input');
-        const feedbackEl = document.getElementById('discord-webhook-feedback');
-
-        function showFeedback(msg, isSuccess) {
-          if (!feedbackEl) return;
-          feedbackEl.style.display = 'block';
-          feedbackEl.style.color = isSuccess ? '#34d399' : '#f87171';
-          feedbackEl.textContent = msg;
-          setTimeout(() => { feedbackEl.style.display = 'none'; }, 5000);
-        }
-
-        if (saveBtn) {
-          saveBtn.onclick = async function() {
-            const webhookUrl = inputEl ? inputEl.value.trim() : '';
-            saveBtn.disabled = true;
-            saveBtn.textContent = '저장 중...';
-
-            try {
-              const res = await fetch('/api/admin/discord-webhook', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'save', webhookUrl })
-              });
-              const data = await res.json();
-              if (res.ok) {
-                showFeedback('✅ ' + (data.message || '저장되었습니다.'), true);
-              } else {
-                showFeedback('❌ ' + (data.error || '저장 실패'), false);
-              }
-            } catch (err) {
-              showFeedback('❌ 통신 오류: ' + err.message, false);
-            } finally {
-              saveBtn.disabled = false;
-              saveBtn.textContent = '💾 저장';
-            }
-          };
-        }
-
-        if (testBtn) {
-          testBtn.onclick = async function() {
-            const webhookUrl = inputEl ? inputEl.value.trim() : '';
-            if (!webhookUrl) {
-              alert('먼저 Discord 웹훅 URL을 입력해 주세요.');
-              return;
-            }
-            testBtn.disabled = true;
-            testBtn.textContent = '전송 중...';
-
-            try {
-              const res = await fetch('/api/admin/discord-webhook', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'test', webhookUrl })
-              });
-              const data = await res.json();
-              if (res.ok) {
-                showFeedback('🎉 ' + data.message, true);
-              } else {
-                showFeedback('⚠️ ' + data.message, false);
-              }
-            } catch (err) {
-              showFeedback('❌ 통신 오류: ' + err.message, false);
-            } finally {
-              testBtn.disabled = false;
-              testBtn.textContent = '🔔 테스트 전송';
-            }
-          };
-        }
       })();
     </script>
   `;

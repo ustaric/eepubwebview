@@ -4,6 +4,7 @@
  * - 🩺 [서버 헬스체크] GET /api/health 스토리지 상태, 토큰 보유 및 API 키 검증
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환
  * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장
+ * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
  */
 
 import { hasRefreshToken } from '../../tokenStore.js';
@@ -91,12 +92,21 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
         const payload = JSON.parse(buffer.toString('utf-8') || '{}');
         const { webhookUrl, action, alertTypes, dailyDigest } = payload;
 
+        // 🌟 [테스트 발송] 체크된 6대 항목 및 정기보고 옵션을 systemMonitor로 함께 전달
         if (action === 'test') {
-          const testResult = await systemMonitor.testDiscordWebhook(webhookUrl);
+          const env = readEnvFile();
+          const targetAlertTypes = alertTypes !== undefined ? alertTypes : (env.DISCORD_ALERT_TYPES || '500,RESOURCE');
+          const targetDailyDigest = dailyDigest !== undefined ? dailyDigest : (env.DISCORD_DAILY_DIGEST === 'true');
+
+          const testResult = await systemMonitor.testDiscordWebhook(webhookUrl, {
+            alertTypes: targetAlertTypes,
+            dailyDigest: targetDailyDigest
+          });
           sendJsonResponse(req, res, testResult.ok ? 200 : 400, testResult);
           return true;
         }
 
+        // 🌟 [설정 저장]
         if (action === 'save') {
           const cleanUrl = (webhookUrl || '').trim();
 
@@ -110,7 +120,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
 
           const isDailyDigest = dailyDigest === true || dailyDigest === 'true';
 
-          // 🌟 .env 파일에 알림 옵션 3종 영구 저장
+          // .env 파일에 알림 옵션 3종 영구 저장
           writeEnvFile({
             DISCORD_WEBHOOK_URL: cleanUrl,
             DISCORD_ALERT_TYPES: cleanAlertTypes,
