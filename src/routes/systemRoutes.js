@@ -3,7 +3,7 @@
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
  * - 🩺 [서버 헬스체크] GET /api/health 스토리지 상태, 토큰 보유 및 API 키 검증
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환
- * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 영구 저장(.env 각인) 및 즉시 테스트 발송
+ * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장
  */
 
 import { hasRefreshToken } from '../../tokenStore.js';
@@ -71,14 +71,16 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     return true;
   }
 
-  // 3. Discord 웹훅 URL 조회, 저장 및 테스트 발송
+  // 3. Discord 웹훅 URL 및 세부 알림 필터 조회, 저장 및 테스트 발송
   if (pathname === '/api/admin/discord-webhook') {
-    // 🌟 [신규] GET 요청 시 현재 저장된 웹훅 URL 즉시 반환
+    // 🌟 [GET] 현재 저장된 웹훅 URL 및 알림 필터 목록, 정기보고 설정 반환
     if (req.method === 'GET') {
       const env = readEnvFile();
       sendJsonResponse(req, res, 200, {
         ok: true,
-        webhookUrl: env.DISCORD_WEBHOOK_URL || ''
+        webhookUrl: env.DISCORD_WEBHOOK_URL || '',
+        alertTypes: env.DISCORD_ALERT_TYPES || '500,RESOURCE',
+        dailyDigest: env.DISCORD_DAILY_DIGEST === 'true'
       });
       return true;
     }
@@ -87,7 +89,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       try {
         const buffer = await readRequestBodyBuffer(req, 1024 * 64);
         const payload = JSON.parse(buffer.toString('utf-8') || '{}');
-        const { webhookUrl, action } = payload;
+        const { webhookUrl, action, alertTypes, dailyDigest } = payload;
 
         if (action === 'test') {
           const testResult = await systemMonitor.testDiscordWebhook(webhookUrl);
@@ -98,22 +100,38 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
         if (action === 'save') {
           const cleanUrl = (webhookUrl || '').trim();
 
-          // 🌟 [핵심 수정] 단일 객체 updates로 전달하여 .env 파일에 100% 확실히 영구 각인!
-          writeEnvFile({ DISCORD_WEBHOOK_URL: cleanUrl });
+          // alertTypes 정규화 (배열 또는 문자열 대응)
+          let cleanAlertTypes = '500,RESOURCE';
+          if (Array.isArray(alertTypes)) {
+            cleanAlertTypes = alertTypes.join(',');
+          } else if (typeof alertTypes === 'string') {
+            cleanAlertTypes = alertTypes.trim();
+          }
+
+          const isDailyDigest = dailyDigest === true || dailyDigest === 'true';
+
+          // 🌟 .env 파일에 알림 옵션 3종 영구 저장
+          writeEnvFile({
+            DISCORD_WEBHOOK_URL: cleanUrl,
+            DISCORD_ALERT_TYPES: cleanAlertTypes,
+            DISCORD_DAILY_DIGEST: isDailyDigest ? 'true' : 'false'
+          });
 
           auditLogger.recordAccessLog({
             ip: clientIp,
             userAgent,
-            action: '⚙️ 디스코드 웹훅 설정 저장',
-            target: cleanUrl ? '웹훅 등록' : '웹훅 제거',
+            action: '⚙️ 디스코드 관제 설정 저장',
+            target: cleanUrl ? `알림 필터(${cleanAlertTypes}), 정기보고(${isDailyDigest})` : '웹훅 제거',
             status: 200,
             user: 'Root Admin'
           });
 
           sendJsonResponse(req, res, 200, {
             ok: true,
-            message: cleanUrl ? 'Discord 웹훅 설정이 저장되었습니다.' : 'Discord 웹훅이 제거되었습니다.',
-            webhookUrl: cleanUrl
+            message: cleanUrl ? 'Discord 관제 알림 설정이 저장되었습니다.' : 'Discord 웹훅이 제거되었습니다.',
+            webhookUrl: cleanUrl,
+            alertTypes: cleanAlertTypes,
+            dailyDigest: isDailyDigest
           });
           return true;
         }

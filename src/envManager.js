@@ -1,8 +1,8 @@
 /**
  * @file src/envManager.js
  * @description .env 환경 설정 파일 파싱, 저장 및 로컬 스토리지 필수 디렉터리(books, settings, archive, crash-reports, logs, users, api) 생성 전담 모듈
- * - 🛡️ [환경변수 무누락 보존] DISCORD_WEBHOOK_URL, STORAGE_API_KEY를 포함한 전 15대 환경변수 영구 보존
- * - 🔔 [Discord 웹훅 영구 기록] DISCORD_WEBHOOK_URL을 .env 파일에 무손실 저장하여 관제 알림 설정 영구 보존
+ * - 🛡️ [환경변수 무누락 보존] DISCORD_ALERT_TYPES, DISCORD_DAILY_DIGEST 포함 전 17대 환경변수 영구 보존
+ * - 🔔 [Discord 알림 필터 영구 기록] 알림 유형 선택값 및 로그 유무 조건부 정기보고 설정 .env 각인
  * - 👥 [다중 사용자 저장소 준비] ./data/users 및 ./data/api 디렉터리 자동 권한 세팅 지원
  * - 🔑 [스토리지 API 보안 키 지원] 서버 전용 비밀키 및 엄격 검증 모드 플래그 영구 동기화
  * - 📁 [공유 도서 라이브러리 지원] SHARED_BOOKS_DIR 경로를 .env에 무손실 저장
@@ -42,7 +42,7 @@ export function readEnvFile() {
 }
 
 /**
- * 📁 .env 파일 안전 덮어쓰기 헬퍼 (DISCORD_WEBHOOK_URL 포함 전 15대 항목 무손실 영구 보존)
+ * 📁 .env 파일 안전 덮어쓰기 헬퍼 (디스코드 알림 상세 필터 포함 전 17대 항목 무손실 영구 보존)
  * @param {Record<string, string>} newValues 
  */
 export function writeEnvFile(newValues) {
@@ -64,7 +64,9 @@ export function writeEnvFile(newValues) {
     `READER_URL=${merged.READER_URL || 'https://epubwebview.vercel.app'}`,
     `STORAGE_API_KEY=${merged.STORAGE_API_KEY || ''}`,
     `ENFORCE_STORAGE_API_KEY=${merged.ENFORCE_STORAGE_API_KEY === 'true' ? 'true' : 'false'}`,
-    `DISCORD_WEBHOOK_URL=${merged.DISCORD_WEBHOOK_URL || ''}` // 🌟 [핵심 해결] 디스코드 웹훅 영구 기록 필드 탑재!
+    `DISCORD_WEBHOOK_URL=${merged.DISCORD_WEBHOOK_URL || ''}`,
+    `DISCORD_ALERT_TYPES=${merged.DISCORD_ALERT_TYPES || '500,RESOURCE'}`, // 기본값: 500 오류 및 자원 80%
+    `DISCORD_DAILY_DIGEST=${merged.DISCORD_DAILY_DIGEST === 'true' ? 'true' : 'false'}` // 로그 있을 때만 일일 정기보고 발송 플래그
   ];
 
   fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf-8');

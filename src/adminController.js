@@ -11,6 +11,7 @@
  * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 프로세스 읽기 권한 즉시 검증
  * - 📥 [보안 감사 로그 다운로드/삭제] securityGuard 연동 실시간 로그 다운로드 및 영구 파쇄 지원
  * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 캡슐화
+ * - 🔔 [디스코드 환경변수 무손실 보존] 전체 설정 저장 시 DISCORD_ALERT_TYPES, DISCORD_DAILY_DIGEST 보존
  */
 
 import fs from 'fs';
@@ -244,7 +245,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
   // 👥 4. 다중 사용자 API 키 & 기기 관리 라우트
   // =========================================================================
 
-  // 1) [새 사용자 키 발급] POST /admin/users/create (기기 기본 한도 6대 탑재)
+  // 1) [새 사용자 키 발급] POST /admin/users/create
   if (req.method === 'POST' && pathname === '/admin/users/create') {
     if (!isAuthenticated(req)) {
       res.writeHead(302, { Location: '/admin' });
@@ -380,7 +381,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 4) [사용자 최대 기기 한도 변경] POST /admin/users/update-max-devices (신규 탑재)
+  // 4) [사용자 최대 기기 한도 변경] POST /admin/users/update-max-devices
   if (req.method === 'POST' && pathname === '/admin/users/update-max-devices') {
     const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
 
@@ -439,7 +440,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 5) [특정 기기 차단 (Ban)] POST /admin/users/devices/block (신규 탑재)
+  // 5) [특정 기기 차단 (Ban)] POST /admin/users/devices/block
   if (req.method === 'POST' && pathname === '/admin/users/devices/block') {
     const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
 
@@ -498,7 +499,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 6) [특정 기기 차단 해제 (Unban)] POST /admin/users/devices/unblock (신규 탑재)
+  // 6) [특정 기기 차단 해제 (Unban)] POST /admin/users/devices/unblock
   if (req.method === 'POST' && pathname === '/admin/users/devices/unblock') {
     const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
 
@@ -557,7 +558,7 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 7) [특정 기기 삭제 (슬롯 반환)] POST /admin/users/devices/delete (신규 탑재)
+  // 7) [특정 기기 삭제 (슬롯 반환)] POST /admin/users/devices/delete
   if (req.method === 'POST' && pathname === '/admin/users/devices/delete') {
     const isAjax = req.headers['accept']?.includes('application/json') || req.headers['x-requested-with'] === 'XMLHttpRequest';
 
@@ -844,10 +845,16 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const params = new URLSearchParams(body);
         const updates = {};
         
-        // 기존 env에 저장되어 있던 DISCORD_WEBHOOK_URL 보존
+        // 🌟 [핵심 개선] 기존 env에 저장되어 있던 Discord 관제 3대 설정 무손실 보존
         const currentEnv = readEnvFile();
         if (currentEnv.DISCORD_WEBHOOK_URL) {
           updates.DISCORD_WEBHOOK_URL = currentEnv.DISCORD_WEBHOOK_URL;
+        }
+        if (currentEnv.DISCORD_ALERT_TYPES) {
+          updates.DISCORD_ALERT_TYPES = currentEnv.DISCORD_ALERT_TYPES;
+        }
+        if (currentEnv.DISCORD_DAILY_DIGEST) {
+          updates.DISCORD_DAILY_DIGEST = currentEnv.DISCORD_DAILY_DIGEST;
         }
 
         const port = params.get('PORT')?.trim();

@@ -6,7 +6,7 @@
  * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
  * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
  * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
- * - 🚨 [서버 500 장애 디스코드 실시간 알림] statusCode >= 500 감지 시 systemMonitor.sendErrorAlert 자동 연계
+ * - 🔔 [선택적 디스코드 실시간 알림] DISCORD_ALERT_TYPES(500, 401, 403, 429, ATTACK) 설정에 따른 조건부 웹훅 연동
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
  * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
  * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
@@ -65,7 +65,7 @@ const MAX_LOGS_LIMIT = 30;
  */
 const accessLogBuffer = [];
 
-// 🔑 최근 스토리지 API 키 사용 현황 메모리 홀더 (0KB 부하 방어)
+// 🔑 최근 스토리지 API 키 사용 현황 메모리 홀더
 let lastApiKeyUsage = null;
 
 // 디스크 용량 캐시 홀더 (60초 TTL)
@@ -171,7 +171,6 @@ function appendLogToDailyFile(entry) {
     const line = JSON.stringify(entry) + '\n';
     fs.appendFileSync(targetFile, line, 'utf-8');
   } catch (err) {
-    // 디스크 쓰기 오류가 발생해도 주 독서 서비스는 절대 중단되지 않음 (Fail-Safe)
     console.warn('⚠️ [AuditLogger:DiskWriteWarn] 일자별 로그 파일 저장 실패:', err.message);
   }
 }
@@ -214,8 +213,8 @@ export const auditLogger = {
   /**
    * 새로운 서버 접근 및 동기화 활동 1건을 기록 (사용자 서재 식별자 user 지원)
    * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)
-   * - 디스크: status >= 400 (외부 침입 차단, 비번 오류, 내부 실패)만 선별 영구 저장
-   * - 디스코드: status >= 500 (서버 내부 치명적 장애) 감지 시 자동 텍스트 알림 발송
+   * - 디스크: status >= 400만 선별 영구 저장
+   * - 디스코드: DISCORD_ALERT_TYPES 설정에 부합하는 이벤트 실시간 발송 (1KB 분기 탑재)
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
@@ -240,7 +239,7 @@ export const auditLogger = {
       date: dateStr,
       ip: ip || '127.0.0.1',
       device: parseDeviceLabel(userAgent),
-      user: user || '-', // 🌟 [신규] 사용자 서재 식별자
+      user: user || '-',
       action: sanitizedAction,
       target: sanitizedTarget,
       status: statusCode
@@ -252,21 +251,38 @@ export const auditLogger = {
     }
     accessLogBuffer.push(entry);
 
-    // 2. 📁 [핵심 개선] 디스크 영구 저장은 오직 '외부 침입/차단' 및 '내부 실패'(status >= 400)만 선별 저장!
+    // 2. 디스크 영구 저장 (status >= 400 선별 저장)
     const isSecurityIncidentOrFailure = statusCode >= 400;
     if (isSecurityIncidentOrFailure) {
       appendLogToDailyFile(entry);
-    }
 
-    // 3. 🚨 [신규] 서버 500번대 치명적 내부 장애 발생 시 Discord 웹훅 텍스트 알림 즉시 발송
-    if (statusCode >= 500) {
-      systemMonitor.sendErrorAlert({
-        path: sanitizedAction,
-        error: sanitizedTarget,
-        user: user || 'Root Admin',
-        status: statusCode,
-        ip: ip || '127.0.0.1'
-      }).catch(() => {});
+      // 3. 🔔 [선택적 Discord 실시간 알림 분기]
+      const env = readEnvFile();
+      const webhookUrl = env.DISCORD_WEBHOOK_URL;
+
+      if (webhookUrl) {
+        const alertTypes = (env.DISCORD_ALERT_TYPES || '500,RESOURCE').split(',').map(s => s.trim());
+
+        let shouldAlert = false;
+        if (statusCode >= 500 && alertTypes.includes('500')) shouldAlert = true;
+        else if (statusCode === 401 && alertTypes.includes('401')) shouldAlert = true;
+        else if (statusCode === 403 && alertTypes.includes('403')) shouldAlert = true;
+        else if (statusCode === 429 && alertTypes.includes('429')) shouldAlert = true;
+        else if ((statusCode === 405 || statusCode === 400 || sanitizedAction.includes('차단') || sanitizedAction.includes('침입')) && alertTypes.includes('ATTACK')) {
+          shouldAlert = true;
+        }
+
+        if (shouldAlert) {
+          systemMonitor.sendSecurityAlert({
+            path: sanitizedAction,
+            error: sanitizedTarget,
+            user: user || 'Root Admin',
+            status: statusCode,
+            ip: ip || '127.0.0.1',
+            detailData: entry
+          }).catch(() => {});
+        }
+      }
     }
   },
 
@@ -320,7 +336,6 @@ export const auditLogger = {
     }
 
     scanDirRecursively(LOGS_DIR);
-    // 최신 일자순 정렬
     results.sort((a, b) => b.date.localeCompare(a.date));
     return results;
   },
