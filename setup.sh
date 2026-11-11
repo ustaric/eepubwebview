@@ -1,24 +1,23 @@
-
 #!/usr/bin/env bash
 
 # ==============================================================================
 # Personal EPUB Server - Refresh Token & Storage Server
-# Ubuntu / Debian / Oracle Linux
+# Ubuntu / Debian / Oracle Linux 통합 설치 및 환경 구성 스크립트
 #
 # 주요 기능
-# - .env 자동 생성 및 기존 설정 보존
-# - UFW / firewalld / iptables-nft 감지
-# - 기존 방화벽 규칙 보존 및 필요한 포트만 추가
-# - Caddy 리버스 프록시 안전한 설정 추가/갱신
-# - Caddyfile 자동 백업 및 설정 검증
-# - Node.js / npm / PM2 설치 및 서비스 실행
+# - .env 15대 표준 환경변수 자동 검증 및 무작위 암호화 키(32바이트) 자동 채번
+# - 기존 .env 설정 100% 무손실 보존
+# - UFW / firewalld / iptables-nft 자동 감지 및 웹 필수 포트(80, 443) 안전 추가
+# - Caddy 리버스 프록시 자동 백업, 설정 검증 및 리로드
+# - Node.js (v18+) / npm / PM2 무중단 데몬 등록 및 부팅 자동 실행
+# - 10회 로컬 헬스체크 및 관리자 관제 센터 안내
 #
 # 보안 정책
-# - SSH 22번 규칙 변경 금지
-# - OCI 관리 규칙 변경 금지
-# - 방화벽 전체 초기화 금지
-# - Caddy 사용 시 Node.js 포트 외부 개방 금지
-# - RPCbind 등 기존 시스템 서비스 변경 금지
+# - SSH 22번 규칙 임의 변경 및 삭제 금지
+# - Oracle Cloud (OCI) Agent 및 관리 규칙 보존
+# - 방화벽 전체 초기화(Flush) 원천 차단
+# - Caddy 사용 시 Node.js 내부 포트(3001) 외부 노출 차단
+# - RPCbind(111) 등 기존 시스템 서비스 무단 변경 금지
 # ==============================================================================
 
 set -uo pipefail
@@ -81,7 +80,7 @@ fi
 
 if [ "$EUID" -eq 0 ]; then
     error "root 계정이 아닌 일반 사용자 계정으로 실행하세요."
-    echo "예: ubuntu 계정에서 ./install.sh"
+    echo "예: ubuntu 계정에서 ./setup.sh"
     exit 1
 fi
 
@@ -96,21 +95,56 @@ if ! sudo -v; then
 fi
 
 # ------------------------------------------------------------------------------
-# 1. 환경 설정 파일
+# 1. 환경 설정 파일 점검 및 15대 표준 환경변수 안전 보장
 # ------------------------------------------------------------------------------
 
 echo -e "${BLUE}[1/5] 환경 설정 점검${NC}"
 
+# 무작위 32바이트 암호화 키 생성 헬퍼
+generate_random_key() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    else
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    fi
+}
+
 if [ ! -f ".env" ]; then
+    RANDOM_KEY=$(generate_random_key)
     if [ -f ".env.example" ]; then
         cp .env.example .env
         success ".env.example 기반 .env 생성 완료"
     else
-        touch .env
-        warn ".env 기본 파일 생성"
+        cat <<EOF > .env
+PORT=3001
+HOST=127.0.0.1
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=
+TOKEN_ENCRYPTION_KEY=${RANDOM_KEY}
+TOKEN_FILE=./data/token.enc
+ALLOWED_ORIGIN=*
+STORAGE_MODE=true
+SHARED_BOOKS_DIR=
+ADMIN_PASSWORD=
+READER_URL=https://epubwebview.vercel.app
+STORAGE_API_KEY=
+ENFORCE_STORAGE_API_KEY=true
+DISCORD_WEBHOOK_URL=
+EOF
+        success "15대 표준 환경변수 템플릿 기반 .env 생성 완료"
     fi
+    chmod 600 .env
 else
     success "기존 .env 설정 유지"
+fi
+
+# TOKEN_ENCRYPTION_KEY 가 비어있는 경우 프로세스 크래시 방지를 위해 자동 채번
+EXISTING_KEY=$(awk -F= '/^TOKEN_ENCRYPTION_KEY=/ { sub(/^[^=]*=/, ""); gsub(/[[:space:]"\047]/, ""); print $0 }' .env 2>/dev/null)
+if [ -z "$EXISTING_KEY" ]; then
+    AUTO_GEN_KEY=$(generate_random_key)
+    sed -i "s/^TOKEN_ENCRYPTION_KEY=.*/TOKEN_ENCRYPTION_KEY=${AUTO_GEN_KEY}/" .env || true
+    info "보안 토큰 암호화 키(TOKEN_ENCRYPTION_KEY) 자동 생성 및 적용 완료"
 fi
 
 APP_PORT=$(
@@ -617,7 +651,7 @@ if [ "$HEALTH_OK" -eq 1 ]; then
     success "EPUB 서버 헬스체크 정상"
 else
     warn "헬스체크 응답을 받지 못했습니다."
-    warn "PM2 로그와 API 경로를 확인하세요."
+    warn "PM2 로그(pm2 logs refresh-server)와 .env 설정을 확인하세요."
 fi
 
 SERVER_IP=$(
@@ -632,12 +666,12 @@ echo -e "${GREEN}Personal EPUB Server 설치 완료${NC}"
 echo -e "${GREEN}================================================================${NC}"
 
 if [ -n "$DOMAIN_NAME" ]; then
-    echo -e "🌐 접속 주소: https://${DOMAIN_NAME}/admin"
+    echo -e "🌐 제어 센터: https://${DOMAIN_NAME}/admin"
 elif [ "$CADDY_PRESENT" -eq 1 ]; then
     echo -e "🌐 기존 Caddy 설정 유지"
-    echo -e "   기존 도메인 및 라우팅으로 접속하세요."
+    echo -e "   기존 도메인 및 라우팅으로 접속하세요: https://도메인/admin"
 else
-    echo -e "🌐 접속 주소: http://${SERVER_IP}:${APP_PORT}/admin"
+    echo -e "🌐 제어 센터: http://${SERVER_IP}:${APP_PORT}/admin"
 fi
 
 echo ""
