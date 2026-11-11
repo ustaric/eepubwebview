@@ -4,7 +4,8 @@
  * - 📁 다중 공유 서재 폴더 목록 렌더링 및 권한 상태 표시
  * - 📱 기기별 폴더 칩(Tag) 인터랙티브 토글 UI 제공
  * - 🌐 전체 기기 허용/지정 기기 전용 원클릭 권한 제어
- * - ⚡ 공유 서재 전용 비동기 REST API 클라이언트 스크립트 내장
+ * - ⚡ [원클릭 즉시 등록] 블로킹 alert() 팝업을 제거하고 0초 만에 목록에 실시간 반영
+ * - 🛡️ [이중 등록 방지] 비동기 저장 중 버튼 비활성화 락 탑재
  */
 
 import fs from 'fs';
@@ -250,7 +251,7 @@ export function renderSharedFoldersTab(env) {
             </div>
           </div>
         </div>
-        <button type="button" class="btn-submit" style="background: #0d9488; height: 42px; font-size: 14px; padding: 0 16px;" onclick="addNewSharedFolder()">
+        <button type="button" id="btn-add-shared-folder" class="btn-submit" style="background: #0d9488; height: 42px; font-size: 14px; padding: 0 16px;" onclick="addNewSharedFolder()">
           ➕ 공유 폴더 등록
         </button>
       </div>
@@ -315,15 +316,22 @@ export function renderSharedFoldersTab(env) {
         }
       }
 
+      // 🌟 [개선] 블로킹 alert() 제거 및 즉시 새로고침 연계 (이중 제출 방지 락 탑재)
       async function addNewSharedFolder() {
         var nameInput = document.getElementById('new-folder-name');
         var pathInput = document.getElementById('new-folder-path');
+        var addBtn = document.getElementById('btn-add-shared-folder');
         var name = nameInput ? nameInput.value.trim() : '';
         var folderPath = pathInput ? pathInput.value.trim() : '';
 
         if (!name || !folderPath) {
           alert('폴더 표시 이름과 서버 실제 경로를 모두 입력해 주세요.');
           return;
+        }
+
+        if (addBtn) {
+          addBtn.disabled = true;
+          addBtn.textContent = '⏳ 등록 중...';
         }
 
         try {
@@ -339,11 +347,21 @@ export function renderSharedFoldersTab(env) {
 
           var ok = await saveSharedFoldersConfig(cfg);
           if (ok) {
-            alert("새 공유 폴더('" + name + "')가 성공적으로 등록되었습니다!");
+            // 번거로운 확인 팝업 없이 즉시 리로드하여 목록에 0초 만에 반영
             window.location.reload();
+          } else {
+            alert('폴더 등록 요청이 실패했습니다.');
+            if (addBtn) {
+              addBtn.disabled = false;
+              addBtn.textContent = '➕ 공유 폴더 등록';
+            }
           }
         } catch (e) {
           alert('폴더 추가 실패: ' + e.message);
+          if (addBtn) {
+            addBtn.disabled = false;
+            addBtn.textContent = '➕ 공유 폴더 등록';
+          }
         }
       }
 

@@ -3,7 +3,7 @@
  * @description 관리자 제어 센터 간이 파일 탐색기 모달 다이얼로그 마크업 및 브라우저 클라이언트 JS 스크립트 전담 모듈
  * - 📁 [탐색기 모달 마크업] 상위 이동 버튼, 현재 경로 바, 폴더 목록 그리드, 선택/취소 푸터 (기본 display: none 강제 결속)
  * - 🎯 [범용 인풋 주입 지원] openFolderPicker(targetInputId) 지원으로 시스템 설정 및 공유 서재 등록 폼 어디든 경로 주입 가능
- * - ⚡ [탭 충돌 원천 제거] 오케스트레이터와 충돌하던 구버전 switchAdminTab 중복 선언 완전 제거
+ * - ⚡ [원클릭 즉시 주입] 번거로운 alert() 확인 팝업을 제거하고 대상 인풋에 경로 즉시 주입 및 모달 자동 닫기
  * - 🔍 [fs-tree 비동기 브라우징 & 실측] /admin/fs-tree 및 /admin/test-folder 연동 안전한 디렉터리 탐색
  */
 
@@ -149,7 +149,6 @@ export function renderFolderModalAndScript() {
     var currentParentPath = null;
     var currentTargetInputId = 'input-shared-books-dir'; // 기본값
 
-    // 🌟 [핵심 개선] 범용 targetInputId 지원 (어느 인풋이든 경로 입력 가능!)
     function openFolderPicker(targetInputId) {
       currentTargetInputId = targetInputId || 'input-shared-books-dir';
       var targetInput = document.getElementById(currentTargetInputId);
@@ -242,9 +241,12 @@ export function renderFolderModalAndScript() {
           var targetInput = document.getElementById(currentTargetInputId);
           if (targetInput) {
             targetInput.value = currentNavPath;
+            // 🌟 [UX 개선] 번거로운 alert() 제거 및 인풋창 시각적 포커스 하이라이트
+            targetInput.focus();
+            targetInput.style.borderColor = '#38bdf8';
+            setTimeout(function() { targetInput.style.borderColor = ''; }, 1500);
           }
           closeFolderPicker();
-          alert('✔ 폴더가 선택되었습니다: ' + currentNavPath);
         } else {
           msgEl.innerHTML = '<span style="color:var(--danger);">❌ 지정 불가: ' + (result.error || '읽기 권한이 없습니다.') + '</span>';
         }
