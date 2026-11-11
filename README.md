@@ -66,7 +66,7 @@ Google OAuth 인증 과정에서 발급된 Refresh Token은 서버에 암호화�
 - **자체 스토리지 모드 (Self-Hosted Storage)**: Google Drive 없이 개인 서버 디스크 기반 자체 스토리지 및 빠른 동기화 지원
 - **빠른 올인원 통합 스냅샷 (/api/storage/snapshot)**: 단 1회의 API 요청으로 도서, 설정, 업적, 통계 데이터를 일괄 조회
 - **원클릭 주소 복사**: 웹 제어 센터에서 GitHub 주소, 서버 접속 URL, 구글 Redirect URI 1초 클립보드 복사
-- **원클릭 대화형 설치 스크립트 (setup.sh)**: Caddy 자동 감지 및 리눅스 내부 방화벽(iptables) 자동 개방 지원
+- **원클릭 대화형 설치 스크립트 (setup.sh)**: 환경 파일 준비, Caddy 연동, Node.js 의존성 설치 및 PM2 등록 지원. 방화벽 동작은 설치 스크립트 버전과 서버 환경에 따라 달라지므로, 실행 전 설치 안내의 포트 정책을 확인해야 합니다.
 - Google OAuth 2.0 Authorization Code Flow 사용
 - Google 공식 Node.js OAuth 라이브러리 사용
 - Refresh Token 서버 보관
@@ -108,19 +108,122 @@ Node.js 버전은 사용하는 배포 환경에 따라 최신 LTS 버전을 사�
 
 ## 📦 설치
 
-### 방법 1. 원클릭 대화형 스크립트 (권장)
+### 서버 파일 안내
 
-저장소를 복제한 뒤 setup.sh를 실행하면 방화벽 포트 개방부터 Caddy 연동, PM2 무중단 백그라운드 등록까지 한 번에 완료됩니다:
+서버의 주요 파일과 모듈별 역할은 별도 문서에 정리되어 있습니다.
+
+- [`리프레시서버파일안내.md`](리프레시서버파일안내.md): 서버 아키텍처, 파일 카탈로그, 모듈 간 의존성 및 주요 공개 인터페이스
+
+처음 설치하거나 서버 구조를 파악할 때 README와 함께 참고하세요.
+
+### 설치 전 준비
+
+- Ubuntu / Debian / Oracle Linux 등 지원되는 Linux 서버
+- Node.js v18.0.0 이상 및 npm
+- 외부 HTTPS 접속을 위한 도메인과 DNS 설정 권장
+- Caddy 또는 Nginx 등 Reverse Proxy 사용 권장
+- Google Drive 연동 시 Google Cloud OAuth Client 정보
+
+운영 서버에서는 일반 사용자 계정으로 접속하고, 설치 과정에서 필요한 관리자 작업에만 `sudo`를 사용하세요. root 계정으로 설치 스크립트를 직접 실행하지 않는 것을 권장합니다.
+
+### 방법 1. 원클릭 대화형 설치 (권장)
+
+저장소를 복제하고 서버 폴더로 이동합니다.
 
     git clone https://github.com/ustaric/refresh-server.git
     cd refresh-server
-    bash setup.sh
+
+설치 스크립트를 실행합니다.
+
+    chmod +x setup.sh
+    ./setup.sh
+
+설치 과정에서 다음 작업을 진행합니다.
+
+1. `.env` 파일을 확인하고, 없는 경우 `.env.example`을 바탕으로 생성
+2. 서비스 포트 등 기본 환경 설정 확인
+3. 클라우드 방화벽 및 서버 내부 방화벽 설정 확인
+4. Caddy 설치 여부 확인 및 도메인 입력에 따른 Reverse Proxy 설정
+5. npm 패키지 설치
+6. PM2 설치 여부 확인 및 서버 프로세스 등록
+7. 로컬 헬스체크 및 관리자 페이지 접속 주소 안내
+
+기존 `.env`가 있으면 설치 스크립트가 해당 설정을 보존하는지 확인하고, 실행 전 별도 백업을 권장합니다.
+
+### 방화벽 및 포트 설정
+
+Caddy Reverse Proxy를 사용하는 일반적인 구성에서는 외부에 필요한 웹 포트만 공개합니다.
+
+| 포트 | 용도 | 외부 공개 |
+| :--- | :--- | :--- |
+| TCP 22 | SSH 관리 접속 | 관리자 접속 IP로 제한 권장 |
+| TCP 80 | Caddy HTTP 및 인증서 처리 | 필요 |
+| TCP 443 | Caddy HTTPS | 필요 |
+| TCP 3001 | Node.js 애플리케이션 기본 포트 | Caddy 사용 시 공개하지 않음 |
+
+Node.js 서버는 가능하면 `127.0.0.1`에 바인딩하고 Caddy가 로컬 주소로 전달하도록 구성하세요. `.env`에서 `PORT`를 변경했다면 실제 서비스 포트도 함께 확인해야 합니다.
+
+Caddy를 사용하지 않고 Node.js 포트에 직접 접속하는 구성을 선택한 경우에만 해당 포트의 외부 접근을 별도로 허용해야 합니다. 이 방식은 HTTPS와 접근 통제를 별도로 구성해야 하므로 권장 구성은 아닙니다.
+
+**Oracle Cloud 사용 시 주의사항**
+
+- OCI VCN의 Security List 또는 Network Security Group에서도 필요한 인그레스 규칙을 설정해야 합니다.
+- Ubuntu 내부 방화벽과 OCI 클라우드 방화벽은 별개입니다. 양쪽 설정을 모두 확인하세요.
+- 기존 SSH 접속 규칙과 Oracle Cloud Agent 관리 규칙을 임의로 삭제하거나 초기화하지 마세요.
+- 방화벽 규칙 전체 초기화 명령이나 `nft flush ruleset`을 실행하지 마세요.
+- 설치 스크립트가 실제로 어떤 방화벽 관리 도구(UFW, firewalld, iptables 등)를 사용하는지 확인하고, 기존 규칙의 보존 및 재부팅 후 유지 여부를 점검하세요.
+- RPCbind 등 기존 시스템 서비스는 사용 여부를 확인하지 않고 임의로 중지하지 마세요.
+
+방화벽 설정이 이미 완료된 운영 서버에서는 설치 스크립트가 기존 규칙을 변경하는지 먼저 검토한 뒤 실행하세요. SSH 원격 접속 중 방화벽 정책을 변경할 때는 현재 접속을 유지하고, 별도 SSH 세션으로 재접속이 가능한지 확인하는 것이 안전합니다.
+
+### 설치 후 확인
+
+PM2 프로세스 상태를 확인합니다.
+
+    pm2 status
+
+실시간 서버 로그를 확인합니다.
+
+    pm2 logs refresh-server
+
+로컬 헬스체크를 실행합니다.
+
+    curl -i http://127.0.0.1:3001/api/health
+
+실제 서비스 포트가 3001이 아니라면 `.env`의 `PORT` 값에 맞춰 주소를 변경하세요.
+
+Caddy를 사용하는 경우 브라우저에서 다음 주소로 관리자 페이지에 접속합니다.
+
+    https://your-domain.example.com/admin
+
+설치 스크립트가 출력한 접속 주소와 실제 도메인 설정을 확인하세요.
 
 ### 방법 2. 수동 설치
 
+설치 스크립트를 사용하지 않고 직접 구성할 수도 있습니다.
+
     git clone https://github.com/ustaric/refresh-server.git
     cd refresh-server
+    cp .env.example .env
     npm install
+
+`.env`에 서비스 포트, 관리자 비밀번호, 필요한 OAuth 설정 등을 입력한 뒤 실행합니다.
+
+    npm start
+
+운영 환경에서는 PM2 등의 프로세스 관리자를 이용할 수 있습니다.
+
+    npm install -g pm2
+    pm2 start server.js --name refresh-server
+    pm2 save
+
+PM2 부팅 자동 실행은 다음 명령으로 등록할 수 있습니다.
+
+    pm2 startup
+
+명령 실행 결과에 표시되는 `sudo` 명령을 안내에 따라 실행한 뒤 다시 `pm2 save`를 실행하세요.
+
+수동 설치에서는 Reverse Proxy, 방화벽, HTTPS, 부팅 자동 실행을 직접 구성하고 확인해야 합니다.
 
 ---
 
