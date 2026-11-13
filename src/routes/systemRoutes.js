@@ -2,8 +2,8 @@
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
  * - 🩺 [서버 헬스체크] GET /api/health 스토리지 상태, 토큰 보유 및 API 키 검증
- * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환
- * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장
+ * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
+ * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장 (관리자 세션 필수)
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
  */
 
@@ -12,6 +12,7 @@ import { apiKeyManager } from '../apiKeyManager.js';
 import { auditLogger } from '../auditLogger.js';
 import { readEnvFile, writeEnvFile } from '../envManager.js';
 import { systemMonitor } from '../systemMonitor.js';
+import { isAuthenticated } from '../adminController.js';
 import {
   extractApiKey,
   extractDeviceInfo,
@@ -35,14 +36,17 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     const env = readEnvFile();
     const providedApiKey = extractApiKey(req, reqUrl);
     const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+    let isAuthorizedHealth = isAuthenticated(req);
 
     if (providedApiKey) {
       const rootMasterKey = env.STORAGE_API_KEY?.trim();
       if (rootMasterKey && providedApiKey === rootMasterKey) {
+        isAuthorizedHealth = true;
         auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
       } else {
         const auth = apiKeyManager.authenticateApiKey(providedApiKey);
         if (auth.authenticated && auth.user) {
+          isAuthorizedHealth = true;
           auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
           if (deviceId) {
             apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
@@ -57,7 +61,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       hasToken: hasRefreshToken(),
       storageMode: env.STORAGE_MODE === 'true',
       multiUserReady: true,
-      sharedBooksDir: env.SHARED_BOOKS_DIR || null,
+      sharedBooksDir: isAuthorizedHealth ? (env.SHARED_BOOKS_DIR || null) : null,
       hasStorageApiKey: Boolean(env.STORAGE_API_KEY),
       enforceApiKey: env.ENFORCE_STORAGE_API_KEY === 'true',
       timestamp: new Date().toISOString()
@@ -65,15 +69,27 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     return true;
   }
 
-  // 2. 실시간 시스템 자원 사용량 (가로 게이지 바용)
+  // 2. 실시간 시스템 자원 사용량 (가로 게이지 바용 - 관리자 세션 필수)
   if (req.method === 'GET' && pathname === '/api/admin/system-stats') {
+    if (!isAuthenticated(req)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🚫 미인증 관리자 자원조회 차단', target: pathname, status: 401 });
+      sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED: 관리자 로그인이 필요합니다.' });
+      return true;
+    }
+
     const stats = systemMonitor.getSystemStats();
     sendJsonResponse(req, res, 200, { ok: true, stats });
     return true;
   }
 
-  // 3. Discord 웹훅 URL 및 세부 알림 필터 조회, 저장 및 테스트 발송
+  // 3. Discord 웹훅 URL 및 세부 알림 필터 조회, 저장 및 테스트 발송 (관리자 세션 필수)
   if (pathname === '/api/admin/discord-webhook') {
+    if (!isAuthenticated(req)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🚫 미인증 웹훅 설정 접근 차단', target: pathname, status: 401 });
+      sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED: 관리자 로그인이 필요합니다.' });
+      return true;
+    }
+
     // 🌟 [GET] 현재 저장된 웹훅 URL 및 알림 필터 목록, 정기보고 설정 반환
     if (req.method === 'GET') {
       const env = readEnvFile();

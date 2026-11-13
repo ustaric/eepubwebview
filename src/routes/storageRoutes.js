@@ -83,39 +83,14 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return false;
   }
 
-  // 1. 크래시 리포트 수신
-  if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
-    const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
-    try {
-      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
-      const reportData = JSON.parse(buffer.toString('utf-8'));
-      storageService.saveCrashReport(fileName, reportData);
-
-      const env = readEnvFile();
-      const configuredApiKey = env.STORAGE_API_KEY?.trim();
-      const providedApiKey = extractApiKey(req, reqUrl);
-      if (configuredApiKey && providedApiKey === configuredApiKey) {
-        auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method });
-      }
-
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 수신', target: fileName, status: 200 });
-      sendJsonResponse(req, res, 200, { ok: true, fileName, status: 'saved' });
-      return true;
-    } catch (err) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '크래시 리포트 저장 실패', target: fileName, status: 500 });
-      sendJsonResponse(req, res, 500, { error: err.message });
-      return true;
-    }
-  }
-
-  // 2. 스토리지 API 요청 횟수 제한 (1분 120회)
+  // 1. 스토리지 API 요청 횟수 제한 (1분 120회)
   if (!checkRateLimit(req, 120)) {
     auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '요청 횟수 초과 차단', target: pathname, status: 429 });
     sendJsonResponse(req, res, 429, { error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
     return true;
   }
 
-  // 3. STORAGE_MODE 활성화 여부 검증
+  // 2. STORAGE_MODE 활성화 여부 검증
   const env = readEnvFile();
   if (env.STORAGE_MODE !== 'true') {
     auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '스토리지 모드 비활성 거절', target: pathname, status: 403 });
@@ -123,7 +98,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 4. 관리자 쿠키 세션 & API 키 인증 및 사용자/기기 화이트리스트 가드
+  // 3. 관리자 쿠키 세션 & API 키 인증 및 사용자/기기 화이트리스트 가드
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
   let authenticatedUserMemo = 'Root Admin';
@@ -226,6 +201,38 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
     sendJsonResponse(req, res, 403, { error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인 접근입니다.' });
     return true;
+  }
+
+  // 4. 크래시 리포트 수신 (인증/RateLimit/STORAGE_MODE 가드 통과 후 처리)
+  if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
+    const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
+    try {
+      const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
+      const reportData = JSON.parse(buffer.toString('utf-8'));
+      storageService.saveCrashReport(fileName, reportData);
+
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '크래시 리포트 수신',
+        target: fileName,
+        status: 200,
+        user: authenticatedUserMemo
+      });
+      sendJsonResponse(req, res, 200, { ok: true, fileName, status: 'saved' });
+      return true;
+    } catch (err) {
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '크래시 리포트 저장 실패',
+        target: fileName,
+        status: 500,
+        user: authenticatedUserMemo
+      });
+      sendJsonResponse(req, res, 500, { error: err.message });
+      return true;
+    }
   }
 
   // 5. 등록된 기기 목록 조회 (GET /api/storage/devices)
@@ -451,6 +458,13 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       return true;
     }
 
+    // 🌟 [보안 및 경로 정규화] 상위 디렉터리 탈출(..) 차단
+    const normalizedReqFile = reqFile.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (normalizedReqFile.includes('..')) {
+      sendJsonResponse(req, res, 400, { error: 'INVALID_PATH: 잘못된 경로 형식입니다 (상위 경로 이동 불가).' });
+      return true;
+    }
+
     let targetFolder = null;
     if (folderId) {
       targetFolder = config.folders.find(f => f.id === folderId && f.enabled);
@@ -460,6 +474,20 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
 
     if (!targetFolder || !fs.existsSync(targetFolder.path)) {
       sendJsonResponse(req, res, 404, { error: '공유 폴더를 찾을 수 없습니다.' });
+      return true;
+    }
+
+    // 🔒 [기기별 폴더 접근 권한 검증] /import와 동일한 allowedDevices 검사 적용
+    if (!isRootAdmin && !targetFolder.allowedDevices.includes('*') && (!deviceId || !targetFolder.allowedDevices.includes(deviceId))) {
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '🚫 공유 도서 다운로드 권한 차단',
+        target: `${reqFile} (폴더: ${targetFolder.name}, 기기: ${deviceId || 'unknown'})`,
+        status: 403,
+        user: authenticatedUserMemo
+      });
+      sendJsonResponse(req, res, 403, { error: 'PERMISSION_DENIED: 해당 공유 폴더에 접근할 수 있는 권한이 없습니다.' });
       return true;
     }
 

@@ -3,7 +3,7 @@
  * @description Google OAuth 및 6자리 단기 기기 연결 번호(OTP) 인증 전담 라우터
  * - ⚡ [구글 공식 로그인 0초 직통 점프] GET /auth/google 클릭 즉시 302 구글 계정 선택 화면으로 다이렉트 이동
  * - 🔄 [Google OAuth 콜백 & 토큰 교환] GET /auth/google/callback 승인 코드 수신 및 암호화 보관
- * - 🕒 [백그라운드 자동 갱신] GET /api/access-token 호출 시 신선한 Google Access Token 즉시 발급
+ * - 🕒 [백그라운드 자동 갱신] GET /api/access-token 호출 시 인증/출처 검증 후 신선한 Google Access Token 즉시 발급
  * - 🔢 [6자리 OTP 번호 발급] POST /api/auth/otp/issue 3분 유효 일회용 번호 생성
  * - ✨ [6자리 OTP 기기 등록 결속] POST /api/auth/otp/verify 인증 성공 시 해당 기기를 정식 승인 장부에 자동 각인
  */
@@ -12,9 +12,11 @@ import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToke
 import { apiKeyManager } from '../apiKeyManager.js';
 import { auditLogger } from '../auditLogger.js';
 import { readEnvFile } from '../envManager.js';
+import { isAuthenticated } from '../adminController.js';
 import {
   extractApiKey,
   extractDeviceInfo,
+  isAllowedClientOrigin,
   checkOtpRateLimit,
   recordOtpFailure,
   clearOtpFailure,
@@ -208,6 +210,37 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '토큰 발급 횟수 초과', target: '/api/access-token', status: 429 });
       sendJsonResponse(req, res, 429, { error: '요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
       return true;
+    }
+
+    // 🔒 [보안 가드] 관리자 세션, 유효 API 키, 또는 허용된 웹뷰어 출처 검증
+    const providedApiKey = extractApiKey(req, reqUrl);
+    const env = readEnvFile();
+    const rootMasterKey = env.STORAGE_API_KEY?.trim();
+    let isAuthorizedTokenRequest = isAuthenticated(req);
+
+    if (!isAuthorizedTokenRequest && providedApiKey) {
+      if (rootMasterKey && providedApiKey === rootMasterKey) {
+        isAuthorizedTokenRequest = true;
+      } else {
+        const auth = apiKeyManager.authenticateApiKey(providedApiKey);
+        if (!auth.authenticated) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🚫 토큰 발급 API 키 인증 실패', target: auth.reason || pathname, status: 401 });
+          sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
+          return true;
+        }
+        isAuthorizedTokenRequest = true;
+      }
+    }
+
+    if (!isAuthorizedTokenRequest) {
+      const configuredOrigin = (env.ALLOWED_ORIGIN || '').trim();
+      const hasBrowserSourceHeader = Boolean(req.headers.origin || req.headers.referer || req.headers['sec-fetch-site']);
+
+      if (!isAllowedClientOrigin(req) || ((!configuredOrigin || configuredOrigin === '*') && !hasBrowserSourceHeader)) {
+        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🚫 미인가 토큰 발급 차단', target: pathname, status: 403 });
+        sendJsonResponse(req, res, 403, { error: 'FORBIDDEN: 허용된 웹뷰어 출처 또는 유효한 인증 정보가 필요합니다.' });
+        return true;
+      }
     }
 
     try {

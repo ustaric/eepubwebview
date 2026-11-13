@@ -13,7 +13,7 @@
  * - 🟢 [원터치 활성화] 발급 후 24시간 내 최초 1회 인증 성공 시 ACTIVE 상태로 자동 영구 활성화
  * - 📁 [사용자 샌드박스 골격 자동 생성] user_xxxx 채번 시 books/, settings/, archive/ 디렉터리 즉시 준비
  * - 🔄 [무손실 재발급] 키 분실 시 기존 도서/설정 100% 보존 상태로 새 API 키만 교체 발급
- * - 🛡️ [원자적 메타데이터 저장] .tmp 쓰기 후 renameSync 교체로 프로세스 강제 종료 시 JSON 깨짐 원천 방어
+ * - 🛡️ [원자적 메타데이터 저장 & 쓰기 스로틀링] .tmp 쓰기 후 renameSync 교체 + 인메모리 캐시/60초 Flush로 디스크 I/O 병목 완화
  */
 
 import fs from 'fs';
@@ -38,13 +38,24 @@ const DEFAULT_MAX_DEVICES = 6;
 // 🔢 6자리 기기 연결 OTP 유효 시간 (3분: 180,000ms)
 const OTP_TTL_MS = 3 * 60 * 1000;
 
+// ⚡ 단순 접속 시각(lastAccessedAt / lastSeen) 디스크 쓰기 스로틀링 주기 (60초)
+const TOUCH_FLUSH_INTERVAL_MS = 60 * 1000;
+
+/** @type {Array<ApiKeyRecord>|null} */
+let cachedApiKeysList = null;
+let cachedFileMtimeMs = 0;
+let isApiKeysDirty = false;
+let lastApiKeysDiskFlushAt = 0;
+
 /**
  * 🔒 6자리 일회용 연결 번호 인메모리 저장소
  * @type {Map<string, { code: string, folderName: string, apiKey: string, expiresAt: number }>}
  */
 const deviceOtpStore = new Map();
 
-// 1분마다 만료된 OTP 자동 청소
+/**
+ * 1분마다 만료된 OTP 청소 및 지연된 접속 이력 디스크 반영
+ */
 setInterval(() => {
   const now = Date.now();
   for (const [code, item] of deviceOtpStore.entries()) {
@@ -52,7 +63,13 @@ setInterval(() => {
       deviceOtpStore.delete(code);
     }
   }
+  flushDirtyApiKeys();
 }, 60 * 1000);
+
+// 프로세스 정상 종료 시 미반영 접속 이력 동기 저장
+process.on('exit', () => {
+  flushDirtyApiKeys(true);
+});
 
 /**
  * @typedef {Object} DeviceRecord
@@ -124,22 +141,66 @@ function writeJsonAtomic(filePath, data) {
   const jsonStr = JSON.stringify(data, null, 2);
   fs.writeFileSync(tempPath, jsonStr, 'utf-8');
   fs.renameSync(tempPath, filePath);
+
+  if (filePath === API_KEYS_FILE) {
+    cachedApiKeysList = Array.isArray(data) ? data : [];
+    isApiKeysDirty = false;
+    lastApiKeysDiskFlushAt = Date.now();
+    try {
+      cachedFileMtimeMs = fs.statSync(API_KEYS_FILE).mtimeMs;
+    } catch (e) {}
+  }
 }
 
 /**
- * JSON 파일 안전 읽기 헬퍼
+ * 스로틀링된 접속 이력(dirty 상태)을 조건 충족 시 디스크에 일괄 반영합니다.
+ * @param {boolean} [force=false] - 경과 시간 무시 강제 저장 여부
+ */
+function flushDirtyApiKeys(force = false) {
+  if (!isApiKeysDirty || !cachedApiKeysList) return;
+  const now = Date.now();
+  if (!force && (now - lastApiKeysDiskFlushAt) < TOUCH_FLUSH_INTERVAL_MS) {
+    return;
+  }
+
+  try {
+    writeJsonAtomic(API_KEYS_FILE, cachedApiKeysList);
+  } catch (err) {
+    console.warn('⚠️ [ApiKeyManager] 지연 접속 이력 디스크 저장 실패 (다음 주기에 재시도):', err.message);
+  }
+}
+
+/**
+ * JSON 파일 안전 읽기 헬퍼 (인메모리 캐시 우선, 외부 변경 시 자동 리로드)
  * @returns {Array<ApiKeyRecord>}
  */
 function readApiKeysData() {
-  if (!fs.existsSync(API_KEYS_FILE)) return [];
+  if (!fs.existsSync(API_KEYS_FILE)) {
+    cachedApiKeysList = [];
+    cachedFileMtimeMs = 0;
+    isApiKeysDirty = false;
+    return cachedApiKeysList;
+  }
+
   try {
+    const stat = fs.statSync(API_KEYS_FILE);
+    if (cachedApiKeysList !== null && (isApiKeysDirty || stat.mtimeMs === cachedFileMtimeMs)) {
+      return cachedApiKeysList;
+    }
+
     const content = fs.readFileSync(API_KEYS_FILE, 'utf-8');
-    if (!content || !content.trim()) return [];
-    const parsed = JSON.parse(content);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!content || !content.trim()) {
+      cachedApiKeysList = [];
+    } else {
+      const parsed = JSON.parse(content);
+      cachedApiKeysList = Array.isArray(parsed) ? parsed : [];
+    }
+    cachedFileMtimeMs = stat.mtimeMs;
+    isApiKeysDirty = false;
+    return cachedApiKeysList;
   } catch (err) {
     console.error('⚠️ [ApiKeyManager] api-keys.json 파싱 실패:', err.message);
-    return [];
+    return cachedApiKeysList || [];
   }
 }
 
@@ -266,6 +327,7 @@ export const apiKeyManager = {
 
     const user = list[index];
     const now = Date.now();
+    let mustFlushImmediately = false;
 
     if (user.status === 'REVOKED') {
       return { authenticated: false, reason: 'API_KEY_REVOKED' };
@@ -284,6 +346,7 @@ export const apiKeyManager = {
       user.status = 'ACTIVE';
       user.activatedAt = new Date(now).toISOString();
       user.expiresAt = null;
+      mustFlushImmediately = true;
       console.log(`✨ [ApiKeyManager:Activated] 사용자 서재 활성화 완료: 폴더='${user.folderName}'`);
     } else if (user.status === 'EXPIRED') {
       return { authenticated: false, reason: 'API_KEY_EXPIRED' };
@@ -291,7 +354,11 @@ export const apiKeyManager = {
 
     user.lastAccessedAt = new Date(now).toISOString();
     list[index] = user;
-    writeJsonAtomic(API_KEYS_FILE, list);
+    isApiKeysDirty = true;
+
+    if (mustFlushImmediately || (now - lastApiKeysDiskFlushAt) >= TOUCH_FLUSH_INTERVAL_MS) {
+      writeJsonAtomic(API_KEYS_FILE, list);
+    }
 
     const safeCheck = validateSafePath(USERS_DIR, user.folderName);
     if (!safeCheck.safe) {
@@ -325,7 +392,7 @@ export const apiKeyManager = {
     let attempts = 0;
 
     while (exists && attempts < 20) {
-      code = String(Math.floor(100000 + Math.random() * 900000));
+      code = String(crypto.randomInt(100000, 1000000));
       exists = deviceOtpStore.has(code);
       attempts++;
     }
@@ -456,25 +523,36 @@ export const apiKeyManager = {
     const user = list[index];
     user.devices = user.devices || {};
     const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
-    const now = new Date().toISOString();
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
 
     let device = user.devices[cleanDeviceId];
 
     // 1. 이미 정식 등록된 기기인 경우
     if (device) {
+      const isNameChanged = Boolean(cleanDeviceName && cleanDeviceName !== '웹 리더 기기' && device.deviceName !== cleanDeviceName);
+      const isIpChanged = device.lastIp !== cleanIp;
+
       if (device.status === 'blocked') {
         device.lastSeen = now;
         device.lastIp = cleanIp;
-        writeJsonAtomic(API_KEYS_FILE, list);
+        isApiKeysDirty = true;
+        if (isIpChanged || (nowMs - lastApiKeysDiskFlushAt) >= TOUCH_FLUSH_INTERVAL_MS) {
+          writeJsonAtomic(API_KEYS_FILE, list);
+        }
         return { allowed: false, reason: 'DEVICE_BLOCKED', device };
       }
 
       device.lastSeen = now;
       device.lastIp = cleanIp;
-      if (cleanDeviceName && cleanDeviceName !== '웹 리더 기기') {
+      if (isNameChanged) {
         device.deviceName = cleanDeviceName;
       }
-      writeJsonAtomic(API_KEYS_FILE, list);
+      isApiKeysDirty = true;
+
+      if (isNameChanged || isIpChanged || (nowMs - lastApiKeysDiskFlushAt) >= TOUCH_FLUSH_INTERVAL_MS) {
+        writeJsonAtomic(API_KEYS_FILE, list);
+      }
       return { allowed: true, device };
     }
 
