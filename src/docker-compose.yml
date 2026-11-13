@@ -1,0 +1,23 @@
+services:
+  refresh-server:
+    image: ghcr.io/ustaric/refresh-server:latest
+    # 직접 로컬 빌드해서 쓰려면 위 image 대신 아래 build를 활성화하세요.
+    # build: .
+    container_name: epub-refresh-server
+    restart: unless-stopped
+    # NAS 호스트 폴더와 권한을 맞춰야 할 경우 아래 user 주석을 해제해 UID:GID를 지정하세요.
+    # user: "1000:1000"
+    ports:
+      - "3001:3001"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3001
+      - TZ=Asia/Seoul
+      - STORAGE_MODE=true
+      # 운영 시 '*' 대신 실제 웹 뷰어 주소(예: https://내뷰어.vercel.app) 입력 권장
+      - ALLOWED_ORIGIN=*
+    volumes:
+      # 책, 사용자 API 키, 설정(.env), 구글 토큰, 감사 로그 영구 보존
+      - ./data:/app/data
+      # NAS 공유 도서 폴더가 있다면 아래 주석을 풀고 호스트 경로를 맞추세요 (관리자 페이지에서는 /books 선택)
+      # - /volume1/books:/books:ro
