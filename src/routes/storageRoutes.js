@@ -516,7 +516,9 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   // 11. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
   if (pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const rawEnd = pathname.replace('/api/storage/books/', '');
-    const bookId = decodeURIComponent(rawEnd);
+    const decodedEnd = decodeURIComponent(rawEnd);
+    const isBooksFolderOnlyCheck = decodedEnd.toLowerCase().endsWith('.json');
+    const bookId = decodedEnd.replace(/\.json$/i, '');
 
     if (rawEnd.endsWith('.webp')) {
       const coverFileName = decodeURIComponent(rawEnd);
@@ -562,7 +564,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
 
     if (req.method === 'GET') {
       const meta = storageService.getBookMetadata(bookId, targetUserFolder);
-      if (!meta) {
+      if (!meta || (isBooksFolderOnlyCheck && meta.isArchived === true)) {
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '도서 메타 조회 실패', target: bookId, status: 404, user: authenticatedUserMemo });
         sendJsonResponse(req, res, 404, { error: '도서를 찾을 수 없습니다.' });
         return true;
@@ -585,6 +587,21 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       sendJsonResponse(req, res, 200, { ok: true, deletedFiles: count });
       return true;
     }
+  }
+
+  // 11-B. 보관함(archive/) 도서 메타데이터 조회 (/api/storage/archive/:id)
+  if (req.method === 'GET' && pathname.startsWith('/api/storage/archive/')) {
+    const rawEnd = pathname.replace('/api/storage/archive/', '');
+    const bookId = decodeURIComponent(rawEnd).replace(/\.json$/i, '');
+    const meta = storageService.getBookMetadata(bookId, targetUserFolder);
+    if (!meta || meta.isArchived !== true) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '보관 도서 메타 조회 실패', target: bookId, status: 404, user: authenticatedUserMemo });
+      sendJsonResponse(req, res, 404, { error: '보관 도서를 찾을 수 없습니다.' });
+      return true;
+    }
+    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '보관 도서 메타 조회', target: `${meta.title || bookId} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
+    sendJsonResponse(req, res, 200, meta);
+    return true;
   }
 
   // 12. EPUB 도서 바이너리 업로드 및 다운로드 (/api/storage/books/:id/epub)
@@ -625,11 +642,29 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       }
     }
 
-    if (req.method === 'GET') {
+    if (req.method === 'GET' || req.method === 'HEAD') {
       const info = storageService.getBookEpubPath(bookId, targetUserFolder);
       if (!info) {
+        if (req.method === 'HEAD') {
+          setCorsHeaders(req, res);
+          res.writeHead(404);
+          res.end();
+          return true;
+        }
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'EPUB 다운로드 실패', target: bookId, status: 404, user: authenticatedUserMemo });
         sendJsonResponse(req, res, 404, { error: 'EPUB 파일을 찾을 수 없습니다.' });
+        return true;
+      }
+
+      setCorsHeaders(req, res);
+      res.writeHead(200, {
+        'Content-Type': 'application/epub+zip',
+        'Content-Length': info.size,
+        'Content-Disposition': `attachment; filename="${encodeURIComponent(bookId)}.epub"`
+      });
+
+      if (req.method === 'HEAD') {
+        res.end();
         return true;
       }
 
@@ -643,12 +678,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         user: authenticatedUserMemo
       });
 
-      setCorsHeaders(req, res);
-      res.writeHead(200, {
-        'Content-Type': 'application/epub+zip',
-        'Content-Length': info.size,
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(bookId)}.epub"`
-      });
       fs.createReadStream(info.filePath).pipe(res);
       return true;
     }
