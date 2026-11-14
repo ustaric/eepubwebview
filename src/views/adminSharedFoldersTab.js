@@ -2,18 +2,26 @@
  * @file src/views/adminSharedFoldersTab.js
  * @description 관리자 제어 센터 - 공유 서재 관리 탭 전담 뷰 컴포넌트
  * - 📁 다중 공유 서재 폴더 목록 렌더링 및 권한 상태 표시
- * - 📱 기기별 폴더 칩(Tag) 인터랙티브 토글 UI 제공
- * - 🌐 전체 기기 허용/지정 기기 전용 원클릭 권한 제어
- * - ⚡ [원클릭 즉시 등록] 블로킹 alert() 팝업을 제거하고 0초 만에 목록에 실시간 반영
- * - 🛡️ [이중 등록 방지] 비동기 저장 중 버튼 비활성화 락 탑재
+ * - 👥 apiKeyManager.getUserListForAdmin() 직통 연동으로 사용자 메모 및 기기 최근 접속(lastSeen) 100% 정확 표출
+ * - 📱 기기별 폴더 칩(Tag) 인터랙티브 토글 UI 및 HTML 이스케이프 방어 적용
+ * - 🌐 전체 기기 허용/지정 기기 전용 원클릭 권한 제어 및 이중 등록 방지 락 탑재
  */
 
 import fs from 'fs';
-import path from 'path';
 import { storageService } from '../storageService.js';
 import { apiKeyManager } from '../apiKeyManager.js';
 
 const SHARED_FOLDERS_CONFIG_FILE = './data/shared_folders.json';
+
+function escapeHtml(str = '') {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 /**
  * 📂 다중 공유 폴더 설정 안전 조회 헬퍼
@@ -41,40 +49,25 @@ export function getSharedFoldersConfig(env) {
 }
 
 /**
- * 👥 등록된 모든 사용자 및 기기 목록 3중 안전 조회 헬퍼
+ * 👥 등록된 모든 사용자 및 기기 목록 정밀 조회 헬퍼
  * @returns {Array<{ folderName: string, memo: string, devices: Array<any> }>}
  */
 export function resolveAllUsersAndDevices() {
-  let usersList = [];
-
-  // 1차: apiKeyManager 내장 메서드 체인 탐색
-  if (typeof apiKeyManager.getUsers === 'function') {
-    usersList = apiKeyManager.getUsers();
-  } else if (typeof apiKeyManager.getAllUsers === 'function') {
-    usersList = apiKeyManager.getAllUsers();
-  } else if (typeof apiKeyManager.listUsers === 'function') {
-    usersList = apiKeyManager.listUsers();
-  } else if (Array.isArray(apiKeyManager.users)) {
-    usersList = apiKeyManager.users;
-  }
-
-  // 2차: 디스크 ./data/api/keys.json 직접 안전 읽기 백업
-  if ((!usersList || usersList.length === 0) && fs.existsSync('./data/api/keys.json')) {
-    try {
-      const keysData = JSON.parse(fs.readFileSync('./data/api/keys.json', 'utf-8'));
-      usersList = Object.values(keysData || {});
-    } catch (e) {}
-  }
+  const usersList = typeof apiKeyManager.getUserListForAdmin === 'function'
+    ? apiKeyManager.getUserListForAdmin()
+    : [];
 
   const result = [];
   const processedFolders = new Set();
 
-  // 사용자별 기기 목록 취합
+  // 1차: apiKeyManager 공식 사용자 장부(api-keys.json) 기준 취합
   if (Array.isArray(usersList)) {
     usersList.forEach(u => {
       if (!u || !u.folderName) return;
       processedFolders.add(u.folderName);
-      const devices = typeof apiKeyManager.getUserDevices === 'function' ? apiKeyManager.getUserDevices(u.folderName) : [];
+      const devices = Array.isArray(u.devices)
+        ? u.devices
+        : (typeof apiKeyManager.getUserDevices === 'function' ? apiKeyManager.getUserDevices(u.folderName) : []);
       result.push({
         folderName: u.folderName,
         memo: u.memo || u.folderName,
@@ -83,7 +76,7 @@ export function resolveAllUsersAndDevices() {
     });
   }
 
-  // 3차: data/users 디렉터리 내 물리 폴더 직접 스캔 백업
+  // 2차: data/users 디렉터리 내 미등록 레거시 물리 폴더 보조 스캔
   if (fs.existsSync('./data/users')) {
     try {
       const dirs = fs.readdirSync('./data/users');
@@ -117,33 +110,36 @@ export function renderSharedFoldersTab(env) {
     const perm = storageService.testDirectoryPermissions(f.path);
     const badgeHtml = perm.readable
       ? '<span class="badge badge-success">정상 (읽기 가능)</span>'
-      : `<span class="badge badge-error" style="background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">접근 오류 (${perm.error || '권한 부족'})</span>`;
+      : `<span class="badge badge-error">접근 오류 (${escapeHtml(perm.error || '권한 부족')})</span>`;
 
-    const isGlobal = f.allowedDevices.includes('*');
+    const isGlobal = Array.isArray(f.allowedDevices) && f.allowedDevices.includes('*');
+    const safeId = escapeHtml(f.id);
+    const safeName = escapeHtml(f.name);
+    const safePath = escapeHtml(f.path);
 
     return `
       <div style="background: #0f172a; border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px;">
         <div style="flex: 1; min-width: 0;">
           <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 4px;">
-            <strong style="font-size: 14.5px; color: #38bdf8;">📁 ${f.name}</strong>
+            <strong style="font-size: 14.5px; color: #38bdf8;">📁 ${safeName}</strong>
             ${badgeHtml}
             <button type="button" class="folder-chip ${isGlobal ? 'active' : ''}" 
                     style="padding: 2px 10px; font-size: 11px;"
-                    onclick="toggleFolderGlobalAccess('${f.id}', this)"
+                    onclick="toggleFolderGlobalAccess('${safeId}', this)"
                     title="클릭하여 전체 기기 접근 허용/차단 토글">
               <span>${isGlobal ? '🌐 전체 허용 중' : '🔒 지정 기기만'}</span>
             </button>
           </div>
           <div style="font-size: 12px; color: var(--text-muted); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-            ${f.path}
+            ${safePath}
           </div>
         </div>
         <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
           <label class="switch" title="이 폴더 활성화/비활성화">
-            <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFolderEnabled('${f.id}', this.checked)">
+            <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFolderEnabled('${safeId}', this.checked)">
             <span class="slider"></span>
           </label>
-          <button type="button" class="btn-action btn-delete" style="padding: 6px 10px;" onclick="deleteSharedFolder('${f.id}')" title="폴더 삭제">삭제</button>
+          <button type="button" class="btn-action btn-delete" style="padding: 6px 10px;" onclick="deleteSharedFolder('${safeId}')" title="폴더 삭제">삭제</button>
         </div>
       </div>
     `;
@@ -169,20 +165,30 @@ export function renderSharedFoldersTab(env) {
   } else {
     deviceChipsSectionHtml = usersWithDevices.map(u => {
       const devices = u.devices || [];
+      const safeUserMemo = escapeHtml(u.memo);
+      const safeUserFolder = escapeHtml(u.folderName);
+
       const devicesHtml = devices.length === 0
         ? '<div style="font-size: 12px; color: var(--text-muted); padding: 6px 0;">(연결된 기기 대기 중 - 6자리 번호 로그인 시 자동 감지)</div>'
         : devices.map(d => {
+            const safeDevId = escapeHtml(d.deviceId);
+            const safeDevName = escapeHtml(d.deviceName || d.deviceId);
+            const seenAt = d.lastSeen || d.lastActiveAt || null;
+
             const chipsHtml = cfg.folders.map(f => {
-              const isAllowed = f.allowedDevices.includes('*') || f.allowedDevices.includes(d.deviceId);
+              const allowedList = Array.isArray(f.allowedDevices) ? f.allowedDevices : [];
+              const isAllowed = allowedList.includes('*') || allowedList.includes(d.deviceId);
               const chipClass = isAllowed ? 'folder-chip active' : 'folder-chip';
+              const safeFolderId = escapeHtml(f.id);
+              const safeFolderName = escapeHtml(f.name);
               return `
                 <button type="button" class="${chipClass}" 
-                        data-folder-id="${f.id}"
-                        data-device-id="${d.deviceId}"
-                        onclick="toggleDeviceFolderAccess('${f.id}', '${d.deviceId}', this)"
-                        title="클릭하여 '${d.deviceName || d.deviceId}' 기기에 '${f.name}' 접근 권한 토글">
+                        data-folder-id="${safeFolderId}"
+                        data-device-id="${safeDevId}"
+                        onclick="toggleDeviceFolderAccess('${safeFolderId}', '${safeDevId}', this)"
+                        title="클릭하여 '${safeDevName}' 기기에 '${safeFolderName}' 접근 권한 토글">
                   <span>${isAllowed ? '✔' : '+'}</span>
-                  <span>📁 ${f.name}</span>
+                  <span>📁 ${safeFolderName}</span>
                 </button>
               `;
             }).join('');
@@ -190,8 +196,8 @@ export function renderSharedFoldersTab(env) {
             return `
               <div style="background: #090d16; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 10px 12px; margin-top: 8px;">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-                  <span style="font-size: 13px; font-weight: 600; color: #f8fafc;">📱 ${d.deviceName || d.deviceId}</span>
-                  <span style="font-size: 11px; color: var(--text-muted);">최근: ${d.lastActiveAt ? new Date(d.lastActiveAt).toLocaleString('ko-KR') : '기록 없음'}</span>
+                  <span style="font-size: 13px; font-weight: 600; color: #f8fafc;">📱 ${safeDevName}</span>
+                  <span style="font-size: 11px; color: var(--text-muted);">최근: ${seenAt ? new Date(seenAt).toLocaleString('ko-KR') : '기록 없음'}</span>
                 </div>
                 <div style="display: flex; flex-wrap: wrap; gap: 6px;">
                   ${chipsHtml || '<span style="font-size: 11.5px; color: var(--text-muted);">부여할 수 있는 공유 폴더가 없습니다.</span>'}
@@ -203,8 +209,8 @@ export function renderSharedFoldersTab(env) {
       return `
         <div style="background: #0f172a; border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;">
           <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 8px;">
-            <strong style="font-size: 14px; color: #38bdf8;">👤 ${u.memo}</strong>
-            <span style="font-size: 12px; color: var(--text-muted); font-family: monospace;">(${u.folderName})</span>
+            <strong style="font-size: 14px; color: #38bdf8;">👤 ${safeUserMemo}</strong>
+            <span style="font-size: 12px; color: var(--text-muted); font-family: monospace;">(${safeUserFolder})</span>
           </div>
           ${devicesHtml}
         </div>
@@ -347,7 +353,6 @@ export function renderSharedFoldersTab(env) {
 
           var ok = await saveSharedFoldersConfig(cfg);
           if (ok) {
-            // 번거로운 확인 팝업 없이 즉시 리로드하여 목록에 0초 만에 반영
             window.location.reload();
           } else {
             alert('폴더 등록 요청이 실패했습니다.');
@@ -415,7 +420,7 @@ export function renderSharedFoldersTab(env) {
 
           if (folder.allowedDevices.includes('*')) {
             folder.allowedDevices = [];
-            var allChips = document.querySelectorAll('.folder-chip');
+            var allChips = document.querySelectorAll('.folder-chip[data-device-id]');
             for (var i = 0; i < allChips.length; i++) {
               var devId = allChips[i].getAttribute('data-device-id');
               if (devId && !folder.allowedDevices.includes(devId)) {

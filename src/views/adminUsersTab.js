@@ -1,15 +1,15 @@
 /**
  * @file src/views/adminUsersTab.js
  * @description 관리자 제어 센터 [탭 2: 👥 사용자 & API 저장소 관리] HTML 렌더러 모듈
+ * - 📚 [1-Click 도서·묘비 모달 직통 연결] 테이블의 도서 수 배지 클릭 및 상단 [📚 도서 관리] 버튼으로 도서/오류파일/묘비 모달 즉시 오픈
  * - 📱 [1-Click 기기 모달 직통 연결] 테이블의 '2/6대' 배지 클릭 즉시 해당 사용자의 등록 기기 관제 팝업 오픈
  * - 📱 [기기 관리 모달 탑재] #modal-user-devices 지원으로 사용자별 등록 기기 목록(기기명, IP, 최근 접속) 및 개별 차단/해제/삭제
- * - 📱 [기기 한도 실시간 조절] 기본 6대 기기 한도 인플레이스 변경 및 기기 수(N/M대) 실측 현황 표출
- * - 🎛️ [상단 일괄 액션 툴바] 새 발급, 기기 관리, 용량 변경, 키 재발급, 삭제를 상단 툴바로 일원화
- * - 🔘 [좌측 단일 선택 라디오] 행 내부 버튼 제거로 가로폭 140px 확보 ➔ 테이블 깨짐 원천 박멸
- * - 👥 [다중 사용자 관제 테이블] 서재 폴더명, 식별 메모, 상태(대기/활성), 기기 수, 저장 용량 실측 바
+ * - 🔄 [테이블 실시간 동기화] 기기·도서 모달 변경 사항을 뒤쪽 사용자 목록 테이블 배지에 즉시 반영
+ * - 🛡️ [XSS 및 속성 위임 안전] data-* 속성 클릭 위임과 HTML 이스케이프로 특수문자 기기명·메모 안전 처리
  */
 
 import { apiKeyManager } from '../apiKeyManager.js';
+import { renderUserLibraryModalAndScript } from './adminUserLibraryModal.js';
 
 function escapeHtml(str = '') {
   if (!str || typeof str !== 'string') return '';
@@ -80,13 +80,20 @@ export function renderUsersTab(env = {}) {
         devices: u.devices || []
       };
 
-      // 🌟 [핵심 개선] 클릭 시 기기 관리 모달이 즉시 열리는 인터랙티브 뱃지 (1-Click Fast-Pass)
-      let deviceBadge = `
-        <div class="device-click-pill" onclick="event.stopPropagation(); openUserDevicesModalDirectly('${safeFolder}')" 
+      const deviceBadge = `
+        <div class="device-click-pill" id="user-device-pill-${safeFolder}" onclick="event.stopPropagation(); openUserDevicesModalDirectly('${safeFolder}')" 
              title="클릭하여 '${safeMemo}' 사용자의 기기 목록 관리" 
              style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 6px; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); transition: all 0.2s;">
           <span style="font-size: 12px; font-weight: 700; color: #38bdf8;">📱 ${devCount}/${maxDev}대</span>
           ${blockedCount > 0 ? `<span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: #ef4444; color: white; font-weight: 700;">${blockedCount}차단</span>` : ''}
+        </div>
+      `;
+
+      const bookBadge = `
+        <div class="device-click-pill" id="user-book-pill-${safeFolder}" onclick="event.stopPropagation(); openUserLibraryModalDirectly('${safeFolder}')"
+             title="클릭하여 '${safeMemo}' 서재의 도서·오류파일·묘비 관리"
+             style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); transition: all 0.2s;">
+          <span style="font-size: 12px; font-weight: 700; color: #34d399;">📚 ${u.bookCount}권</span>
         </div>
       `;
 
@@ -110,7 +117,7 @@ export function renderUsersTab(env = {}) {
             ${deviceBadge}
           </td>
           <td style="text-align: center; font-size: 12.5px; white-space: nowrap;">
-            <strong>${u.bookCount}</strong> <span style="font-size: 11px; color: var(--text-muted);">권</span>
+            ${bookBadge}
           </td>
           <td style="min-width: 130px;">
             <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">
@@ -149,6 +156,9 @@ export function renderUsersTab(env = {}) {
           <button type="button" class="btn-action btn-download" style="padding: 6px 10px; font-size: 12px; border: none; cursor: pointer;" onclick="openCreateUserModal()">
             🎲 새 사용자 발급
           </button>
+          <button type="button" id="btn-toolbar-library" class="btn-action" style="background: #059669; color: white; padding: 6px 10px; font-size: 12px; border: none; cursor: not-allowed; opacity: 0.4;" onclick="triggerToolbarLibrary()" disabled>
+            📚 도서 관리
+          </button>
           <button type="button" id="btn-toolbar-devices" class="btn-action" style="background: #0d9488; color: white; padding: 6px 10px; font-size: 12px; border: none; cursor: not-allowed; opacity: 0.4;" onclick="triggerToolbarDevices()" disabled>
             📱 기기 관리
           </button>
@@ -173,7 +183,7 @@ export function renderUsersTab(env = {}) {
               <th>사용자 메모</th>
               <th style="text-align: center;">상태</th>
               <th style="text-align: center;">기기 수 (클릭 관리)</th>
-              <th style="text-align: center;">도서 수</th>
+              <th style="text-align: center;">도서 수 (클릭 관리)</th>
               <th>저장 용량</th>
               <th style="text-align: right;">최근 접속</th>
             </tr>
@@ -321,7 +331,7 @@ export function renderUsersTab(env = {}) {
             </div>
             <div style="display: flex; align-items: center; gap: 8px;">
               <span id="devices-count-pill" style="font-size: 12px; font-weight: 700; color: #2dd4bf;"></span>
-              <button type="button" class="btn-action" style="background: #334155; color: #f8fafc; padding: 3px 8px; font-size: 11px;" onclick="promptChangeMaxDevices()">
+              <button type="button" class="btn-action" style="background: #334155; color: #f8fafc; padding: 3px 8px; font-size: 11px; border: none; cursor: pointer;" onclick="promptChangeMaxDevices()">
                 ⚙️ 한도 변경
               </button>
             </div>
@@ -336,10 +346,50 @@ export function renderUsersTab(env = {}) {
       </div>
     </div>
 
+    ${renderUserLibraryModalAndScript()}
+
     <script>
       let activeSelectedUser = null;
 
-      // 🌟 [1-Click Fast-Pass] 2/6대 배지 클릭 시 즉시 모달 오픈
+      function escUserHtml(str) {
+        return String(str == null ? '' : str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      window.updateAdminUserRowBookCount = function(folderName, summary) {
+        if (!folderName || !summary) return;
+        const map = window.__USER_DEVICES_MAP__ || {};
+        if (map[folderName]) {
+          map[folderName].bookCount = summary.totalBooks || 0;
+        }
+        const pill = document.getElementById('user-book-pill-' + folderName);
+        if (pill) {
+          pill.innerHTML = '<span style="font-size: 12px; font-weight: 700; color: #34d399;">📚 ' + (summary.totalBooks || 0) + '권</span>';
+        }
+      };
+
+      function syncAdminUserRowDeviceBadge(userObj) {
+        if (!userObj || !userObj.folderName) return;
+        const pill = document.getElementById('user-device-pill-' + userObj.folderName);
+        if (!pill) return;
+        const devList = userObj.devices || [];
+        const maxDev = userObj.maxDevices || 6;
+        const blockedCnt = devList.filter(function(d) { return d.status === 'blocked'; }).length;
+        pill.innerHTML = '<span style="font-size: 12px; font-weight: 700; color: #38bdf8;">📱 ' + devList.length + '/' + maxDev + '대</span>' +
+          (blockedCnt > 0 ? '<span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: #ef4444; color: white; font-weight: 700;">' + blockedCnt + '차단</span>' : '');
+      }
+
+      // 🌟 [1-Click Fast-Pass] 도서 수 배지 클릭 시 즉시 서재 모달 오픈
+      function openUserLibraryModalDirectly(folderName) {
+        selectUserRadio(folderName);
+        triggerToolbarLibrary();
+      }
+
+      // 🌟 [1-Click Fast-Pass] 2/6대 배지 클릭 시 즉시 기기 모달 오픈
       function openUserDevicesModalDirectly(folderName) {
         selectUserRadio(folderName);
         triggerToolbarDevices();
@@ -367,9 +417,9 @@ export function renderUsersTab(env = {}) {
         if (activeRow) activeRow.style.background = 'rgba(56, 189, 248, 0.08)';
 
         document.getElementById('toolbar-selected-label').innerHTML = 
-          '<span style="color:#38bdf8;">' + userData.memo + '</span> (' + folderName + ')';
+          '<span style="color:#38bdf8;">' + escUserHtml(userData.memo) + '</span> (' + escUserHtml(folderName) + ')';
 
-        ['btn-toolbar-devices', 'btn-toolbar-quota', 'btn-toolbar-reissue', 'btn-toolbar-delete'].forEach(function(btnId) {
+        ['btn-toolbar-library', 'btn-toolbar-devices', 'btn-toolbar-quota', 'btn-toolbar-reissue', 'btn-toolbar-delete'].forEach(function(btnId) {
           const btn = document.getElementById(btnId);
           if (btn) {
             btn.disabled = false;
@@ -377,6 +427,13 @@ export function renderUsersTab(env = {}) {
             btn.style.opacity = '1';
           }
         });
+      }
+
+      function triggerToolbarLibrary() {
+        if (!activeSelectedUser) return;
+        if (typeof window.openUserLibraryModal === 'function') {
+          window.openUserLibraryModal(activeSelectedUser.folderName, activeSelectedUser.memo);
+        }
       }
 
       function triggerToolbarQuota() {
@@ -430,23 +487,24 @@ export function renderUsersTab(env = {}) {
             ? '<span class="status-pill status-403">⛔ 차단됨</span>' 
             : '<span class="status-pill status-200">🟢 정상</span>';
 
+          const safeDevId = escUserHtml(d.deviceId);
           const toggleActionBtn = isBlocked
-            ? '<button type="button" class="btn-action btn-download" style="background:#10b981;" onclick="toggleDeviceBlock(\\'' + d.deviceId + '\\', false)">해제</button>'
-            : '<button type="button" class="btn-action btn-delete" onclick="toggleDeviceBlock(\\'' + d.deviceId + '\\', true)">차단</button>';
+            ? '<button type="button" class="btn-action btn-download" style="background:#10b981;border:none;cursor:pointer;" data-dev-action="unblock" data-dev-id="' + safeDevId + '">해제</button>'
+            : '<button type="button" class="btn-action btn-delete" data-dev-action="block" data-dev-id="' + safeDevId + '">차단</button>';
 
           const lastSeenDate = d.lastSeen ? new Date(d.lastSeen).toLocaleDateString('ko-KR', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }) : '-';
 
-          rowsHtml += '<tr id="row-device-' + d.deviceId + '">' +
+          rowsHtml += '<tr id="row-device-' + safeDevId + '">' +
             '<td style="font-weight:600; font-size:12.5px; color:#f8fafc; white-space:nowrap;">' +
-              (d.deviceName || '알 수 없는 기기') +
-              '<div style="font-size:10px; color:var(--text-muted); font-family:monospace;">' + d.deviceId.substring(0, 16) + '...</div>' +
+              escUserHtml(d.deviceName || '알 수 없는 기기') +
+              '<div style="font-size:10px; color:var(--text-muted); font-family:monospace;">' + escUserHtml((d.deviceId || '').substring(0, 16)) + '...</div>' +
             '</td>' +
-            '<td style="font-family:monospace; font-size:11.5px; color:#a78bfa; white-space:nowrap;">' + (d.lastIp || '-') + '</td>' +
-            '<td style="font-size:11.5px; color:var(--text-muted); white-space:nowrap;">' + lastSeenDate + '</td>' +
+            '<td style="font-family:monospace; font-size:11.5px; color:#a78bfa; white-space:nowrap;">' + escUserHtml(d.lastIp || '-') + '</td>' +
+            '<td style="font-size:11.5px; color:var(--text-muted); white-space:nowrap;">' + escUserHtml(lastSeenDate) + '</td>' +
             '<td style="text-align:center; white-space:nowrap;">' + statusBadge + '</td>' +
             '<td style="text-align:right; white-space:nowrap;">' +
               toggleActionBtn +
-              '<button type="button" class="btn-action" style="background:#334155; color:#f87171; margin-left:4px;" onclick="deleteDeviceItem(\\'' + d.deviceId + '\\')">🗑️</button>' +
+              '<button type="button" class="btn-action" style="background:#334155; color:#f87171; border:none; cursor:pointer; margin-left:4px;" data-dev-action="delete" data-dev-id="' + safeDevId + '">🗑️</button>' +
             '</td>' +
           '</tr>';
         }
@@ -464,6 +522,18 @@ export function renderUsersTab(env = {}) {
           '<tbody>' + rowsHtml + '</tbody>' +
         '</table>';
       }
+
+      document.addEventListener('click', function(e) {
+        const devBtn = e.target.closest('[data-dev-action]');
+        if (!devBtn) return;
+        const action = devBtn.getAttribute('data-dev-action');
+        const deviceId = devBtn.getAttribute('data-dev-id');
+        if (!deviceId) return;
+
+        if (action === 'block') toggleDeviceBlock(deviceId, true);
+        else if (action === 'unblock') toggleDeviceBlock(deviceId, false);
+        else if (action === 'delete') deleteDeviceItem(deviceId);
+      });
 
       async function toggleDeviceBlock(deviceId, shouldBlock) {
         if (!activeSelectedUser) return;
@@ -486,6 +556,7 @@ export function renderUsersTab(env = {}) {
           const d = activeSelectedUser.devices.find(function(item) { return item.deviceId === deviceId; });
           if (d) d.status = shouldBlock ? 'blocked' : 'active';
           renderDevicesTableInModal();
+          syncAdminUserRowDeviceBadge(activeSelectedUser);
         } catch (err) {
           alert('기기 상태 변경 실패: ' + err.message);
         }
@@ -511,6 +582,7 @@ export function renderUsersTab(env = {}) {
           if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
           activeSelectedUser.devices = activeSelectedUser.devices.filter(function(item) { return item.deviceId !== deviceId; });
           renderDevicesTableInModal();
+          syncAdminUserRowDeviceBadge(activeSelectedUser);
         } catch (err) {
           alert('기기 삭제 실패: ' + err.message);
         }
@@ -544,6 +616,7 @@ export function renderUsersTab(env = {}) {
           if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
           activeSelectedUser.maxDevices = newLimit;
           renderDevicesTableInModal();
+          syncAdminUserRowDeviceBadge(activeSelectedUser);
           alert('✔ 최대 기기 한도가 ' + newLimit + '대로 변경되었습니다.');
         } catch (err) {
           alert('한도 변경 실패: ' + err.message);

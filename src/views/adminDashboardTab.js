@@ -80,11 +80,11 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">${l.timestamp}</td>
-          <td style="font-family: monospace; font-size: 11.5px; color: #a78bfa; white-space: nowrap;">${l.ip}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">${escapeHtml(l.timestamp)}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: #a78bfa; white-space: nowrap;">${escapeHtml(l.ip)}</td>
           <td style="white-space: nowrap;">${userBadge}</td>
-          <td style="font-size: 11.5px; color: #e2e8f0; white-space: nowrap;">${l.device}</td>
-          <td style="font-size: 12px; font-weight: 600; white-space: nowrap;">${l.action}</td>
+          <td style="font-size: 11.5px; color: #e2e8f0; white-space: nowrap;">${escapeHtml(l.device)}</td>
+          <td style="font-size: 12px; font-weight: 600; white-space: nowrap;">${escapeHtml(l.action)}</td>
           <td style="font-size: 11.5px; color: var(--text-muted); max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(l.target)}">${escapeHtml(l.target)}</td>
           <td style="text-align: right; white-space: nowrap;">${statusBadge}</td>
         </tr>
@@ -126,23 +126,24 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
   } else {
     const fileRows = logFiles.map(f => {
       const encodedRelPath = encodeURIComponent(f.relativePath);
+      const safeDate = escapeHtml(f.date);
       return `
         <tr>
           <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8; white-space: nowrap;">
-            📅 ${f.date}
+            📅 ${safeDate}
           </td>
           <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">
-            ${f.relativePath}
+            ${escapeHtml(f.relativePath)}
           </td>
           <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
               ${f.linesCount}건 기록
             </span>
           </td>
-          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${f.sizeKb}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${escapeHtml(f.sizeKb)}</td>
           <td style="text-align: right; white-space: nowrap;">
             <a href="/admin/logs/download?file=${encodedRelPath}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
-            <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" onclick="return confirm('${f.date} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
+            <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" onclick="return confirm('${safeDate} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
           </td>
         </tr>
       `;
@@ -187,14 +188,14 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8; white-space: nowrap;">${r.fileName}</td>
-          <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">${dateStr}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8; white-space: nowrap;">${escapeHtml(r.fileName)}</td>
+          <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">${escapeHtml(dateStr)}</td>
           <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
               ${r.totalAnomalies}건
             </span>
           </td>
-          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${r.sizeKb}</td>
+          <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${escapeHtml(r.sizeKb)}</td>
           <td style="text-align: right; white-space: nowrap;">
             <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
             <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
@@ -324,7 +325,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
           <div style="display: flex; align-items: center; justify-content: space-between;">
             <span style="font-size: 12.5px; font-weight: 600;">요청 폭주 제한 (Rate Limit)</span>
             <span class="badge ${count429 > 0 ? 'badge-warning' : 'badge-info'}" style="font-size: 10.5px;">
-              ${count429 > 0 ? `${count429}건 초과 락` : '120회 / 분'}
+              ${count429 > 0 ? `${count429}건 초과 락` : '600회 / 분'}
             </span>
           </div>
           <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 4px;">IP 기반 비정상 트래픽 방어</div>
@@ -456,7 +457,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
     <script>
       (function() {
-        // 실시간 10초 자원 갱신 루프 (디스코드 구형 이벤트 바인딩은 완전히 제거됨)
         async function fetchSystemStats() {
           try {
             const res = await fetch('/api/admin/system-stats');

@@ -1,6 +1,7 @@
 /**
  * @file src/adminController.js
  * @description 관리자 웹 제어 센터 라우터, 쿠키 인증, 브루트포스 락, 다중 사용자 API 관리 및 설정 저장 전담 컨트롤러
+ * - 📚 [서재 도서/묘비 관리 라우트 위임] /admin/users/library* 및 /admin/users/tombstones* 요청을 adminLibraryRoutes로 직통 위임
  * - 📱 [기기 관리 라우트 탑재] /admin/users/devices/block, unblock, delete 지원으로 특정 기기 핀포인트 밴 및 슬롯 반환
  * - 📱 [기기 한도 변경 라우트] POST /admin/users/update-max-devices 지원으로 계정별 최대 허용 기기 수(기본 6대) 조절
  * - ⚙️ [용량 변경 라우트 탑재] POST /admin/users/update-quota 지원으로 사용자별 도서 할당 용량 실시간 갱신
@@ -23,6 +24,7 @@ import { storageService } from './storageService.js';
 import { auditLogger } from './auditLogger.js';
 import { validateSafePath } from './securityGuard.js';
 import { apiKeyManager } from './apiKeyManager.js';
+import { handleAdminLibraryRoute } from './routes/adminLibraryRoutes.js';
 
 // 🌟 분리된 순수 View 렌더러 import
 import { renderLoginPageHtml, renderAdminSettingsHtml } from './adminViews.js';
@@ -242,8 +244,15 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
   }
 
   // =========================================================================
-  // 👥 4. 다중 사용자 API 키 & 기기 관리 라우트
+  // 👥 4. 다중 사용자 API 키, 서재 도서/묘비 & 기기 관리 라우트
   // =========================================================================
+
+  // 0) [사용자 서재 도서·오류파일·묘비 관리 AJAX 위임]
+  if (await handleAdminLibraryRoute(req, res, pathname, clientIp, userAgent, {
+    isAdminAuthenticated: isAuthenticated(req)
+  })) {
+    return true;
+  }
 
   // 1) [새 사용자 키 발급] POST /admin/users/create
   if (req.method === 'POST' && pathname === '/admin/users/create') {
