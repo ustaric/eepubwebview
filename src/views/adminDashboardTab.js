@@ -66,7 +66,8 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
   } else {
     const logRows = recentLogs.map((l) => {
       let statusBadge = '<span class="status-pill status-200">200 OK</span>';
-      if (l.status === 403) statusBadge = '<span class="status-pill status-403">403 차단</span>';
+      if (l.status === 401) statusBadge = '<span class="status-pill status-403">401 미인증</span>';
+      else if (l.status === 403) statusBadge = '<span class="status-pill status-403">403 차단</span>';
       else if (l.status === 405) statusBadge = '<span class="status-pill status-403">405 불가</span>';
       else if (l.status === 429) statusBadge = '<span class="status-pill status-429">429 락</span>';
       else if (l.status === 404) statusBadge = '<span class="status-pill status-404">404 없음</span>';
@@ -487,9 +488,23 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
     <script>
       (function() {
+        var statsIntervalId = null;
+
         async function fetchSystemStats() {
           try {
             const res = await fetch('/api/admin/system-stats');
+            if (res.status === 401) {
+              if (statsIntervalId !== null) {
+                clearInterval(statsIntervalId);
+                statsIntervalId = null;
+              }
+              const timeEl = document.getElementById('gauge-sync-time');
+              if (timeEl) {
+                timeEl.textContent = '🔒 세션 만료 - 새로고침 후 재인증 필요';
+                timeEl.style.color = '#f87171';
+              }
+              return;
+            }
             if (!res.ok) return;
             const data = await res.json();
             if (!data.ok || !data.stats) return;
@@ -522,7 +537,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
           } catch (e) {}
         }
 
-        setInterval(fetchSystemStats, 10000);
+        statsIntervalId = setInterval(fetchSystemStats, 10000);
 
         window.closeJsonPreviewModal = function() {
           var modal = document.getElementById('modal-json-preview');
