@@ -1,6 +1,7 @@
 /**
  * @file src/auditLogger.js
  * @description 개인 서버 활동 링 버퍼(RAM) 및 다중 사용자 저장소 실측 집계 엔진
+ * - 🇰🇷 [한국 표준시(KST) 통일] Asia/Seoul 기준 타임스탬프·일자 및 일별 로그 디렉터리 생성 보장
  * - 👥 [활동 로그 사용자 표출] recordAccessLog에 user(메모/폴더명) 필드 탑재로 대시보드 사용자별 활동 추적
  * - 👥 [다중 사용자 실측 집계] data/users 하위 모든 서재의 도서 권수 및 실측 용량 60초 캐싱 집계
  * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
@@ -35,10 +36,52 @@ const USERS_DIR = path.resolve(ROOT_DIR, 'data/users');
 const MAX_LOGS_LIMIT = 30;
 
 /**
+ * 🇰🇷 주어진 시각을 한국 표준시(Asia/Seoul) 기준 연/월/일/시분초 문자열로 변환합니다.
+ * @param {Date|number} [input=new Date()]
+ * @returns {{ year: string, month: string, day: string, dateStr: string, timeStr: string, fullTime: string }}
+ */
+function getKstDateParts(input = new Date()) {
+  const dateObj = input instanceof Date ? input : new Date(input);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(dateObj);
+
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+
+  const year = map.year;
+  const month = map.month;
+  const day = map.day;
+  const hour = map.hour === '24' ? '00' : map.hour;
+  const minute = map.minute;
+  const second = map.second;
+  const dateStr = `${year}-${month}-${day}`;
+  const timeStr = `${hour}:${minute}:${second}`;
+
+  return {
+    year,
+    month,
+    day,
+    dateStr,
+    timeStr,
+    fullTime: `${dateStr} ${timeStr}`
+  };
+}
+
+/**
  * @typedef {Object} AccessLogEntry
  * @property {string} id - 고유 로그 ID
- * @property {string} timestamp - 발생 시각 (HH:mm:ss)
- * @property {string} date - 발생 일자 (YYYY-MM-DD)
+ * @property {string} timestamp - 발생 시각 (HH:mm:ss, KST)
+ * @property {string} date - 발생 일자 (YYYY-MM-DD, KST)
  * @property {string} ip - 접속 IP
  * @property {string} device - 정규화된 기기/브라우저 명칭
  * @property {string} user - 사용자 식별 메모 또는 폴더명 (예: "홍길동 (user_dde4bc6a)")
@@ -49,9 +92,9 @@ const MAX_LOGS_LIMIT = 30;
 
 /**
  * @typedef {Object} ApiKeyUsageInfo
- * @property {string} timestamp - 접근 시각 (HH:mm:ss)
- * @property {string} date - 접근 일자 (YYYY-MM-DD)
- * @property {string} fullTime - 전체 일시 (YYYY-MM-DD HH:mm:ss)
+ * @property {string} timestamp - 접근 시각 (HH:mm:ss, KST)
+ * @property {string} date - 접근 일자 (YYYY-MM-DD, KST)
+ * @property {string} fullTime - 전체 일시 (YYYY-MM-DD HH:mm:ss, KST)
  * @property {string} ip - 접속 IP
  * @property {string} device - 정규화된 안전 기기 명칭
  * @property {string} path - 접근한 스토리지 엔드포인트
@@ -148,17 +191,14 @@ function countFilesWithExt(dirPath, ext) {
 }
 
 /**
- * 📁 [디스크 실시간 쓰기 헬퍼] 년/월/일 계층형 폴더 자동 생성 및 1줄 안전 추가
+ * 📁 [디스크 실시간 쓰기 헬퍼] KST 년/월/일 계층형 폴더 자동 생성 및 1줄 안전 추가
  * @param {AccessLogEntry} entry 
  */
 function appendLogToDailyFile(entry) {
   try {
-    const now = new Date();
-    const year = now.getFullYear().toString();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
+    const { year, month, day } = getKstDateParts();
 
-    // ./data/logs/YYYY/MM/DD/ 경로 구성
+    // ./data/logs/YYYY/MM/DD/ 경로 구성 (KST 기준)
     const targetDir = path.join(LOGS_DIR, year, month, day);
     if (!fs.existsSync(targetDir)) {
       fs.mkdirSync(targetDir, { recursive: true, mode: 0o755 });
@@ -177,7 +217,7 @@ function appendLogToDailyFile(entry) {
 
 export const auditLogger = {
   /**
-   * 🔑 [스토리지 API 키 사용 기록] 유효한 API 키로 인증에 성공한 요청 정보 실시간 기록
+   * 🔑 [스토리지 API 키 사용 기록] 유효한 API 키로 인증에 성공한 요청 정보 실시간 기록 (KST)
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
@@ -186,14 +226,12 @@ export const auditLogger = {
    * @param {string} [params.userMemo=""] - 사용자 식별 메모/이름
    */
   recordApiKeyUsage({ ip, userAgent = "", path = "", method = "GET", userMemo = "" }) {
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0]; // HH:mm:ss
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const { timeStr, dateStr, fullTime } = getKstDateParts();
 
     lastApiKeyUsage = {
       timestamp: timeStr,
       date: dateStr,
-      fullTime: `${dateStr} ${timeStr}`,
+      fullTime,
       ip: ip || '127.0.0.1',
       device: parseDeviceLabel(userAgent),
       path: path || '/api/storage/...',
@@ -211,7 +249,7 @@ export const auditLogger = {
   },
 
   /**
-   * 새로운 서버 접근 및 동기화 활동 1건을 기록 (사용자 서재 식별자 user 지원)
+   * 새로운 서버 접근 및 동기화 활동 1건을 기록 (한국 표준시 KST 기준)
    * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)
    * - 디스크: status >= 400만 선별 영구 저장
    * - 디스코드: DISCORD_ALERT_TYPES 설정에 부합하는 이벤트 실시간 발송 (1KB 분기 탑재)
@@ -224,9 +262,7 @@ export const auditLogger = {
    * @param {string} [params.user="-"] - 사용자 메모 또는 폴더명 (예: "홍길동 (user_dde4bc6a)")
    */
   recordAccessLog({ ip, userAgent = "", action, target = "-", status = 200, user = "-" }) {
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0]; // HH:mm:ss
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const { timeStr, dateStr } = getKstDateParts();
 
     // 🛡️ [로그 소독] 민감정보 실시간 마스킹
     const sanitizedAction = maskSensitiveLog(action || '요청');
@@ -393,7 +429,7 @@ export const auditLogger = {
   },
 
   /**
-   * 💾 서버 저장소 실시간 현황 집계 (다중 사용자 폴더 data/users 합산 실측, 60초 캐싱 지원)
+   * 💾 서버 저장소 실시간 현황 집계 (다중 사용자 폴더 data/users 합산 실측, 60초 캐싱 및 KST 시각 지원)
    * @param {boolean} [forceRefresh=false]
    */
   getStorageMetrics(forceRefresh = false) {
@@ -435,7 +471,7 @@ export const auditLogger = {
       crashReportsCount: crashReports,
       totalDataSizeMb: `${sizeMb} MB`,
       totalDataSizeBytes: totalBytes,
-      lastCalculatedAt: new Date(now).toTimeString().split(' ')[0]
+      lastCalculatedAt: getKstDateParts(now).timeStr
     };
     lastMetricsCalculatedAt = now;
 

@@ -10,7 +10,7 @@
  * - 🚦 [관리자 통합 라우트 디스패처] handleAdminRoute 제공으로 server.js와 직통 위임 유지
  * - 📁 [간이 파일 탐색기 API 탑재] GET /admin/fs-tree 제공으로 서버 디렉터리 브라우징 지원
  * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 프로세스 읽기 권한 즉시 검증
- * - 📥 [보안 감사 로그 다운로드/삭제] securityGuard 연동 실시간 로그 다운로드 및 영구 파쇄 지원
+ * - 📥 [보안 감사 로그 & 리포트 바로보기/다운로드] ?preview=1 인라인 JSON 열람 및 다운로드/삭제 지원
  * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 캡슐화
  * - 🔔 [디스코드 환경변수 무손실 보존] 전체 설정 저장 시 DISCORD_ALERT_TYPES, DISCORD_DAILY_DIGEST 보존
  */
@@ -715,15 +715,22 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 7. 일자별 보안 감사 로그 다운로드 (GET /admin/logs/download)
+  // 7. 일자별 보안 감사 로그 바로 보기(?preview=1) 및 다운로드 (GET /admin/logs/download)
   if (req.method === 'GET' && pathname === '/admin/logs/download') {
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const isPreview = reqUrl.searchParams.get('preview') === '1';
+
     if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
+      if (isPreview) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
       return true;
     }
 
-    const reqUrl = new URL(req.url, 'http://localhost');
     const relFile = reqUrl.searchParams.get('file');
 
     if (!relFile) {
@@ -743,6 +750,12 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     if (!formattedJson) {
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: '로그 파일 없음' }));
+      return true;
+    }
+
+    if (isPreview) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(formattedJson);
       return true;
     }
 
@@ -781,11 +794,19 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     return true;
   }
 
-  // 9. 크래시 리포트 다운로드
+  // 9. 크래시 리포트 바로 보기(?preview=1) 및 다운로드
   if (req.method === 'GET' && pathname.startsWith('/admin/crash-reports/download/')) {
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const isPreview = reqUrl.searchParams.get('preview') === '1';
+
     if (!isAuthenticated(req)) {
-      res.writeHead(302, { Location: '/admin' });
-      res.end();
+      if (isPreview) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+      } else {
+        res.writeHead(302, { Location: '/admin' });
+        res.end();
+      }
       return true;
     }
 
@@ -794,6 +815,16 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     if (!info) {
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: '리포트 파일 없음' }));
+      return true;
+    }
+
+    if (isPreview) {
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': info.size
+      });
+      const readStream = fs.createReadStream(info.filePath);
+      readStream.pipe(res);
       return true;
     }
 

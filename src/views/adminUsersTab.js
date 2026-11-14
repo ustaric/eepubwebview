@@ -1,6 +1,7 @@
 /**
  * @file src/views/adminUsersTab.js
  * @description 관리자 제어 센터 [탭 2: 👥 사용자 & API 저장소 관리] HTML 렌더러 모듈
+ * - 🇰🇷 [한국 표준시(KST) 통일] 사용자 최근 접속 및 기기 최근 접속 시각을 Asia/Seoul 기준으로 정확히 표출
  * - 📚 [1-Click 도서·묘비 모달 직통 연결] 테이블의 도서 수 배지 클릭 및 상단 [📚 도서 관리] 버튼으로 도서/오류파일/묘비 모달 즉시 오픈
  * - 📱 [1-Click 기기 모달 직통 연결] 테이블의 '2/6대' 배지 클릭 즉시 해당 사용자의 등록 기기 관제 팝업 오픈
  * - 📱 [기기 관리 모달 탑재] #modal-user-devices 지원으로 사용자별 등록 기기 목록(기기명, IP, 최근 접속) 및 개별 차단/해제/삭제
@@ -97,6 +98,17 @@ export function renderUsersTab(env = {}) {
         </div>
       `;
 
+      const lastAccessedText = u.lastAccessedAt
+        ? new Date(u.lastAccessedAt).toLocaleString('ko-KR', {
+            timeZone: 'Asia/Seoul',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+          })
+        : '미접속';
+
       return `
         <tr id="row-user-${safeFolder}" style="cursor: pointer;" onclick="selectUserRadio('${safeFolder}')">
           <td style="text-align: center; width: 36px;" onclick="event.stopPropagation();">
@@ -129,7 +141,7 @@ export function renderUsersTab(env = {}) {
             </div>
           </td>
           <td style="font-size: 11px; color: var(--text-muted); white-space: nowrap; text-align: right;">
-            ${u.lastAccessedAt ? new Date(u.lastAccessedAt).toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '미접속'}
+            ${escapeHtml(lastAccessedText)}
           </td>
         </tr>
       `;
@@ -185,7 +197,7 @@ export function renderUsersTab(env = {}) {
               <th style="text-align: center;">기기 수 (클릭 관리)</th>
               <th style="text-align: center;">도서 수 (클릭 관리)</th>
               <th>저장 용량</th>
-              <th style="text-align: right;">최근 접속</th>
+              <th style="text-align: right;">최근 접속 (KST)</th>
             </tr>
           </thead>
           <tbody>
@@ -383,13 +395,11 @@ export function renderUsersTab(env = {}) {
           (blockedCnt > 0 ? '<span style="font-size: 10px; padding: 1px 4px; border-radius: 4px; background: #ef4444; color: white; font-weight: 700;">' + blockedCnt + '차단</span>' : '');
       }
 
-      // 🌟 [1-Click Fast-Pass] 도서 수 배지 클릭 시 즉시 서재 모달 오픈
       function openUserLibraryModalDirectly(folderName) {
         selectUserRadio(folderName);
         triggerToolbarLibrary();
       }
 
-      // 🌟 [1-Click Fast-Pass] 2/6대 배지 클릭 시 즉시 기기 모달 오픈
       function openUserDevicesModalDirectly(folderName) {
         selectUserRadio(folderName);
         triggerToolbarDevices();
@@ -492,7 +502,16 @@ export function renderUsersTab(env = {}) {
             ? '<button type="button" class="btn-action btn-download" style="background:#10b981;border:none;cursor:pointer;" data-dev-action="unblock" data-dev-id="' + safeDevId + '">해제</button>'
             : '<button type="button" class="btn-action btn-delete" data-dev-action="block" data-dev-id="' + safeDevId + '">차단</button>';
 
-          const lastSeenDate = d.lastSeen ? new Date(d.lastSeen).toLocaleDateString('ko-KR', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }) : '-';
+          const lastSeenDate = d.lastSeen
+            ? new Date(d.lastSeen).toLocaleString('ko-KR', {
+                timeZone: 'Asia/Seoul',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+              })
+            : '-';
 
           rowsHtml += '<tr id="row-device-' + safeDevId + '">' +
             '<td style="font-weight:600; font-size:12.5px; color:#f8fafc; white-space:nowrap;">' +
@@ -514,7 +533,7 @@ export function renderUsersTab(env = {}) {
             '<tr>' +
               '<th>기기명 / 식별자</th>' +
               '<th>접속 IP</th>' +
-              '<th>최근 접속</th>' +
+              '<th>최근 접속 (KST)</th>' +
               '<th style="text-align:center;">상태</th>' +
               '<th style="text-align:right;">제어</th>' +
             '</tr>' +

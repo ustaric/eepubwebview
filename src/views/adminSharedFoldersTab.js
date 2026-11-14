@@ -2,7 +2,7 @@
  * @file src/views/adminSharedFoldersTab.js
  * @description 관리자 제어 센터 - 공유 서재 관리 탭 전담 뷰 컴포넌트
  * - 📁 다중 공유 서재 폴더 목록 렌더링 및 권한 상태 표시
- * - 👥 apiKeyManager.getUserListForAdmin() 직통 연동으로 사용자 메모 및 기기 최근 접속(lastSeen) 100% 정확 표출
+ * - 👥 apiKeyManager.getUserListForAdmin() 직통 연동 및 기기별 사용자 메모 배지·KST 최근 접속 표출
  * - 📱 기기별 폴더 칩(Tag) 인터랙티브 토글 UI 및 HTML 이스케이프 방어 적용
  * - 🌐 전체 기기 허용/지정 기기 전용 원클릭 권한 제어 및 이중 등록 방지 락 탑재
  */
@@ -174,6 +174,9 @@ export function renderSharedFoldersTab(env) {
             const safeDevId = escapeHtml(d.deviceId);
             const safeDevName = escapeHtml(d.deviceName || d.deviceId);
             const seenAt = d.lastSeen || d.lastActiveAt || null;
+            const seenText = seenAt
+              ? new Date(seenAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', hour12: false })
+              : '기록 없음';
 
             const chipsHtml = cfg.folders.map(f => {
               const allowedList = Array.isArray(f.allowedDevices) ? f.allowedDevices : [];
@@ -186,7 +189,7 @@ export function renderSharedFoldersTab(env) {
                         data-folder-id="${safeFolderId}"
                         data-device-id="${safeDevId}"
                         onclick="toggleDeviceFolderAccess('${safeFolderId}', '${safeDevId}', this)"
-                        title="클릭하여 '${safeDevName}' 기기에 '${safeFolderName}' 접근 권한 토글">
+                        title="클릭하여 '${safeDevName}' (${safeUserMemo}) 기기에 '${safeFolderName}' 접근 권한 토글">
                   <span>${isAllowed ? '✔' : '+'}</span>
                   <span>📁 ${safeFolderName}</span>
                 </button>
@@ -195,9 +198,12 @@ export function renderSharedFoldersTab(env) {
 
             return `
               <div style="background: #090d16; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 10px 12px; margin-top: 8px;">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-                  <span style="font-size: 13px; font-weight: 600; color: #f8fafc;">📱 ${safeDevName}</span>
-                  <span style="font-size: 11px; color: var(--text-muted);">최근: ${seenAt ? new Date(seenAt).toLocaleString('ko-KR') : '기록 없음'}</span>
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
+                  <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 6px;">
+                    <span style="font-size: 13px; font-weight: 600; color: #f8fafc;">📱 ${safeDevName}</span>
+                    <span class="badge badge-info" style="font-size: 10.5px; padding: 2px 7px;">👤 ${safeUserMemo}</span>
+                  </div>
+                  <span style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">최근(KST): ${escapeHtml(seenText)}</span>
                 </div>
                 <div style="display: flex; flex-wrap: wrap; gap: 6px;">
                   ${chipsHtml || '<span style="font-size: 11.5px; color: var(--text-muted);">부여할 수 있는 공유 폴더가 없습니다.</span>'}
@@ -322,7 +328,6 @@ export function renderSharedFoldersTab(env) {
         }
       }
 
-      // 🌟 [개선] 블로킹 alert() 제거 및 즉시 새로고침 연계 (이중 제출 방지 락 탑재)
       async function addNewSharedFolder() {
         var nameInput = document.getElementById('new-folder-name');
         var pathInput = document.getElementById('new-folder-path');

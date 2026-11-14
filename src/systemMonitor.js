@@ -1,6 +1,7 @@
 /**
  * @file src/systemMonitor.js
  * @description 서버 시스템 자원(CPU, RAM, DISK) 실측 모니터링 및 Discord 웹훅 알림 전담 모듈
+ * - 🇰🇷 [한국 표준시(KST) 통일] 실시간 게이지 시각 및 일일 다이제스트 날짜 경로를 Asia/Seoul 기준으로 일치화
  * - 🖥️ [크로스 플랫폼 CPU 1분 이동평균] Windows 및 Linux 공용 10초 주기 틱 샘플링 연산 탑재
  * - 🧠 [실측 RAM & DISK 연산] os.totalmem/freemem 및 fs.statfsSync를 통한 실시간 점유율(%) 산출
  * - 🔔 [자원 80% 초과 30분 쿨다운] CPU, RAM, DISK 중 하나라도 80% 초과 시 디스코드 웹훅 발송 (30분 도배 방지 락)
@@ -40,6 +41,39 @@ let currentCpuPercent = 0;
 let sampleIntervalId = null;
 let monitorIntervalId = null;
 let dailyDigestIntervalId = null;
+
+/**
+ * 🇰🇷 주어진 시각을 한국 표준시(Asia/Seoul) 기준 연/월/일/시분초 문자열로 변환합니다.
+ * @param {Date|number} [input=new Date()]
+ * @returns {{ year: string, month: string, day: string, dateStr: string, timeStr: string }}
+ */
+function getKstDateParts(input = new Date()) {
+  const dateObj = input instanceof Date ? input : new Date(input);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(dateObj);
+
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+
+  const year = map.year;
+  const month = map.month;
+  const day = map.day;
+  const hour = map.hour === '24' ? '00' : map.hour;
+  const dateStr = `${year}-${month}-${day}`;
+  const timeStr = `${hour}:${map.minute}:${map.second}`;
+
+  return { year, month, day, dateStr, timeStr };
+}
 
 /**
  * 전체 CPU 코어의 유휴(idle) 시간 및 총(total) 틱 시간 합산
@@ -207,14 +241,13 @@ export const systemMonitor = {
   },
 
   /**
-   * 관리자 대시보드 가로 게이지 바용 실시간 메트릭 반환
+   * 관리자 대시보드 가로 게이지 바용 실시간 메트릭 반환 (KST 시각)
    * @returns {{ cpu: number, ram: number, disk: number, lastCheckedAt: string }}
    */
   getSystemStats() {
     const mem = getMemoryMetrics();
     const disk = getDiskMetrics();
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0];
+    const { timeStr } = getKstDateParts();
 
     return {
       cpu: currentCpuPercent,
@@ -384,23 +417,19 @@ export const systemMonitor = {
   },
 
   /**
-   * 📅 [일일 정기 보고] 로그가 1건 이상 존재할 때만 발송 (로그 없으면 침묵)
+   * 📅 [일일 정기 보고] KST 당일 로그가 1건 이상 존재할 때만 발송 (로그 없으면 침묵)
    */
   async checkAndSendDailyDigest() {
     const env = readEnvFile();
     const webhookUrl = env.DISCORD_WEBHOOK_URL;
     if (!webhookUrl || env.DISCORD_DAILY_DIGEST !== 'true') return;
 
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const { year, month, day, dateStr } = getKstDateParts();
 
     // 하루 1회 중복 발송 방지
     if (lastDailyDigestDate === dateStr) return;
 
-    // 당일 로그 파일 실측
-    const year = now.getFullYear().toString();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
+    // 당일 KST 로그 파일 실측
     const dailyLogPath = path.join(LOGS_DIR, year, month, day, `audit-${dateStr}.jsonl`);
 
     // 🌟 [핵심 조건] 로그 파일이 없거나 라인 수가 0이면 발송하지 않고 스킵!
@@ -417,7 +446,7 @@ export const systemMonitor = {
     if (linesCount === 0) return; // 위협/오류 0건 시 침묵
 
     lastDailyDigestDate = dateStr;
-    const timeStr = now.toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
+    const timeStr = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
     const stats = this.getSystemStats();
 
     const payload = {

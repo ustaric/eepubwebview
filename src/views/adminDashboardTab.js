@@ -1,14 +1,13 @@
 /**
  * @file src/views/adminDashboardTab.js
  * @description 관리자 제어 센터 [탭 1: 📊 관제 대시보드] HTML 렌더러 모듈
+ * - 🇰🇷 [한국 표준시(KST) 통일] 크래시 리포트 발생 시각을 Asia/Seoul 기준으로 정확히 변환 표출
+ * - 👁️ [JSON 바로 보기 모달] 감사 로그·크래시 리포트 파일명 클릭 또는 👁️ 아이콘 클릭 시 즉시 프리뷰/복사 모달 오픈
  * - 🖥️ [상단 실시간 가로 1줄 게이지 바] CPU(1분 평균), RAM, DISK 점유율 가로 1줄 콤팩트 실시간 표출 (80% 이상 경고 점멸)
  * - 👥 [사용자 칼럼 표출] 활동 로그 테이블에 사용자 메모/서재 칼럼 완벽 표출
  * - ↔️ [가로/세로 2D 스크롤 박스] max-height: 400px (10행 기준) + overflow: auto 로 오른쪽 끝 잘림 방지
  * - 📌 [스티키 헤더 탑재] 스크롤을 내려도 thead th가 상단에 고정되어 가독성 극대화
  * - 💾 [디스크 및 도서 메트릭] 활성/보관 도서 권수 및 실측 디스크 용량 현황 카드
- * - 📁 [일자별 감사 로그 다운로드 센터] 일자별 영구 저장 파일 목록 및 스크롤 박스
- * - 🔬 [크래시 리포트 센터] 뷰어 조판 결함 진단 리포트 스크롤 테이블
- * - 🧹 [단일화 조치] 중복된 구형 웹훅 설정 카드를 제거하고 [⚙️ 시스템 설정] 탭으로 일원화
  */
 
 import { auditLogger } from '../auditLogger.js';
@@ -55,7 +54,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     securityBadgeHtml = `<span class="badge badge-warning">⚠️ 서버 오류 ${count500}건 발생</span>`;
   }
 
-  // 1. 최근 30건 활동 로그 테이블 (사용자 열 추가 및 오른쪽 끝 잘림 방지 스타일)
+  // 1. 최근 30건 활동 로그 테이블
   let activityLogsHtml = '';
   if (!recentLogs || recentLogs.length === 0) {
     activityLogsHtml = `
@@ -96,7 +95,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
         <table class="data-table" style="min-width: 720px; border-collapse: separate; border-spacing: 0;">
           <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
-              <th style="background: #1e293b;">시각</th>
+              <th style="background: #1e293b;">시각 (KST)</th>
               <th style="background: #1e293b;">IP</th>
               <th style="background: #1e293b;">사용자 (서재)</th>
               <th style="background: #1e293b;">기기 / 환경</th>
@@ -113,7 +112,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 2. 일자별 감사 로그 아카이브 목록 (스크롤 컨테이너 적용)
+  // 2. 일자별 감사 로그 아카이브 목록 (파일명 클릭 바로 보기 + 1-이모지 버튼)
   const logFiles = auditLogger.getLogFilesList();
   let logFilesHtml = '';
   if (!logFiles || logFiles.length === 0) {
@@ -127,13 +126,19 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     const fileRows = logFiles.map(f => {
       const encodedRelPath = encodeURIComponent(f.relativePath);
       const safeDate = escapeHtml(f.date);
+      const safeRelPath = escapeHtml(f.relativePath);
+      const previewUrl = `/admin/logs/download?file=${encodedRelPath}&preview=1`;
+      const previewTitle = `📁 감사 로그 (${safeDate})`;
+
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8; white-space: nowrap;">
+          <td style="font-family: monospace; font-size: 12.5px; font-weight: 600; color: #38bdf8; white-space: nowrap; cursor: pointer;"
+              data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="클릭하여 JSON 바로 보기">
             📅 ${safeDate}
           </td>
-          <td style="font-family: monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap;">
-            ${escapeHtml(f.relativePath)}
+          <td style="font-family: monospace; font-size: 11.5px; color: #93c5fd; white-space: nowrap; cursor: pointer; text-decoration: underline dotted;"
+              data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="클릭하여 JSON 바로 보기">
+            ${safeRelPath}
           </td>
           <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
@@ -142,8 +147,10 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
           </td>
           <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${escapeHtml(f.sizeKb)}</td>
           <td style="text-align: right; white-space: nowrap;">
-            <a href="/admin/logs/download?file=${encodedRelPath}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
-            <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" onclick="return confirm('${safeDate} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
+            <button type="button" class="btn-action btn-download" style="margin-right: 4px; border: none; cursor: pointer;"
+                    data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="JSON 바로 보기">👁️</button>
+            <a href="/admin/logs/download?file=${encodedRelPath}" class="btn-action btn-download" style="margin-right: 4px;" title="JSON 다운로드">📥</a>
+            <a href="/admin/logs/delete?file=${encodedRelPath}" class="btn-action btn-delete" title="삭제" onclick="return confirm('${safeDate} 일자의 로그 파일을 완전히 삭제하시겠습니까?');">🗑️</a>
           </td>
         </tr>
       `;
@@ -155,7 +162,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
           <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
               <th style="background: #1e293b;">기록 일자</th>
-              <th style="background: #1e293b;">저장 경로</th>
+              <th style="background: #1e293b;">저장 경로 (클릭 바로보기)</th>
               <th style="background: #1e293b; text-align: center;">활동/접근 수</th>
               <th style="background: #1e293b; text-align: right;">용량</th>
               <th style="background: #1e293b; text-align: right;">작업</th>
@@ -169,7 +176,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 3. 크래시 리포트 테이블 (10개 스크롤 컨테이너 적용)
+  // 3. 크래시 리포트 테이블 (KST 변환 + 파일명 클릭 바로 보기 + 1-이모지 버튼)
   let crashReportsHtml = '';
   if (!crashReports || crashReports.length === 0) {
     crashReportsHtml = `
@@ -181,14 +188,22 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
   } else {
     const rows = crashReports.map(r => {
       const dateStr = new Date(r.createdAt).toLocaleString('ko-KR', {
+        timeZone: 'Asia/Seoul',
         year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit'
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
       });
       const encodedName = encodeURIComponent(r.fileName);
+      const safeName = escapeHtml(r.fileName);
+      const previewUrl = `/admin/crash-reports/download/${encodedName}?preview=1`;
+      const previewTitle = `🔬 조판 리포트 (${safeName})`;
 
       return `
         <tr>
-          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8; white-space: nowrap;">${escapeHtml(r.fileName)}</td>
+          <td style="font-family: monospace; font-size: 11.5px; color: #38bdf8; white-space: nowrap; cursor: pointer; text-decoration: underline dotted;"
+              data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="클릭하여 JSON 바로 보기">
+            ${safeName}
+          </td>
           <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">${escapeHtml(dateStr)}</td>
           <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
@@ -197,8 +212,10 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
           </td>
           <td style="font-size: 11.5px; color: var(--text-muted); text-align: right; white-space: nowrap;">${escapeHtml(r.sizeKb)}</td>
           <td style="text-align: right; white-space: nowrap;">
-            <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;">📥 다운로드</a>
-            <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
+            <button type="button" class="btn-action btn-download" style="margin-right: 4px; border: none; cursor: pointer;"
+                    data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="JSON 바로 보기">👁️</button>
+            <a href="/admin/crash-reports/download/${encodedName}" class="btn-action btn-download" style="margin-right: 4px;" title="JSON 다운로드">📥</a>
+            <a href="/admin/crash-reports/delete/${encodedName}" class="btn-action btn-delete" title="삭제" onclick="return confirm('이 리포트를 삭제하시겠습니까?');">🗑️</a>
           </td>
         </tr>
       `;
@@ -209,8 +226,8 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
         <table class="data-table" style="min-width: 580px; border-collapse: separate; border-spacing: 0;">
           <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
-              <th style="background: #1e293b;">파일명</th>
-              <th style="background: #1e293b;">발생 시각</th>
+              <th style="background: #1e293b;">파일명 (클릭 바로보기)</th>
+              <th style="background: #1e293b;">발생 시각 (KST)</th>
               <th style="background: #1e293b; text-align: center;">결함 수</th>
               <th style="background: #1e293b; text-align: right;">크기</th>
               <th style="background: #1e293b; text-align: right;">작업</th>
@@ -228,7 +245,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     <!-- 상단 가로 1줄 실시간 시스템 자원 게이지 바 -->
     <div class="card" style="padding: 14px 18px; margin-bottom: 16px; background: #0f172a; border: 1px solid var(--border);">
       <div class="system-gauge-container">
-        <!-- CPU 게이지 -->
         <div class="gauge-item">
           <div class="gauge-label-row">
             <span class="gauge-title">🖥️ CPU (1분 평균)</span>
@@ -241,7 +257,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
         <div class="gauge-divider"></div>
 
-        <!-- RAM 게이지 -->
         <div class="gauge-item">
           <div class="gauge-label-row">
             <span class="gauge-title">🧠 RAM 사용량</span>
@@ -254,7 +269,6 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
         <div class="gauge-divider"></div>
 
-        <!-- DISK 게이지 -->
         <div class="gauge-item">
           <div class="gauge-label-row">
             <span class="gauge-title">💾 DISK 스토리지</span>
@@ -267,7 +281,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; font-size:11px; color:var(--text-muted);">
         <span>⚡ 10초 주기 실시간 관제 중 (자원 80% 초과 시 Discord 자동 통지)</span>
-        <span id="gauge-sync-time">산출: ${initialStats.lastCheckedAt}</span>
+        <span id="gauge-sync-time">산출(KST): ${initialStats.lastCheckedAt}</span>
       </div>
     </div>
 
@@ -292,7 +306,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
         </div>
       </div>
       <p style="font-size: 12px; color: var(--text-muted); margin: 0; text-align: right;">
-        최근 산출 시각: ${metrics.lastCalculatedAt || '-'}
+        최근 산출 시각(KST): ${metrics.lastCalculatedAt || '-'}
       </p>
     </div>
 
@@ -348,42 +362,58 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       </div>
     </div>
 
-    <!-- 3. 일자별 보안 감사 로그 다운로드 센터 (스크롤 박스 적용) -->
+    <!-- 3. 일자별 보안 감사 로그 다운로드 센터 -->
     <div class="card">
       <div class="section-title">
         <span>📁 일자별 보안 감사 로그 다운로드 센터 (${logFiles.length}일분 보관 중)</span>
       </div>
       <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        서버에 실제 접근 시도(동기화, 다운로드, 침투 차단)가 발생할 때마다 <strong>./data/logs/YYYY/MM/DD/</strong> 에 실시간 누적된 일자별 영구 보관 파일입니다.
+        파일명 또는 <strong>👁️</strong> 버튼을 클릭하면 브라우저에서 JSON 내용을 바로 볼 수 있습니다.
       </p>
       ${logFilesHtml}
     </div>
 
-    <!-- 4. 최근 30건 실시간 기기/IP 활동 로그 위젯 (사용자 열 추가 및 10행 세로/가로 스크롤 적용) -->
+    <!-- 4. 최근 30건 실시간 기기/IP 활동 로그 위젯 -->
     <div class="card">
       <div class="section-title">
         <span>📋 최근 실시간 활동 로그 (최근 30건 FIFO 링 버퍼)</span>
-        <span class="badge badge-success">실시간 관제 중</span>
+        <span class="badge badge-success">실시간 관제 중 (KST)</span>
       </div>
       <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        사용자별 도서 동기화, 다운로드 및 접근 이력이 표출됩니다. (10행 이상 시 세로 및 좌우 스크롤 지원)
+        사용자별 도서 동기화, 다운로드 및 접근 이력이 한국 표준시(KST) 기준으로 표출됩니다.
       </p>
       ${activityLogsHtml}
     </div>
 
-    <!-- 5. 조판 결함 및 크래시 리포트 다운로드 센터 (10행 스크롤 적용) -->
+    <!-- 5. 조판 결함 및 크래시 리포트 다운로드 센터 -->
     <div class="card">
       <div class="section-title">
         <span>🔬 조판 결함 및 크래시 리포트 (${crashReports ? crashReports.length : 0}건)</span>
         ${crashReports && crashReports.length > 0 ? `<a href="/admin/crash-reports/clear" class="btn-clear-all" onclick="return confirm('수집된 모든 크래시 리포트를 일괄 삭제하시겠습니까?');">🧹 전체 비우기</a>` : ''}
       </div>
       <p style="font-size: 12.5px; color: var(--text-muted); margin: 0 0 10px 0;">
-        웹 뷰어에서 자동 전송된 줄 잘림, 텍스트 중복, 챕터 마지막 유령 빈 페이지 결함 진단 JSON 목록입니다.
+        파일명 또는 <strong>👁️</strong> 버튼을 클릭하면 진단 JSON 내용을 바로 확인할 수 있습니다.
       </p>
       ${crashReportsHtml}
     </div>
 
-    <!-- 🎨 [스타일 & 스크립트] 가로 게이지 바 및 실시간 10초 갱신 클라이언트 루프 -->
+    <!-- 🔍 JSON 바로 보기 모달 -->
+    <div class="modal-overlay" id="modal-json-preview">
+      <div class="modal-box" style="max-width: 780px; width: 100%;">
+        <div class="modal-header">
+          <h3 id="json-preview-title" style="color: #38bdf8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">📄 JSON 바로 보기</h3>
+          <button type="button" class="modal-close-btn" onclick="closeJsonPreviewModal()">&times;</button>
+        </div>
+        <div class="modal-body" style="padding: 14px 16px;">
+          <pre id="json-preview-content" style="margin: 0; padding: 14px; background: #090d16; border: 1px solid var(--border); border-radius: 8px; color: #e2e8f0; font-family: monospace; font-size: 12px; line-height: 1.5; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-word;"></pre>
+        </div>
+        <div class="modal-footer" style="justify-content: space-between;">
+          <button type="button" class="btn-modal-cancel" id="btn-copy-json-preview" onclick="copyJsonPreviewContent()">📋 내용 복사</button>
+          <button type="button" class="btn-modal-select" onclick="closeJsonPreviewModal()">닫기</button>
+        </div>
+      </div>
+    </div>
+
     <style>
       .system-gauge-container {
         display: flex;
@@ -488,11 +518,66 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
             updateBar('gauge-disk-bar', 'gauge-disk-val', disk);
 
             const timeEl = document.getElementById('gauge-sync-time');
-            if (timeEl) timeEl.textContent = '산출: ' + lastCheckedAt;
+            if (timeEl) timeEl.textContent = '산출(KST): ' + lastCheckedAt;
           } catch (e) {}
         }
 
         setInterval(fetchSystemStats, 10000);
+
+        window.closeJsonPreviewModal = function() {
+          var modal = document.getElementById('modal-json-preview');
+          if (modal) modal.classList.remove('active');
+        };
+
+        window.copyJsonPreviewContent = function() {
+          var pre = document.getElementById('json-preview-content');
+          var btn = document.getElementById('btn-copy-json-preview');
+          if (!pre) return;
+          if (typeof copyToClipboard === 'function' && btn) {
+            copyToClipboard(pre.textContent || '', btn);
+          } else if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(pre.textContent || '');
+          }
+        };
+
+        document.addEventListener('click', async function(e) {
+          var target = e.target.closest('[data-json-preview-url]');
+          if (target) {
+            var url = target.getAttribute('data-json-preview-url');
+            var title = target.getAttribute('data-json-title') || '📄 JSON 바로 보기';
+            var modal = document.getElementById('modal-json-preview');
+            var titleEl = document.getElementById('json-preview-title');
+            var preEl = document.getElementById('json-preview-content');
+            if (!modal || !preEl) return;
+
+            if (titleEl) titleEl.textContent = title;
+            preEl.textContent = '⏳ JSON 내용을 불러오는 중...';
+            modal.classList.add('active');
+
+            try {
+              var res = await fetch(url);
+              var rawText = await res.text();
+              if (!res.ok) {
+                preEl.textContent = '❌ 불러오기 실패 (HTTP ' + res.status + ')\\n' + rawText;
+                return;
+              }
+              try {
+                var parsed = JSON.parse(rawText);
+                preEl.textContent = JSON.stringify(parsed, null, 2);
+              } catch (_) {
+                preEl.textContent = rawText;
+              }
+            } catch (err) {
+              preEl.textContent = '❌ 통신 오류: ' + err.message;
+            }
+            return;
+          }
+
+          var previewModal = document.getElementById('modal-json-preview');
+          if (previewModal && e.target === previewModal) {
+            window.closeJsonPreviewModal();
+          }
+        });
       })();
     </script>
   `;
