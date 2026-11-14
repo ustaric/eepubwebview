@@ -1,6 +1,7 @@
 /**
  * @file googleAuth.js
  * @description Google OAuth2 클라이언트 생성, 로그인 URL 발급, 코드 교환 및 토큰 갱신 전담 모듈
+ * - 🚦 [Single-Flight & 단기 캐싱] 동시 /api/access-token 요청 시 중복 Google OAuth 갱신 방지 및 만료 전 캐시 재사용
  */
 
 import { OAuth2Client } from 'google-auth-library';
@@ -9,7 +10,7 @@ import { config } from './config.js';
 import { saveRefreshToken, getRefreshToken, hasRefreshToken } from './tokenStore.js';
 
 /**
- * 전역 싱글톤 Google OAuth2 클라이언트
+ * 전역 싱글톤 Google OAuth2 클라이언트 (로그인 URL 생성 및 인가 코드 교환 전용)
  */
 const oauth2Client = new OAuth2Client(
   config.google.clientId,
@@ -23,6 +24,13 @@ const oauth2Client = new OAuth2Client(
  */
 const stateStore = new Map();
 const STATE_TTL_MS = 10 * 60 * 1000; // 10분
+
+// 만료 5분 전 선제 갱신 버퍼 및 Single-Flight 상태 홀더
+const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+/** @type {{ access_token: string, token_type: string, expiresAtMs: number } | null} */
+let cachedAccessToken = null;
+/** @type {Promise<{ access_token: string, expires_in: number, token_type: string }> | null} */
+let inFlightRefreshPromise = null;
 
 /**
  * 만료된 state 정리 함수
@@ -93,6 +101,7 @@ export async function exchangeCodeForTokens(code) {
 
     if (tokens.refresh_token) {
       saveRefreshToken(tokens.refresh_token);
+      cachedAccessToken = null; // 새 Refresh Token 저장 시 기존 Access Token 캐시 무효화
       console.log('[GoogleAuth] 신규 Refresh Token이 성공적으로 발급 및 저장되었습니다.');
       return { success: true, message: '새로운 Refresh Token이 안전하게 저장되었습니다.' };
     }
@@ -112,47 +121,80 @@ export async function exchangeCodeForTokens(code) {
 
 /**
  * 저장된 Refresh Token을 사용하여 Google로부터 새로운 Access Token 갱신 발급
+ * - 만료 5분 이상 남은 캐시 토큰이 있으면 즉시 재사용하고, 동시 갱신 요청은 단일 Promise(Single-Flight)로 병합합니다.
  * @returns {Promise<{ access_token: string, expires_in: number, token_type: string }>}
  */
 export async function getFreshAccessToken() {
   const refreshToken = getRefreshToken();
 
   if (!refreshToken) {
+    cachedAccessToken = null;
     const error = new Error('저장된 Refresh Token이 없습니다. 먼저 /auth/google 을 통해 Google 계정을 연동해 주세요.');
     error.status = 401;
     throw error;
   }
 
-  try {
-    // 임시 인스턴스 또는 클라이언트에 저장된 refresh_token 할당
-    oauth2Client.setCredentials({
-      refresh_token: refreshToken
-    });
-
-    console.log('[GoogleAuth] 저장된 Refresh Token을 이용하여 Access Token 갱신을 요청합니다.');
-    const response = await oauth2Client.getAccessToken();
-
-    // response.res.data 내부에 access_token 및 만료 정보(expires_in 초 단위)가 반환됨
-    const tokenData = response?.res?.data || {};
-    const accessToken = tokenData.access_token || response.token;
-    const expiresIn = tokenData.expires_in || 3599;
-    const tokenType = tokenData.token_type || 'Bearer';
-
-    if (!accessToken) {
-      throw new Error('Google로부터 유효한 access_token을 수신하지 못했습니다.');
-    }
-
-    console.log('[GoogleAuth] 새 Access Token 발급 완료 (유효 시간:', expiresIn, '초)');
-
+  const now = Date.now();
+  if (cachedAccessToken && now < (cachedAccessToken.expiresAtMs - TOKEN_EXPIRY_BUFFER_MS)) {
+    const remainingSec = Math.max(60, Math.floor((cachedAccessToken.expiresAtMs - now) / 1000));
     return {
-      access_token: accessToken,
-      expires_in: expiresIn,
-      token_type: tokenType
+      access_token: cachedAccessToken.access_token,
+      expires_in: remainingSec,
+      token_type: cachedAccessToken.token_type
     };
-  } catch (err) {
-    console.error('[GoogleAuth Error] Access Token 갱신 실패:', err.message);
-    const error = new Error('Google Access Token 갱신에 실패했습니다: ' + err.message);
-    error.status = 502;
-    throw error;
   }
+
+  if (inFlightRefreshPromise) {
+    console.log('[GoogleAuth:SingleFlight] 진행 중인 Access Token 갱신 요청을 공유합니다.');
+    return await inFlightRefreshPromise;
+  }
+
+  inFlightRefreshPromise = (async () => {
+    try {
+      const refreshClient = new OAuth2Client(
+        config.google.clientId,
+        config.google.clientSecret,
+        config.google.redirectUri
+      );
+      refreshClient.setCredentials({
+        refresh_token: refreshToken
+      });
+
+      console.log('[GoogleAuth] 저장된 Refresh Token을 이용하여 Access Token 갱신을 요청합니다.');
+      const response = await refreshClient.getAccessToken();
+
+      const tokenData = response?.res?.data || {};
+      const accessToken = tokenData.access_token || response.token;
+      const expiresIn = Number(tokenData.expires_in) || 3599;
+      const tokenType = tokenData.token_type || 'Bearer';
+
+      if (!accessToken) {
+        throw new Error('Google로부터 유효한 access_token을 수신하지 못했습니다.');
+      }
+
+      cachedAccessToken = {
+        access_token: accessToken,
+        token_type: tokenType,
+        expiresAtMs: Date.now() + (expiresIn * 1000)
+      };
+
+      console.log('[GoogleAuth] 새 Access Token 발급 완료 (유효 시간:', expiresIn, '초)');
+
+      return {
+        access_token: accessToken,
+        expires_in: expiresIn,
+        token_type: tokenType
+      };
+    } catch (err) {
+      cachedAccessToken = null;
+      console.error('[GoogleAuth Error] Access Token 갱신 실패:', err.message);
+      const error = new Error('Google Access Token 갱신에 실패했습니다: ' + err.message);
+      error.status = 502;
+      throw error;
+    } finally {
+      inFlightRefreshPromise = null;
+    }
+  })();
+
+  return await inFlightRefreshPromise;
 }

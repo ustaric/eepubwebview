@@ -3,7 +3,7 @@
  * @description 관리자 디렉터리 트리 탐색, 권한 실측, 외부 공유 서재 스캔 및 서버 내부 0초 도서 직통 복사(Import) 엔진
  * - 🔍 [디렉터리 트리 & 권한 실측] testDirectoryPermissions 및 getDirectoryTree로 관리자 탐색기 제어
  * - 📚 [공유 폴더 도서 재귀 스캔] getRemoteBooks로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집
- * - ⚡ [서버 내부 0초 직통 복사] importRemoteBookToLibrary로 클라이언트 트래픽 없이 books/ 폴더로 즉시 안착 및 메타데이터 각인
+ * - ⚡ [서버 내부 0초 직통 복사 & 기존 기록 보존] importRemoteBookToLibrary로 books/ 안착 시 기존 독서 진행률/CFI/표지 무손실 보존
  * - 🛡️ [확장자 & 심볼릭 링크 보안] isAllowedBookFile 및 resolveSafeRelativePath로 탈출 시도 실측 차단
  */
 
@@ -16,7 +16,7 @@ import {
   resolveStorageContext,
   ensureDir
 } from './storageContext.js';
-import { saveBookMetadata } from './bookStorageEngine.js';
+import { getBookMetadata, saveBookMetadata } from './bookStorageEngine.js';
 
 // =========================================================================
 // 🔍 1. 서버 디렉터리 탐색 및 권한 실측 엔진
@@ -196,11 +196,12 @@ export function getRemoteBookFilePath(sharedDir, relativeFilePath) {
 }
 
 /**
- * ⚡ 공유 폴더 도서를 서버 내부 디스크에서 books/ 로 직접 복사(Import)하고 정식 메타데이터 생성
+ * ⚡ 공유 폴더 도서를 서버 내부 디스크에서 books/ 로 직접 복사(Import)하고 메타데이터를 생성/병합합니다.
+ * - 동일한 bookId의 기존 메타데이터(books/ 또는 archive/)가 이미 존재하면 독서 진행률, CFI, 표지 등 기존 기록을 보존합니다.
  * @param {string} sharedDir - 공유 폴더 절대 경로
  * @param {string} relativeFilePath - 공유 폴더 내 파일 상대 경로
  * @param {string|null} [userFolder=null] - 대상 사용자 폴더명
- * @returns {Object|null}
+ * @returns {Object|null} 복사 결과 및 도서 메타데이터
  */
 export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolder = null) {
   if (!sharedDir || !relativeFilePath) return null;
@@ -239,6 +240,9 @@ export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolde
     throw new Error(`복사 대상 경로 보안 오류: ${pathCheck.reason}`);
   }
 
+  // 기존 메타데이터 선조회 (재임포트 시 기존 독서 진행률·CFI·표지 무손실 보존용)
+  const existingMeta = getBookMetadata(safeBookId, userFolder);
+
   fs.copyFileSync(safeSourcePath, targetEpubPath);
 
   console.log(`⚡ [StorageService:Import] 서버 내부 0초 도서 복사 완료 (언더바 규격):`, {
@@ -247,28 +251,46 @@ export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolde
     existsOnDisk: fs.existsSync(targetEpubPath),
     savedSizeBytes: stat.size,
     bookId: safeBookId,
-    userFolder: userFolder || 'root'
+    userFolder: userFolder || 'root',
+    preservedExistingProgress: Boolean(existingMeta)
   });
 
-  const bookData = {
-    bookId: safeBookId,
-    title: cleanTitle,
-    fileName,
-    totalCharacters: 0,
-    readCharacters: 0,
-    progress: '0.0%',
-    lastCfi: '0',
-    completed: false,
-    isArchived: false,
-    hasLocalFile: true,
-    isRecordOnly: false,
-    isConvertedTxt: isTxt,
-    lastReadDate: nowIso,
-    lastModified: nowIso
-  };
+  const bookData = existingMeta
+    ? {
+        ...existingMeta,
+        bookId: safeBookId,
+        title: existingMeta.title || cleanTitle,
+        fileName: existingMeta.fileName || fileName,
+        isArchived: false,
+        archiveStatus: 'active',
+        hasLocalFile: true,
+        isRecordOnly: false,
+        unarchivedAt: existingMeta.isArchived ? nowIso : (existingMeta.unarchivedAt || null),
+        archivedAt: null,
+        lastReadDate: nowIso,
+        lastModified: nowIso
+      }
+    : {
+        bookId: safeBookId,
+        title: cleanTitle,
+        fileName,
+        totalCharacters: 0,
+        readCharacters: 0,
+        progress: '0.0%',
+        lastCfi: '0',
+        completed: false,
+        isArchived: false,
+        hasLocalFile: true,
+        isRecordOnly: false,
+        isConvertedTxt: isTxt,
+        lastReadDate: nowIso,
+        lastModified: nowIso
+      };
 
   saveBookMetadata(safeBookId, bookData, userFolder);
-  console.log(`📖 [StorageService:Import] 정규 도서 메타데이터 자동 각인 완료: '${safeBookId}.json' (폴더: ${userFolder || 'root'})`);
+  console.log(
+    `📖 [StorageService:Import] 도서 메타데이터 ${existingMeta ? '기존 기록 보존 병합' : '신규 각인'} 완료: '${safeBookId}.json' (진도율: ${bookData.progress || '0.0%'}, 폴더: ${userFolder || 'root'})`
+  );
 
   return {
     ok: true,

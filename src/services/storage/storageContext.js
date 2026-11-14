@@ -6,6 +6,7 @@
  * - 👥 [다중 사용자 샌드박스 스코핑] resolveStorageContext로 data/users/{userFolder} 완전 격리
  * - 📊 [사용자 용량 한도 실측] checkUserStorageQuota로 디스크 실측 기반 할당량 통제
  * - 🔒 [보안 경로 검증] resolveSafeRelativePath로 심볼릭 링크 및 Path Traversal 실측 차단
+ * - ✍️ [충돌 없는 원자적 쓰기] writeJsonSafely 임시 파일명 난수 접미사 적용으로 동시 쓰기 ENOENT 방어
  */
 
 import fs from 'fs';
@@ -123,16 +124,23 @@ export function readJsonSafely(filePath) {
 }
 
 /**
- * JSON 파일 원자적 쓰기 헬퍼
+ * JSON 파일 원자적 쓰기 헬퍼 (동시 쓰기 충돌 방지를 위한 난수 접미사 적용)
  * @param {string} filePath 
  * @param {any} data 
  */
 export function writeJsonSafely(filePath, data) {
   ensureDir(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp_${Date.now()}`;
+  const tempPath = `${filePath}.tmp_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   const jsonStr = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  fs.writeFileSync(tempPath, jsonStr, 'utf-8');
-  fs.renameSync(tempPath, filePath);
+  try {
+    fs.writeFileSync(tempPath, jsonStr, 'utf-8');
+    fs.renameSync(tempPath, filePath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch (_) {}
+    throw err;
+  }
 }
 
 /**

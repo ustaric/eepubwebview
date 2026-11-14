@@ -3,6 +3,7 @@
  * @description 개인용 Google Drive Refresh Token 및 다중 사용자 자체 스토리지 제어 통합 HTTP 서버
  * - 🚀 [초슬림 ESM 파사드 아키텍처] 모든 도메인 로직을 서브 라우터(system, auth, admin, storage)로 100% 위임
  * - 🛡️ [글로벌 보안 가드] ALLOWED_HTTP_METHODS(5대 메서드), securityGuard 보안 헤더 주입 및 OPTIONS 프리플라이트 자동 처리
+ * - 🧯 [최상위 비동기 예외 방어] 프록시 프로토콜 정규화 및 미포착 라우트 예외 500 JSON 안전 응답 처리
  * - 🚦 [지능형 URL 디스패처] systemRoutes ➔ authRoutes ➔ adminController ➔ storageRoutes 순차 위임
  * - 📊 [백그라운드 자원 감시 가동] systemMonitor 연동으로 1분 이동평균 연산 및 80% 초과 30분 쿨다운 감시
  */
@@ -43,49 +44,66 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers.host || `${config.host}:${config.port}`;
-  const reqUrl = new URL(req.url, `${protocol}://${host}`);
-  const pathname = reqUrl.pathname;
-  const clientIp = getClientIp(req);
-  const userAgent = req.headers['user-agent'] || '';
+  try {
+    const rawProto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim().toLowerCase();
+    const protocol = (rawProto === 'https' || rawProto === 'http') ? rawProto : 'http';
+    const host = req.headers.host || `${config.host}:${config.port}`;
+    const reqUrl = new URL(req.url, `${protocol}://${host}`);
+    const pathname = reqUrl.pathname;
+    const clientIp = getClientIp(req);
+    const userAgent = req.headers['user-agent'] || '';
 
-  console.log(`[Request] ${req.method} ${pathname} (IP: ${clientIp})`);
+    console.log(`[Request] ${req.method} ${pathname} (IP: ${clientIp})`);
 
-  // =========================================================================
-  // 🧭 도메인 책임별 서브 라우터 순차 디스패치 위임
-  // =========================================================================
+    // =========================================================================
+    // 🧭 도메인 책임별 서브 라우터 순차 디스패치 위임
+    // =========================================================================
 
-  // [도메인 1] 시스템 헬스체크 & 실시간 관제 라우터 (/api/health, /api/admin/system-stats, /api/admin/discord-webhook)
-  if (await handleSystemRoute(req, res, pathname, reqUrl, clientIp, userAgent)) {
-    return;
+    // [도메인 1] 시스템 헬스체크 & 실시간 관제 라우터 (/api/health, /api/admin/system-stats, /api/admin/discord-webhook)
+    if (await handleSystemRoute(req, res, pathname, reqUrl, clientIp, userAgent)) {
+      return;
+    }
+
+    // [도메인 2] Google OAuth & 6자리 OTP 인증 라우터 (/auth/google/*, /api/auth/otp/*, /api/access-token)
+    if (await handleAuthRoute(req, res, pathname, reqUrl, clientIp, userAgent, protocol, host)) {
+      return;
+    }
+
+    // [도메인 3] 관리자 인증 & 대시보드 라우터 (/admin/*, /settings)
+    if (pathname.startsWith('/admin') || pathname === '/settings') {
+      const handled = await handleAdminRoute(req, res, pathname, clientIp, userAgent);
+      if (handled) return;
+    }
+
+    // [도메인 4] 자체 스토리지 REST API 라우터 (/api/storage/*)
+    if (await handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent)) {
+      return;
+    }
+
+    // 기본 루트(/) 접속 시 관리자 대시보드로 302 이동
+    if (req.method === 'GET' && pathname === '/') {
+      res.writeHead(302, { Location: '/admin' });
+      res.end();
+      return;
+    }
+
+    // 매칭되는 라우트가 없는 경우 404
+    return sendJsonResponse(req, res, 404, { error: 'Not Found' });
+  } catch (err) {
+    console.error(`❌ [Server Unhandled Error] ${req.method} ${req.url}:`, err);
+    if (!res.headersSent && !res.writableEnded) {
+      try {
+        sendJsonResponse(req, res, 500, {
+          error: 'INTERNAL_SERVER_ERROR',
+          message: err?.message || '서버 요청 처리 중 예기치 않은 오류가 발생했습니다.'
+        });
+      } catch (_) {
+        if (!res.writableEnded) res.end();
+      }
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   }
-
-  // [도메인 2] Google OAuth & 6자리 OTP 인증 라우터 (/auth/google/*, /api/auth/otp/*, /api/access-token)
-  if (await handleAuthRoute(req, res, pathname, reqUrl, clientIp, userAgent, protocol, host)) {
-    return;
-  }
-
-  // [도메인 3] 관리자 인증 & 대시보드 라우터 (/admin/*, /settings)
-  if (pathname.startsWith('/admin') || pathname === '/settings') {
-    const handled = await handleAdminRoute(req, res, pathname, clientIp, userAgent);
-    if (handled) return;
-  }
-
-  // [도메인 4] 자체 스토리지 REST API 라우터 (/api/storage/*)
-  if (await handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent)) {
-    return;
-  }
-
-  // 기본 루트(/) 접속 시 관리자 대시보드로 302 이동
-  if (req.method === 'GET' && pathname === '/') {
-    res.writeHead(302, { Location: '/admin' });
-    res.end();
-    return;
-  }
-
-  // 매칭되는 라우트가 없는 경우 404
-  return sendJsonResponse(req, res, 404, { error: 'Not Found' });
 });
 
 // 서버 구동 및 백그라운드 자원 감시 루프 시작

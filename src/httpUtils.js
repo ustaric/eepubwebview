@@ -1,8 +1,8 @@
 /**
  * @file src/httpUtils.js
  * @description HTTP 요청 파싱, CORS, Rate Limiting 및 응답 생성 전담 공통 인프라 유틸리티 모듈
- * - 🛡️ [CORS & 보안 헤더 자동 주입] injectSecurityHeaders 연동 및 ALLOWED_ORIGIN 기반 동적 CORS 헤더 제어
- * - 🚦 [IP 기반 요청 폭주 방어] 1분 120회 스토리지 요청 제한 및 5분 주기 메모리 자가 소독(GC)
+ * - 🛡️ [CORS & 보안 헤더 자동 주입] injectSecurityHeaders 연동, ALLOWED_ORIGIN 기반 동적 CORS 및 Vary: Origin 캐시 격리 헤더 제어
+ * - 🚦 [IP 기반 요청 폭주 방어] 1분 단위 요청 제한 및 5분 주기 메모리 자가 소독(GC)
  * - 🔒 [OTP 무차별 대입 방어] 1분 내 5회 실패 시 10분 강제 락 및 실시간 대기 시간(분) 산출
  * - 🔑 [인증 식별자 지능형 추출] Header(X-API-KEY / Authorization Bearer) 및 URL Query(?apiKey) 통합 파싱
  * - 📱 [기기 식별 헤더 정규화] X-Device-Id 및 안전하게 URL 디코딩된 X-Device-Name 추출
@@ -229,6 +229,7 @@ export function setCorsHeaders(req, res) {
     }
   }
 
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY, X-Device-Id, X-Device-Name');
   res.setHeader('Access-Control-Max-Age', '86400');

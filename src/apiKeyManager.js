@@ -3,13 +3,13 @@
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 6자리 단기 기기 연결 OTP 관리 엔진
  * - 🛡️ [2단계 화이트리스트 기기 거버넌스] 유효 API 키 + 서버 정식 승인 기기 2중 검증 (삭제/미승인 기기 자동 재등록 원천 차단)
  * - 📱 [최초 기기 마스터 자동 안착] 등록 기기가 0대인 최초 상태에서만 1번째 기기로 자동 등록 허용
- * - 🔢 [6자리 OTP 정식 기기 등록 결속] verifyAndExchangeDeviceOtp 성공 시점에만 게스트 기기를 정식 장부에 등록 (슬롯 6대 한도)
+ * - 🔢 [6자리 OTP 정식 기기 등록 결속] verifyAndExchangeDeviceOtp 성공 시점에만 게스트 기기를 정식 장부에 등록 (슬롯 6대 한도, 폐기키/차단기기 방어)
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
  * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
  * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
  * - 👥 [보관 도서 합산 집계] getUserListForAdmin에서 books/ 및 archive/ 도서 권수 동시 실측
  * - 🔑 [SHA-256 단방향 해싱] 서버 디스크에는 해시값만 저장하여 비밀 키 원문 유출 원천 차단
- * - ⏳ [24시간 활성화 윈도우] 발급 후 24시간 내 미접속 시 EXPIRED 자동 만료 및 고아 폴더 회수
+ * - ⏳ [24시간 활성화 윈도우 & 재발급 서재 보호] 신규 미사용 키만 고아 폴더 회수, 재발급·기존 데이터 보유 서재는 EXPIRED 전환 후 도서 보존
  * - 🟢 [원터치 활성화] 발급 후 24시간 내 최초 1회 인증 성공 시 ACTIVE 상태로 자동 영구 활성화
  * - 📁 [사용자 샌드박스 골격 자동 생성] user_xxxx 채번 시 books/, settings/, archive/ 디렉터리 즉시 준비
  * - 🔄 [무손실 재발급] 키 분실 시 기존 도서/설정 100% 보존 상태로 새 API 키만 교체 발급
@@ -91,6 +91,7 @@ process.on('exit', () => {
  * @property {number} storageQuotaBytes - 최대 허용 저장 용량 (Byte)
  * @property {number} [maxDevices=6] - 최대 등록 허용 기기 수
  * @property {Record<string, DeviceRecord>} [devices={}] - 등록된 기기 목록
+ * @property {boolean} [isReissued=false] - 기존 서재에서 재발급된 키 여부
  * @property {string} createdAt - 발급 시각 (ISO)
  * @property {string|null} activatedAt - 최초 접속 활성화 시각 (ISO)
  * @property {string|null} expiresAt - 24시간 활성화 마감 시각 (ISO)
@@ -446,21 +447,47 @@ export const apiKeyManager = {
       return { success: false, error: '유효 시간(3분)이 초과되었습니다. 번호를 다시 발급받으세요.' };
     }
 
-    // 🌟 [핵심] 번호 인증 성공 시 게스트 기기를 정식 승인 장부에 등록!
-    if (deviceId) {
-      const cleanDeviceId = String(deviceId).trim().slice(0, 64);
-      const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
-      const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
-
+    // 🔒 [계정 및 기기 차단 상태 선제 검증] 루트 관리자가 아닌 일반 사용자 계정의 폐기·만료·기기차단 여부 확인
+    if (item.folderName !== 'root') {
       const list = readApiKeysData();
       const index = list.findIndex(u => u.folderName === item.folderName);
-      if (index !== -1) {
-        const user = list[index];
+      if (index === -1) {
+        deviceOtpStore.delete(cleanCode);
+        return { success: false, error: '폐기되었거나 존재하지 않는 사용자 계정입니다.' };
+      }
+
+      const user = list[index];
+      if (user.status === 'REVOKED' || user.status === 'EXPIRED') {
+        deviceOtpStore.delete(cleanCode);
+        return { success: false, error: '사용 중지되었거나 만료된 API 키입니다.' };
+      }
+
+      if (user.status === 'PENDING' && user.expiresAt && now > new Date(user.expiresAt).getTime()) {
+        user.status = 'EXPIRED';
+        writeJsonAtomic(API_KEYS_FILE, list);
+        deviceOtpStore.delete(cleanCode);
+        return { success: false, error: '활성화 기한이 만료된 API 키입니다.' };
+      }
+
+      if (deviceId) {
+        const cleanDeviceId = String(deviceId).trim().slice(0, 64);
+        const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
+        const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
+
         user.devices = user.devices || {};
+        const existingDevice = user.devices[cleanDeviceId];
+        if (existingDevice && existingDevice.status === 'blocked') {
+          console.warn(`⛔ [ApiKeyManager:OTPBlocked] 차단된 기기의 OTP 우회 승인 차단: '${cleanDeviceId}' ➔ '${user.memo}'`);
+          return {
+            success: false,
+            error: '관리자에 의해 차단된 기기입니다. 관리자 화면에서 차단을 먼저 해제해 주세요.'
+          };
+        }
+
         const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
         const currentCount = Object.keys(user.devices).length;
 
-        if (!user.devices[cleanDeviceId] && currentCount >= maxLimit) {
+        if (!existingDevice && currentCount >= maxLimit) {
           return {
             success: false,
             error: `기기 등록 한도(${maxLimit}대)를 초과했습니다. 기존 기기를 먼저 정리해 주세요.`
@@ -471,7 +498,7 @@ export const apiKeyManager = {
         user.devices[cleanDeviceId] = {
           deviceId: cleanDeviceId,
           deviceName: cleanDeviceName,
-          firstSeen: user.devices[cleanDeviceId]?.firstSeen || nowIso,
+          firstSeen: existingDevice?.firstSeen || nowIso,
           lastSeen: nowIso,
           lastIp: cleanIp,
           status: 'active'
@@ -679,6 +706,7 @@ export const apiKeyManager = {
     list[index].status = 'PENDING';
     list[index].expiresAt = expiresAt;
     list[index].activatedAt = null;
+    list[index].isReissued = true;
 
     writeJsonAtomic(API_KEYS_FILE, list);
     console.log(`🔄 [ApiKeyManager:Reissued] API 키 재발급 완료 (폴더 보존): '${folderName}' ➔ 새 만료기한: ${expiresAt}`);
@@ -745,6 +773,11 @@ export const apiKeyManager = {
     return { success: true };
   },
 
+  /**
+   * 🧹 24시간 활성화 기한이 지난 PENDING 계정을 정리합니다.
+   * - 최초 발급 후 1번도 사용하지 않은 빈 고아 폴더만 삭제 회수합니다.
+   * - 재발급(isReissued) 계정, 기존 등록 기기 또는 저장 파일이 존재하는 서재는 폴더를 삭제하지 않고 EXPIRED 상태로 전환해 데이터를 보존합니다.
+   */
   cleanupExpiredPendingKeys() {
     const list = readApiKeysData();
     const now = Date.now();
@@ -755,16 +788,33 @@ export const apiKeyManager = {
       if (item.status === 'PENDING') {
         const deadline = new Date(item.expiresAt).getTime();
         if (now > deadline) {
-          console.log(`🧹 [ApiKeyManager:Cleanup] 24시간 미사용 고아 폴더 정리: '${item.folderName}'`);
           const userRoot = path.join(USERS_DIR, item.folderName);
-          const safeCheck = validateSafePath(USERS_DIR, item.folderName);
-          if (safeCheck.safe && fs.existsSync(userRoot)) {
+          const hasExistingDevices = Boolean(item.devices && Object.keys(item.devices).length > 0);
+          const isReissuedAccount = Boolean(item.isReissued);
+          const hasStoredFiles = ['books', 'archive', 'settings'].some((sub) => {
+            const subDir = path.join(userRoot, sub);
             try {
-              fs.rmSync(userRoot, { recursive: true, force: true });
-            } catch (e) {}
+              return fs.existsSync(subDir) && fs.readdirSync(subDir).length > 0;
+            } catch (_) {
+              return true;
+            }
+          });
+
+          if (isReissuedAccount || hasExistingDevices || hasStoredFiles) {
+            console.warn(`⏳ [ApiKeyManager:ExpirePreserve] 기존 서재/재발급 계정('${item.folderName}') 24시간 미접속 ➔ 데이터 보존 상태로 EXPIRED 전환`);
+            item.status = 'EXPIRED';
+            changed = true;
+          } else {
+            console.log(`🧹 [ApiKeyManager:Cleanup] 24시간 미사용 고아 폴더 정리: '${item.folderName}'`);
+            const safeCheck = validateSafePath(USERS_DIR, item.folderName);
+            if (safeCheck.safe && fs.existsSync(userRoot)) {
+              try {
+                fs.rmSync(userRoot, { recursive: true, force: true });
+              } catch (e) {}
+            }
+            list.splice(i, 1);
+            changed = true;
           }
-          list.splice(i, 1);
-          changed = true;
         }
       }
     }

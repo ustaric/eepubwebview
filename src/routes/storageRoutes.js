@@ -5,8 +5,8 @@
  * - 🚫 [미등록/삭제 기기 403 즉시 차단] 장부에서 삭제된 기기의 임의 재접속 원천 거부 및 6자리 번호 재로그인 요구
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
- * - 🚦 [용량 초과 사전 차단] Content-Length 검사로 사용자 할당량 초과 시 413 즉시 거부
- * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더 및 기기별 Stealth 권한 필터링 완비
+ * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
+ * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
  * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
  */
@@ -83,8 +83,8 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return false;
   }
 
-  // 1. 스토리지 API 요청 횟수 제한 (1분 120회)
-  if (!checkRateLimit(req, 120)) {
+  // 1. 스토리지 API 요청 횟수 제한 (1분 600회: 대량 마이그레이션 및 표지·메타 일괄 동기화 허용)
+  if (!checkRateLimit(req, 600)) {
     auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '요청 횟수 초과 차단', target: pathname, status: 429 });
     sendJsonResponse(req, res, 429, { error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
     return true;
@@ -293,18 +293,47 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       try {
         const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
         const newConfig = JSON.parse(buffer.toString('utf-8') || '{}');
-        saveSharedFoldersConfig(newConfig);
+
+        if (!newConfig || typeof newConfig !== 'object' || Array.isArray(newConfig) || !Array.isArray(newConfig.folders)) {
+          sendJsonResponse(req, res, 400, { error: 'INVALID_CONFIG: enabled(boolean) 및 folders(array) 형식이 필요합니다.' });
+          return true;
+        }
+
+        const sanitizedFolders = [];
+        for (let idx = 0; idx < newConfig.folders.length; idx++) {
+          const f = newConfig.folders[idx];
+          if (!f || typeof f !== 'object' || typeof f.path !== 'string' || !f.path.trim()) {
+            sendJsonResponse(req, res, 400, { error: `INVALID_FOLDER_ITEM: 유효하지 않은 공유 폴더 항목입니다 (index=${idx}).` });
+            return true;
+          }
+          sanitizedFolders.push({
+            id: String(f.id || `folder_${Date.now()}_${idx}`).trim(),
+            name: String(f.name || path.basename(f.path.trim()) || '공유 서재').trim(),
+            path: f.path.trim(),
+            enabled: f.enabled !== false,
+            allowedDevices: Array.isArray(f.allowedDevices)
+              ? f.allowedDevices.map((d) => String(d).trim()).filter(Boolean)
+              : ['*']
+          });
+        }
+
+        const sanitizedConfig = {
+          enabled: Boolean(newConfig.enabled),
+          folders: sanitizedFolders
+        };
+
+        saveSharedFoldersConfig(sanitizedConfig);
 
         auditLogger.recordAccessLog({
           ip: clientIp,
           userAgent,
           action: '⚙️ 공유 폴더 설정 갱신',
-          target: `폴더 ${newConfig.folders?.length || 0}개 (기능활성: ${newConfig.enabled})`,
+          target: `폴더 ${sanitizedConfig.folders.length}개 (기능활성: ${sanitizedConfig.enabled})`,
           status: 200,
           user: authenticatedUserMemo
         });
 
-        sendJsonResponse(req, res, 200, { ok: true, message: '공유 폴더 설정이 저장되었습니다.', config: newConfig });
+        sendJsonResponse(req, res, 200, { ok: true, message: '공유 폴더 설정이 저장되었습니다.', config: sanitizedConfig });
         return true;
       } catch (err) {
         sendJsonResponse(req, res, 500, { error: err.message });
@@ -483,7 +512,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         ip: clientIp,
         userAgent,
         action: '🚫 공유 도서 다운로드 권한 차단',
-        target: `${reqFile} (폴더: ${targetFolder.name}, 기기: ${deviceId || 'unknown'})`,
+        target: `${normalizedReqFile} (폴더: ${targetFolder.name}, 기기: ${deviceId || 'unknown'})`,
         status: 403,
         user: authenticatedUserMemo
       });
@@ -491,9 +520,9 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       return true;
     }
 
-    const fileInfo = storageService.getRemoteBookFilePath(targetFolder.path, reqFile);
+    const fileInfo = storageService.getRemoteBookFilePath(targetFolder.path, normalizedReqFile);
     if (!fileInfo) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: reqFile, status: 404, user: authenticatedUserMemo });
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 다운로드 실패', target: normalizedReqFile, status: 404, user: authenticatedUserMemo });
       sendJsonResponse(req, res, 404, { error: '도서 파일을 찾을 수 없습니다.' });
       return true;
     }
