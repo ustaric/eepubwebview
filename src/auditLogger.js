@@ -7,6 +7,7 @@
  * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
  * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
  * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
+ * - 🔍 [차단 요청 추적 메타데이터] method, deviceId, deviceName, origin, authState(원문 비노출) 선택 기록 지원
  * - 🔔 [선택적 디스코드 실시간 알림] DISCORD_ALERT_TYPES(500, 401, 403, 429, ATTACK) 설정에 따른 조건부 웹훅 연동
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
  * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
@@ -88,6 +89,11 @@ function getKstDateParts(input = new Date()) {
  * @property {string} action - 동작 유형 (스냅샷, EPUB 다운로드, 표지, 저장, 삭제 등)
  * @property {string} target - 대상 파일명 또는 도서 ID (마스킹 적용)
  * @property {number} status - HTTP 응답 코드 (200, 403, 404, 429 등)
+ * @property {string} [method] - HTTP 요청 메서드 (GET, POST, DELETE 등)
+ * @property {string} [deviceId] - 요청 헤더의 기기 고유 식별자 (X-Device-Id)
+ * @property {string} [deviceName] - 요청 헤더의 기기 이름 (X-Device-Name)
+ * @property {string} [origin] - 요청 출처 (Origin 또는 Referer origin)
+ * @property {string} [authState] - 인증 헤더 상태 태그 (원문 비노출)
  */
 
 /**
@@ -260,8 +266,25 @@ export const auditLogger = {
    * @param {string} [params.target="-"] - 파일명 또는 도서 식별자
    * @param {number} [params.status=200] - 응답 상태 코드
    * @param {string} [params.user="-"] - 사용자 메모 또는 폴더명 (예: "홍길동 (user_dde4bc6a)")
+   * @param {string} [params.method=""] - HTTP 요청 메서드
+   * @param {string} [params.deviceId=""] - 클라이언트 X-Device-Id
+   * @param {string} [params.deviceName=""] - 클라이언트 X-Device-Name
+   * @param {string} [params.origin=""] - 요청 Origin/Referer
+   * @param {string} [params.authState=""] - 인증 헤더 진단 상태 태그
    */
-  recordAccessLog({ ip, userAgent = "", action, target = "-", status = 200, user = "-" }) {
+  recordAccessLog({
+    ip,
+    userAgent = "",
+    action,
+    target = "-",
+    status = 200,
+    user = "-",
+    method = "",
+    deviceId = "",
+    deviceName = "",
+    origin = "",
+    authState = ""
+  }) {
     const { timeStr, dateStr } = getKstDateParts();
 
     // 🛡️ [로그 소독] 민감정보 실시간 마스킹
@@ -278,7 +301,12 @@ export const auditLogger = {
       user: user || '-',
       action: sanitizedAction,
       target: sanitizedTarget,
-      status: statusCode
+      status: statusCode,
+      ...(method ? { method: maskSensitiveLog(String(method).toUpperCase()) } : {}),
+      ...(deviceId ? { deviceId: maskSensitiveLog(String(deviceId)) } : {}),
+      ...(deviceName ? { deviceName: maskSensitiveLog(String(deviceName)) } : {}),
+      ...(origin ? { origin: maskSensitiveLog(String(origin)) } : {}),
+      ...(authState ? { authState: maskSensitiveLog(String(authState)) } : {})
     };
 
     // 1. RAM 링 버퍼에 기록 (최대 30건 FIFO: 정상 200 포함 실시간 현황 관제)

@@ -8,6 +8,7 @@
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
  * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
  * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
+ * - 🔍 [차단 감사 메타데이터 보강] 401/403/429 차단 로그에 method, deviceId, deviceName, origin, authState(원문 비노출) 기록
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
  */
 
@@ -78,14 +79,65 @@ function saveSharedFoldersConfig(config) {
   }
 }
 
+/**
+ * 🔍 요청 출처(Origin 또는 Referer origin) 안전 추출 헬퍼
+ * @param {import('http').IncomingMessage} req
+ * @returns {string}
+ */
+function getSafeOriginLabel(req) {
+  if (req.headers.origin) return String(req.headers.origin).trim();
+  if (req.headers.referer) {
+    try {
+      return new URL(req.headers.referer).origin;
+    } catch (_) {
+      return '';
+    }
+  }
+  return '';
+}
+
+/**
+ * 🔍 민감 원문 없이 인증 헤더 상태 태그만 산출하는 진단 헬퍼
+ * @param {import('http').IncomingMessage} req
+ * @param {URL} reqUrl
+ * @returns {string}
+ */
+function getAuthDiagnosticState(req, reqUrl) {
+  const rawApiHeader = req.headers['x-api-key'];
+  let apiKeyPart = 'apiKey:none';
+  if (rawApiHeader !== undefined) {
+    apiKeyPart = String(rawApiHeader).trim() ? 'apiKey:header_present' : 'apiKey:header_empty';
+  } else if (reqUrl.searchParams.has('apiKey')) {
+    apiKeyPart = reqUrl.searchParams.get('apiKey')?.trim() ? 'apiKey:query_present' : 'apiKey:query_empty';
+  }
+
+  const rawAuthHeader = req.headers['authorization'];
+  let authPart = 'auth:none';
+  if (rawAuthHeader) {
+    authPart = String(rawAuthHeader).startsWith('Bearer ') ? 'auth:bearer_present' : 'auth:other_present';
+  }
+
+  return `${apiKeyPart}|${authPart}`;
+}
+
 export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
   if (!pathname.startsWith('/api/storage/')) {
     return false;
   }
 
+  const safeOrigin = getSafeOriginLabel(req);
+
   // 1. 스토리지 API 요청 횟수 제한 (1분 600회: 대량 마이그레이션 및 표지·메타 일괄 동기화 허용)
   if (!checkRateLimit(req, 600)) {
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '요청 횟수 초과 차단', target: pathname, status: 429 });
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '요청 횟수 초과 차단',
+      target: pathname,
+      status: 429,
+      method: req.method,
+      origin: safeOrigin
+    });
     sendJsonResponse(req, res, 429, { error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
     return true;
   }
@@ -93,7 +145,15 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   // 2. STORAGE_MODE 활성화 여부 검증
   const env = readEnvFile();
   if (env.STORAGE_MODE !== 'true') {
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '스토리지 모드 비활성 거절', target: pathname, status: 403 });
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '스토리지 모드 비활성 거절',
+      target: pathname,
+      status: 403,
+      method: req.method,
+      origin: safeOrigin
+    });
     sendJsonResponse(req, res, 403, { error: 'STORAGE_MODE_DISABLED: 개인 서버 저장소 모드가 비활성화되어 있습니다.' });
     return true;
   }
@@ -108,6 +168,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
   const providedApiKey = extractApiKey(req, reqUrl);
   const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+  const authState = getAuthDiagnosticState(req, reqUrl);
 
   // 🌟 [핵심 개선] 관리자 웹 제어 센터 세션 쿠키가 유효한 경우 즉시 Root Admin 권한 부여!
   if (isAuthenticated(req)) {
@@ -136,7 +197,11 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
             action: '🚫 차단된 기기 접근 차단',
             target: `${deviceName || deviceId} (${auth.user.memo})`,
             status: 403,
-            user: authenticatedUserMemo
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
           });
           sendJsonResponse(req, res, 403, { error: 'DEVICE_BLOCKED: 관리자에 의해 차단된 기기입니다.', deviceId });
           return true;
@@ -149,7 +214,11 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
             action: '🚫 기기 등록 한도 초과',
             target: `${deviceName || deviceId} (${deviceResult.maxDevices || 6}대 한도 초과)`,
             status: 403,
-            user: authenticatedUserMemo
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
           });
           sendJsonResponse(req, res, 403, {
             error: `DEVICE_LIMIT_EXCEEDED: 허용된 최대 등록 기기 수(${deviceResult.maxDevices || 6}대)를 초과했습니다.`,
@@ -165,7 +234,11 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
             action: '🚫 미등록/삭제된 기기 차단',
             target: `${deviceName || deviceId} (${auth.user.memo})`,
             status: 403,
-            user: authenticatedUserMemo
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
           });
           sendJsonResponse(req, res, 403, {
             error: 'DEVICE_UNREGISTERED: 등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.',
@@ -177,28 +250,94 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
 
       auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
     } else if (auth.reason === 'API_KEY_EXPIRED') {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '만료된 API 키 차단', target: pathname, status: 401 });
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '만료된 API 키 차단',
+        target: pathname,
+        status: 401,
+        method: req.method,
+        deviceId,
+        deviceName,
+        origin: safeOrigin,
+        authState
+      });
       sendJsonResponse(req, res, 401, { error: 'API_KEY_EXPIRED: 사용 기간이 종료된 키입니다.' });
       return true;
     } else if (auth.reason === 'API_KEY_REVOKED') {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '폐기된 API 키 차단', target: pathname, status: 401 });
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '폐기된 API 키 차단',
+        target: pathname,
+        status: 401,
+        method: req.method,
+        deviceId,
+        deviceName,
+        origin: safeOrigin,
+        authState
+      });
       sendJsonResponse(req, res, 401, { error: 'API_KEY_REVOKED: 폐기된 API 키입니다.' });
       return true;
     } else if (isEnforceApiKey) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'API 키 인증 실패 차단', target: pathname, status: 401 });
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: 'API 키 인증 실패 차단',
+        target: pathname,
+        status: 401,
+        method: req.method,
+        deviceId,
+        deviceName,
+        origin: safeOrigin,
+        authState
+      });
       sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
       return true;
     } else if (!isAllowedClientOrigin(req)) {
-      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: '비인가 출처 차단',
+        target: pathname,
+        status: 403,
+        method: req.method,
+        deviceId,
+        deviceName,
+        origin: safeOrigin,
+        authState
+      });
       sendJsonResponse(req, res, 403, { error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인 접근입니다.' });
       return true;
     }
   } else if (isEnforceApiKey) {
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: 'API 키 누락 차단', target: pathname, status: 401 });
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: 'API 키 누락 차단',
+      target: pathname,
+      status: 401,
+      method: req.method,
+      deviceId,
+      deviceName,
+      origin: safeOrigin,
+      authState
+    });
     sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: X-API-KEY 헤더가 누락되었습니다.' });
     return true;
   } else if (!isAllowedClientOrigin(req)) {
-    auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '비인가 출처 차단', target: pathname, status: 403 });
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '비인가 출처 차단',
+      target: pathname,
+      status: 403,
+      method: req.method,
+      deviceId,
+      deviceName,
+      origin: safeOrigin,
+      authState
+    });
     sendJsonResponse(req, res, 403, { error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인 접근입니다.' });
     return true;
   }
