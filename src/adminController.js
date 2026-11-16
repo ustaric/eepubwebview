@@ -148,6 +148,13 @@ export function destroyAdminSession(token) {
 
 /**
  * 🌟 [관리자 라우트 전담 통합 디스패처]
+ * 관리자 로그인/로그아웃, 제어 센터 HTML 렌더링, 사용자·기기·로그·크래시 리포트·설정 저장 요청을 처리합니다.
+ * @param {import('http').IncomingMessage} req - HTTP 요청 객체
+ * @param {import('http').ServerResponse} res - HTTP 응답 객체
+ * @param {string} pathname - 정규화된 요청 경로
+ * @param {string} clientIp - 클라이언트 IP 주소
+ * @param {string} userAgent - 요청 User-Agent 헤더
+ * @returns {Promise<boolean>} 라우트 처리 완료 여부
  */
 export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) {
   // 1. 관리자 로그인 처리 (POST /admin/login)
@@ -165,48 +172,58 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const inputPass = params.get('password')?.trim() || '';
-      const env = readEnvFile();
-      const currentPass = env.ADMIN_PASSWORD;
+      try {
+        const params = new URLSearchParams(body);
+        const inputPass = params.get('password')?.trim() || '';
+        const env = readEnvFile();
+        const currentPass = env.ADMIN_PASSWORD;
 
-      if (!currentPass || currentPass.trim() === '') {
-        if (!inputPass) {
-          const html = renderLoginPageHtml('비밀번호를 입력해 주세요.', true);
-          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(html);
+        if (!currentPass || currentPass.trim() === '') {
+          if (!inputPass) {
+            const html = renderLoginPageHtml('비밀번호를 입력해 주세요.', true);
+            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(html);
+            return;
+          }
+
+          writeEnvFile({ ADMIN_PASSWORD: inputPass });
+          clearLoginFailure(clientIp);
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200, user: 'Root Admin' });
+
+          const sessionToken = createAdminSession();
+          res.writeHead(302, {
+            'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
+            'Location': '/admin'
+          });
+          res.end();
           return;
         }
 
-        writeEnvFile({ ADMIN_PASSWORD: inputPass });
-        clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 비밀번호 설정', target: '최초 등록', status: 200, user: 'Root Admin' });
-
-        const sessionToken = createAdminSession();
-        res.writeHead(302, {
-          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
-          'Location': '/admin'
-        });
-        res.end();
-        return;
-      }
-
-      if (inputPass === currentPass) {
-        clearLoginFailure(clientIp);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200, user: 'Root Admin' });
-        const sessionToken = createAdminSession();
-        res.writeHead(302, {
-          'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
-          'Location': '/admin'
-        });
-        res.end();
-      } else {
-        recordLoginFailure(clientIp);
-        const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
-        auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401, user: 'Root Admin' });
-        const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
+        if (inputPass === currentPass) {
+          clearLoginFailure(clientIp);
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 성공', target: '대시보드 진입', status: 200, user: 'Root Admin' });
+          const sessionToken = createAdminSession();
+          res.writeHead(302, {
+            'Set-Cookie': `admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`,
+            'Location': '/admin'
+          });
+          res.end();
+        } else {
+          recordLoginFailure(clientIp);
+          const remaining = 5 - (loginAttemptMap.get(clientIp)?.failCount || 0);
+          console.warn(`🔒 [AuthTrace:AdminLogin] 비번 오류 | 호출자: [POST /admin/login] | IP: ${clientIp} | 남은시도: ${Math.max(0, remaining)} | auditLogger 401 기록 전달`);
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '관리자 로그인 실패', target: `비번 오류 (남은시도: ${Math.max(0, remaining)})`, status: 401, user: 'Root Admin' });
+          const html = renderLoginPageHtml(`비밀번호가 올바르지 않습니다. (남은 시도: ${Math.max(0, remaining)}회)`, false);
+          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
+      } catch (err) {
+        console.error('❌ [AdminController:LoginError] 로그인 처리 중 예외 발생:', err);
+        if (!res.headersSent && !res.writableEnded) {
+          const html = renderLoginPageHtml('로그인 처리 중 서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.', false);
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+        }
       }
     });
     return true;
@@ -232,13 +249,23 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
 
     if (!isAuthenticated(req)) {
       const html = renderLoginPageHtml(null, isInitialSetup);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      });
       res.end(html);
       return true;
     }
 
     const html = renderAdminSettingsHtml(req);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
     res.end(html);
     return true;
   }

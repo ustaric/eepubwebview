@@ -36,6 +36,9 @@ const USERS_DIR = path.resolve(ROOT_DIR, 'data/users');
 // 최대 보관 메모리 로그 건수 (대시보드 실시간용)
 const MAX_LOGS_LIMIT = 30;
 
+// ⏱️ 반복 발생 기반 Discord 알림 임계치 추적 맵 (key -> { count, expiresAt })
+const repeatAlertMap = new Map();
+
 /**
  * 🇰🇷 주어진 시각을 한국 표준시(Asia/Seoul) 기준 연/월/일/시분초 문자열로 변환합니다.
  * @param {Date|number} [input=new Date()]
@@ -121,6 +124,39 @@ let lastApiKeyUsage = null;
 let cachedStorageMetrics = null;
 let lastMetricsCalculatedAt = 0;
 const METRICS_CACHE_TTL_MS = 60 * 1000;
+
+/**
+ * ⏱️ 지정된 시간 창 내에 동일 이벤트가 최소 횟수(minCount) 이상 반복되었는지 판별합니다.
+ * @param {string} alertKey - 반복 카운트 식별 키 (status:target:ip)
+ * @param {number} windowMs - 집계 시간 창(ms)
+ * @param {number} minCount - 알림 발송 최소 누적 횟수
+ * @returns {boolean} Discord 알림 발송 임계치 도달 여부
+ */
+function checkRepeatAlertThreshold(alertKey, windowMs, minCount) {
+  const threshold = Number(minCount) || 1;
+  if (threshold <= 1) return true;
+
+  const now = Date.now();
+  const safeWindowMs = Math.max(1000, Number(windowMs) || 60000);
+
+  if (repeatAlertMap.size > 200) {
+    for (const [k, v] of repeatAlertMap.entries()) {
+      if (now > v.expiresAt) {
+        repeatAlertMap.delete(k);
+      }
+    }
+  }
+
+  let record = repeatAlertMap.get(alertKey);
+  if (!record || now > record.expiresAt) {
+    record = { count: 1, expiresAt: now + safeWindowMs };
+  } else {
+    record.count += 1;
+  }
+
+  repeatAlertMap.set(alertKey, record);
+  return record.count >= threshold;
+}
 
 /**
  * User-Agent 헤더를 분석하여 한눈에 알아보기 쉬운 기기/브라우저 명칭으로 압축 정규화
@@ -255,10 +291,10 @@ export const auditLogger = {
   },
 
   /**
-   * 새로운 서버 접근 및 동기화 활동 1건을 기록 (한국 표준시 KST 기준)
+   * 새로운 서버 접근 및 동기화 활동 1건을 기록합니다. (한국 표준시 KST 기준)
    * - RAM 링 버퍼: 최근 30건 전체 보관 (정상+차단 종합 관제)
    * - 디스크: status >= 400만 선별 영구 저장
-   * - 디스코드: DISCORD_ALERT_TYPES 설정에 부합하는 이벤트 실시간 발송 (1KB 분기 탑재)
+   * - 디스코드: DISCORD_ALERT_TYPES 설정에 부합하는 이벤트 실시간 발송 (alertMinCount 반복 임계치 지원)
    * @param {Object} params
    * @param {string} params.ip - 접속 IP
    * @param {string} [params.userAgent=""] - 요청 User-Agent
@@ -271,6 +307,9 @@ export const auditLogger = {
    * @param {string} [params.deviceName=""] - 클라이언트 X-Device-Name
    * @param {string} [params.origin=""] - 요청 Origin/Referer
    * @param {string} [params.authState=""] - 인증 헤더 진단 상태 태그
+   * @param {number} [params.alertMinCount=1] - Discord 알림 발송을 위한 동일 IP·대상 최소 반복 횟수
+   * @param {number} [params.alertWindowMs=60000] - 반복 횟수 집계 시간 창(ms)
+   * @returns {void}
    */
   recordAccessLog({
     ip,
@@ -283,7 +322,9 @@ export const auditLogger = {
     deviceId = "",
     deviceName = "",
     origin = "",
-    authState = ""
+    authState = "",
+    alertMinCount = 1,
+    alertWindowMs = 60000
   }) {
     const { timeStr, dateStr } = getKstDateParts();
 
@@ -337,14 +378,24 @@ export const auditLogger = {
         }
 
         if (shouldAlert) {
-          systemMonitor.sendSecurityAlert({
-            path: sanitizedAction,
-            error: sanitizedTarget,
-            user: user || 'Root Admin',
-            status: statusCode,
-            ip: ip || '127.0.0.1',
-            detailData: entry
-          }).catch(() => {});
+          const repeatKey = `${statusCode}:${sanitizedTarget}:${ip || '127.0.0.1'}`;
+          const isThresholdMet = checkRepeatAlertThreshold(repeatKey, alertWindowMs, alertMinCount);
+
+          if (isThresholdMet) {
+            if (alertMinCount > 1) {
+              console.warn(`🚨 [AuditTrace:AlertEscalated] 반복 임계치 도달 | key: ${repeatKey} | minCount: ${alertMinCount} | Discord 알림 발송`);
+            }
+            systemMonitor.sendSecurityAlert({
+              path: sanitizedAction,
+              error: sanitizedTarget,
+              user: user || 'Root Admin',
+              status: statusCode,
+              ip: ip || '127.0.0.1',
+              detailData: entry
+            }).catch(() => {});
+          } else {
+            console.log(`ℹ️ [AuditTrace:AlertSuppressed] 단발성 이벤트 알림 보류 | key: ${repeatKey} | minCount: ${alertMinCount} | 기록은 정상 저장`);
+          }
         }
       }
     }
