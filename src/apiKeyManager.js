@@ -3,7 +3,7 @@
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기, 기기별 비밀 토큰(deviceToken) 바인딩 및 6자리 단기 OTP 관리 엔진
  * - 🛡️ [2중 기기 위조 원천 방어] 유효 API 키 + X-Device-Id + 기기별 X-Device-Token(SHA-256 해시 + timingSafeEqual) 다중 바인딩 검증
  * - 🧬 [프로토타입 오염 방어] __proto__/constructor 등 금지 deviceId 차단 및 Object.hasOwn 안전 조회 적용
- * - 📱 [최초 1호기 명시 등록] 등록 기기 0대 상태에서만 registerOrVerifyDevice를 통해 마스터 deviceToken 발급 (GET /api/health 자동 발급 차단)
+ * - 📱 [최초 1호기 명시 등록 & 재발급 복구] 0대 상태 또는 재발급 PENDING 상태에서 새 마스터 deviceToken 정상 발급 (Deadlock 원천 차단)
  * - 🔢 [6자리 OTP 기기 토큰 발급·갱신] verifyAndExchangeDeviceOtp 성공 시 게스트 기기를 승인 장부에 등록하고 새 deviceToken 발급
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
  * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
@@ -13,7 +13,7 @@
  * - ⏳ [24시간 활성화 윈도우 & 재발급 서재 보호] 신규 미사용 키만 고아 폴더 회수, 재발급·기존 데이터 보유 서재는 EXPIRED 전환 후 도서 보존
  * - 🟢 [원터치 활성화] 발급 후 24시간 내 최초 1회 인증 성공 시 ACTIVE 상태로 자동 영구 활성화
  * - 📁 [사용자 샌드박스 골격 자동 생성] user_xxxx 채번 시 books/, settings/, archive/ 디렉터리 즉시 준비
- * - 🔄 [무손실 재발급] 키 분실 시 기존 도서/설정/기기 100% 보존 상태로 새 API 키만 교체 발급
+ * - 🔄 [무손실 재발급 & 기기 슬롯 클린 리셋] 키 분실 시 도서/설정/진행률 100% 보존 상태로 기기 슬롯을 초기화하여 첫 기기 즉시 연결 지원
  * - 🛡️ [원자적 메타데이터 저장 & 쓰기 스로틀링] .tmp 쓰기 후 renameSync 교체 + 인메모리 캐시/60초 Flush로 디스크 I/O 병목 완화
  */
 
@@ -596,8 +596,9 @@ export const apiKeyManager = {
 
   /**
    * 🔑 [POST /api/auth/device/register 전용]
-   * - 등록 기기가 0대인 최초 상태: 1번째 마스터 기기로 등록하고 새 `deviceToken`을 발급합니다.
-   * - 이미 기기가 1대 이상 등록된 상태: 동일 `deviceId` + 유효한 `deviceToken`을 가진 기기만 통과시키며, 미등록·토큰불일치·차단 기기는 모두 거부합니다.
+   * - 등록 기기가 0대인 최초 상태이거나, 관리자에 의해 키가 재발급된 직후(PENDING & isReissued) 상태:
+   *   1번째 마스터 기기로 등록하고 새 `deviceToken`을 발급합니다.
+   * - 이미 기기가 1대 이상 등록된 일반 ACTIVE 상태: 동일 `deviceId` + 유효한 `deviceToken`을 가진 기기만 통과시킵니다.
    * @param {string} folderName 
    * @param {Object} [params={}] 
    * @returns {{ allowed: boolean, newlyRegistered?: boolean, deviceToken?: string|null, reason?: string, message?: string, device?: DeviceRecord|null }}
@@ -628,8 +629,29 @@ export const apiKeyManager = {
     const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
     const now = new Date().toISOString();
     const existingDevice = Object.hasOwn(user.devices, cleanDeviceId) ? user.devices[cleanDeviceId] : null;
+    const isReissuedPending = user.status === 'PENDING' && Boolean(user.isReissued);
 
-    // 1. 이미 등록된 기기인 경우: 반드시 기존 tokenHash와 일치하는 X-Device-Token이 있어야 통과
+    // 🌟 [핵심 개선] 재발급 직후(PENDING & isReissued)인 경우 기존 옛 tokenHash 잠금을 해제하고 새 deviceToken으로 재등록 허용
+    if (existingDevice && isReissuedPending) {
+      if (existingDevice.status === 'blocked') {
+        return { allowed: false, reason: 'DEVICE_BLOCKED', device: existingDevice };
+      }
+      const issuedDeviceToken = generateDeviceToken();
+      const tokenHash = hashApiKey(issuedDeviceToken);
+
+      existingDevice.tokenHash = tokenHash;
+      existingDevice.lastSeen = now;
+      existingDevice.lastIp = cleanIp;
+      if (cleanDeviceName && cleanDeviceName !== '웹 리더 기기') {
+        existingDevice.deviceName = cleanDeviceName;
+      }
+
+      writeJsonAtomic(API_KEYS_FILE, list);
+      console.log(`🔄 [ApiKeyManager:ReissuedMasterSync] 재발급 키 마스터 기기 토큰 재등록 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
+      return { allowed: true, newlyRegistered: true, deviceToken: issuedDeviceToken, device: existingDevice };
+    }
+
+    // 1. 이미 등록된 일반 ACTIVE 기기인 경우: 반드시 기존 tokenHash와 일치하는 X-Device-Token이 있어야 통과
     if (existingDevice) {
       if (existingDevice.status === 'blocked') {
         return { allowed: false, reason: 'DEVICE_BLOCKED', device: existingDevice };
@@ -638,7 +660,7 @@ export const apiKeyManager = {
         return {
           allowed: false,
           reason: 'DEVICE_TOKEN_REQUIRED',
-          message: '보안 기기 토큰이 필요합니다. 6자리 연결 번호로 로그인하거나 관리자 페이지에서 기존 기기 슬롯을 삭제한 뒤 다시 연결해 주세요.'
+          message: '보안 기기 토큰이 필요합니다. 6자리 연결 번호로 로그인하거나 관리자 페이지에서 기기를 재발급해 주세요.'
         };
       }
       const providedHash = hashApiKey(deviceToken);
@@ -661,8 +683,8 @@ export const apiKeyManager = {
 
     const currentDeviceCount = Object.keys(user.devices).length;
 
-    // 2. 최초 0대 상태일 때만 1호기(Master) 등록 및 비밀 토큰 발급 허용
-    if (currentDeviceCount === 0) {
+    // 2. 최초 0대 상태이거나 재발급 직후일 때 1호기(Master) 등록 및 비밀 토큰 발급 허용
+    if (currentDeviceCount === 0 || isReissuedPending) {
       const issuedDeviceToken = generateDeviceToken();
       const tokenHash = hashApiKey(issuedDeviceToken);
       const newDevice = {
@@ -680,7 +702,7 @@ export const apiKeyManager = {
       return { allowed: true, newlyRegistered: true, deviceToken: issuedDeviceToken, device: newDevice };
     }
 
-    // 3. 이미 1대 이상 등록된 상태에서 미등록 기기는 자동 등록 불가
+    // 3. 이미 1대 이상 등록된 상태에서 미등록 기기는 자동 등록 불가 (6자리 번호 필요)
     return {
       allowed: false,
       reason: 'DEVICE_UNREGISTERED',
@@ -690,17 +712,8 @@ export const apiKeyManager = {
 
   /**
    * 접속 기기의 유효성과 기기별 비밀 토큰(X-Device-Token) 일치 여부를 엄격 검증합니다.
-   * - `deviceId` 누락/위조 키: `DEVICE_ID_REQUIRED`
-   * - 등록 기기 0대 상태: `MASTER_DEVICE_REGISTRATION_REQUIRED` (GET 요청에서 비밀 토큰 자동 발급 차단)
-   * - 등록 기기 `tokenHash` 부재 또는 `X-Device-Token` 누락: `DEVICE_TOKEN_REQUIRED`
-   * - `X-Device-Token` 해시 불일치: `DEVICE_TOKEN_INVALID`
-   * - 미등록 기기(1대 이상 존재): `DEVICE_UNREGISTERED`
    * @param {string} folderName 
    * @param {Object} [params={}] 
-   * @param {string} [params.deviceId]
-   * @param {string} [params.deviceName]
-   * @param {string} [params.deviceToken]
-   * @param {string} [params.clientIp]
    * @returns {{ allowed: boolean, reason?: string, message?: string, device?: DeviceRecord|null }}
    */
   verifyAndTouchDevice(folderName, { deviceId, deviceName = '', deviceToken = '', clientIp = '' } = {}) {
@@ -781,8 +794,8 @@ export const apiKeyManager = {
 
     const currentDeviceCount = Object.keys(user.devices).length;
 
-    // 2. 등록 기기가 0대인 최초 상태: 명시적 POST /api/auth/device/register를 통해 마스터 등록 유도
-    if (currentDeviceCount === 0) {
+    // 2. 등록 기기가 0대인 최초 상태 또는 재발급 직후 상태: 마스터 기기 등록 유도
+    if (currentDeviceCount === 0 || (user.status === 'PENDING' && user.isReissued)) {
       return {
         allowed: false,
         reason: 'MASTER_DEVICE_REGISTRATION_REQUIRED',
@@ -887,6 +900,13 @@ export const apiKeyManager = {
     return { success: true, folderName, maxDevices: validLimit, memo: list[index].memo };
   },
 
+  /**
+   * 🔄 [API 키 재발급]
+   * - 도서 파일, 보관함, 전역 설정, 독서 진행률은 100% 무손실 보존합니다.
+   * - 구버전 키로 묶여있던 `devices` 목록을 초기화(`devices = {}`)하여,
+   *   재발급된 키를 입력한 첫 번째 기기가 Deadlock 없이 즉시 새 마스터 기기로 등록될 수 있도록 합니다.
+   * @param {string} folderName 
+   */
   reissueApiKey(folderName = '') {
     if (!folderName) return { success: false, error: '폴더명이 지정되지 않았습니다.' };
 
@@ -908,9 +928,10 @@ export const apiKeyManager = {
     list[index].expiresAt = expiresAt;
     list[index].activatedAt = null;
     list[index].isReissued = true;
+    list[index].devices = {}; // 🌟 기기 슬롯 클린 리셋 ➔ 새 키 첫 기기 즉시 연결 허용
 
     writeJsonAtomic(API_KEYS_FILE, list);
-    console.log(`🔄 [ApiKeyManager:Reissued] API 키 재발급 완료 (폴더 보존): '${folderName}' ➔ 새 만료기한: ${expiresAt}`);
+    console.log(`🔄 [ApiKeyManager:Reissued] API 키 재발급 및 기기 슬롯 리셋 완료 (도서/설정 보존): '${folderName}' ➔ 새 만료기한: ${expiresAt}`);
 
     return {
       success: true,
@@ -976,8 +997,6 @@ export const apiKeyManager = {
 
   /**
    * 🧹 24시간 활성화 기한이 지난 PENDING 계정을 정리합니다.
-   * - 최초 발급 후 1번도 사용하지 않은 빈 고아 폴더만 삭제 회수합니다.
-   * - 재발급(isReissued) 계정, 기존 등록 기기 또는 저장 파일이 존재하는 서재는 폴더를 삭제하지 않고 EXPIRED 상태로 전환해 데이터를 보존합니다.
    */
   cleanupExpiredPendingKeys() {
     const list = readApiKeysData();
