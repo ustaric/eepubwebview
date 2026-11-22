@@ -1,7 +1,7 @@
 /**
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
- * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, X-Device-Token 포함 경량 검증 및 미인증/비승인 시 userRole·경로 비노출
+ * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, X-Device-Token 포함 경량 검증 및 needsDeviceRegistration 플래그 제공
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
  * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장 (관리자 세션 필수)
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
@@ -50,6 +50,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     let authReason = null;
     let deviceAuthorized = null;
     let deviceReason = null;
+    let needsDeviceRegistration = false;
     let userRole = null;
 
     if (providedApiKey !== null) {
@@ -80,6 +81,11 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
             });
             deviceAuthorized = Boolean(deviceResult.allowed);
             deviceReason = deviceResult.allowed ? null : (deviceResult.reason || 'DEVICE_UNAUTHORIZED');
+
+            // 🌟 등록 기기 0대이거나 재발급 직후라 마스터 등록이 필요한 상태임을 명시 전달
+            if (deviceResult.reason === 'MASTER_DEVICE_REGISTRATION_REQUIRED') {
+              needsDeviceRegistration = true;
+            }
 
             if (deviceResult.allowed) {
               isAuthorizedHealth = true;
@@ -113,6 +119,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       authReason,
       deviceAuthorized,
       deviceReason,
+      needsDeviceRegistration,
       userRole: isAuthorizedHealth ? userRole : null,
       timestamp: new Date().toISOString()
     });
