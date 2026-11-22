@@ -1,10 +1,10 @@
 /**
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
- * - 🔑 [지능형 관리자 쿠키 & 듀얼 API 키 검증] 관리자 웹 세션(admin_session) 및 Root/User API 키 완벽 동시 지원
- * - 🚫 [미등록/삭제 기기 403 즉시 차단] 장부에서 삭제된 기기의 임의 재접속 원천 거부 및 6자리 번호 재로그인 요구
+ * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 미제공 시 관리자 웹 세션(admin_session) 지원
+ * - 🚫 [미등록/삭제/식별자누락 기기 403 즉시 차단] 장부에서 삭제된 기기 및 X-Device-Id 누락 요청 원천 거부
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
- * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
+ * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp(GET/HEAD) 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
  * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
  * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
@@ -158,7 +158,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 3. 관리자 쿠키 세션 & API 키 인증 및 사용자/기기 화이트리스트 가드
+  // 3. API 키 우선 인증 및 관리자 쿠키 세션·기기 화이트리스트 가드
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
   let authenticatedUserMemo = 'Root Admin';
@@ -169,26 +169,44 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   const providedApiKey = extractApiKey(req, reqUrl);
   const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
   const authState = getAuthDiagnosticState(req, reqUrl);
+  const isAdminConfigRoute = pathname === '/api/storage/admin/shared-folders';
+  const hasAdminSession = isAuthenticated(req);
 
-  // 🌟 [핵심 개선] 관리자 웹 제어 센터 세션 쿠키가 유효한 경우 즉시 Root Admin 권한 부여!
-  if (isAuthenticated(req)) {
+  if (isAdminConfigRoute && hasAdminSession) {
     isRootAdmin = true;
     targetUserFolder = null;
     authenticatedUserMemo = 'Root Admin (Web Session)';
-  } else if (rootMasterKey && providedApiKey && providedApiKey === rootMasterKey) {
-    targetUserFolder = null;
-    authenticatedUserMemo = 'Root Admin';
-    isRootAdmin = true;
-    auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
   } else if (providedApiKey) {
-    const auth = apiKeyManager.authenticateApiKey(providedApiKey);
-    if (auth.authenticated && auth.user) {
-      targetUserFolder = auth.user.folderName;
-      userQuotaBytes = auth.user.storageQuotaBytes || (1024 * 1024 * 1024);
-      authenticatedUserMemo = `${auth.user.memo} (${auth.user.folderName})`;
+    if (rootMasterKey && providedApiKey === rootMasterKey) {
+      targetUserFolder = null;
+      authenticatedUserMemo = 'Root Admin';
+      isRootAdmin = true;
+      auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
+    } else {
+      const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
+      if (auth.authenticated && auth.user) {
+        targetUserFolder = auth.user.folderName;
+        userQuotaBytes = auth.user.storageQuotaBytes || (1024 * 1024 * 1024);
+        authenticatedUserMemo = `${auth.user.memo} (${auth.user.folderName})`;
 
-      if (deviceId) {
         const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
+
+        if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_ID_REQUIRED') {
+          auditLogger.recordAccessLog({
+            ip: clientIp,
+            userAgent,
+            action: '🚫 기기 식별자 누락 차단',
+            target: `${pathname} (${auth.user.memo})`,
+            status: 403,
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
+          });
+          sendJsonResponse(req, res, 403, { error: 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.' });
+          return true;
+        }
 
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_BLOCKED') {
           auditLogger.recordAccessLog({
@@ -246,70 +264,60 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
           });
           return true;
         }
-      }
 
-      auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
-    } else if (auth.reason === 'API_KEY_EXPIRED') {
-      auditLogger.recordAccessLog({
-        ip: clientIp,
-        userAgent,
-        action: '만료된 API 키 차단',
-        target: pathname,
-        status: 401,
-        method: req.method,
-        deviceId,
-        deviceName,
-        origin: safeOrigin,
-        authState
-      });
-      sendJsonResponse(req, res, 401, { error: 'API_KEY_EXPIRED: 사용 기간이 종료된 키입니다.' });
-      return true;
-    } else if (auth.reason === 'API_KEY_REVOKED') {
-      auditLogger.recordAccessLog({
-        ip: clientIp,
-        userAgent,
-        action: '폐기된 API 키 차단',
-        target: pathname,
-        status: 401,
-        method: req.method,
-        deviceId,
-        deviceName,
-        origin: safeOrigin,
-        authState
-      });
-      sendJsonResponse(req, res, 401, { error: 'API_KEY_REVOKED: 폐기된 API 키입니다.' });
-      return true;
-    } else if (isEnforceApiKey) {
-      auditLogger.recordAccessLog({
-        ip: clientIp,
-        userAgent,
-        action: 'API 키 인증 실패 차단',
-        target: pathname,
-        status: 401,
-        method: req.method,
-        deviceId,
-        deviceName,
-        origin: safeOrigin,
-        authState
-      });
-      sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
-      return true;
-    } else if (!isAllowedClientOrigin(req)) {
-      auditLogger.recordAccessLog({
-        ip: clientIp,
-        userAgent,
-        action: '비인가 출처 차단',
-        target: pathname,
-        status: 403,
-        method: req.method,
-        deviceId,
-        deviceName,
-        origin: safeOrigin,
-        authState
-      });
-      sendJsonResponse(req, res, 403, { error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인 접근입니다.' });
-      return true;
+        auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
+      } else if (auth.reason === 'API_KEY_EXPIRED') {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '만료된 API 키 차단',
+          target: pathname,
+          status: 401,
+          method: req.method,
+          deviceId,
+          deviceName,
+          origin: safeOrigin,
+          authState
+        });
+        sendJsonResponse(req, res, 401, { error: 'API_KEY_EXPIRED: 사용 기간이 종료된 키입니다.' });
+        return true;
+      } else if (auth.reason === 'API_KEY_REVOKED') {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '폐기된 API 키 차단',
+          target: pathname,
+          status: 401,
+          method: req.method,
+          deviceId,
+          deviceName,
+          origin: safeOrigin,
+          authState
+        });
+        sendJsonResponse(req, res, 401, { error: 'API_KEY_REVOKED: 폐기된 API 키입니다.' });
+        return true;
+      } else {
+        // 명시적으로 전달된 API 키가 무효인 경우 ENFORCE_STORAGE_API_KEY 여부와 무관하게 Root 우회를 차단하고 401 응답
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: 'API 키 인증 실패 차단',
+          target: pathname,
+          status: 401,
+          method: req.method,
+          deviceId,
+          deviceName,
+          origin: safeOrigin,
+          authState
+        });
+        sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
+        return true;
+      }
     }
+  } else if (hasAdminSession) {
+    isRootAdmin = true;
+    targetUserFolder = null;
+    authenticatedUserMemo = 'Root Admin (Web Session)';
   } else if (isEnforceApiKey) {
     auditLogger.recordAccessLog({
       ip: clientIp,
@@ -681,7 +689,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     setCorsHeaders(req, res);
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Content-Length': fileInfo.size,
+      'Content-Length': infoSizeFallback(fileInfo.size),
       'Content-Disposition': `attachment; filename="${encodeURIComponent(fileInfo.fileName)}"`
     });
     fs.createReadStream(fileInfo.filePath).pipe(res);
@@ -716,10 +724,16 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     const isBooksFolderOnlyCheck = decodedEnd.toLowerCase().endsWith('.json');
     const bookId = decodedEnd.replace(/\.json$/i, '');
 
-    if (rawEnd.endsWith('.webp')) {
+    if (rawEnd.endsWith('.webp') && (req.method === 'GET' || req.method === 'HEAD')) {
       const coverFileName = decodeURIComponent(rawEnd);
       const info = storageService.getCoverImagePath(coverFileName, targetUserFolder);
       if (!info) {
+        if (req.method === 'HEAD') {
+          setCorsHeaders(req, res);
+          res.writeHead(404);
+          res.end();
+          return true;
+        }
         sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
         return true;
       }
@@ -900,6 +914,12 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     if (req.method === 'GET' || req.method === 'HEAD') {
       const info = storageService.getCoverImagePath(fileName, targetUserFolder);
       if (!info) {
+        if (req.method === 'HEAD') {
+          setCorsHeaders(req, res);
+          res.writeHead(404);
+          res.end();
+          return true;
+        }
         sendJsonResponse(req, res, 404, { error: '표지를 찾을 수 없습니다.' });
         return true;
       }
@@ -959,4 +979,13 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   }
 
   return false;
+}
+
+/**
+ * 파일 크기 헤더용 안전 변환 헬퍼
+ * @param {number} size 
+ * @returns {number}
+ */
+function infoSizeFallback(size) {
+  return Number.isFinite(size) && size >= 0 ? size : 0;
 }

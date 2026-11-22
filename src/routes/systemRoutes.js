@@ -1,7 +1,7 @@
 /**
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
- * - 🩺 [서버 헬스체크] GET /api/health 스토리지 상태, 토큰 보유 및 API 키 검증
+ * - 🩺 [서버 헬스체크 & 경량 키·기기 검증] GET /api/health 스토리지 상태, 토큰 보유 및 API 키·기기 승인 결과 반환
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
  * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장 (관리자 세션 필수)
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
@@ -31,28 +31,59 @@ import {
  * @returns {Promise<boolean>} 라우트 처리 여부
  */
 export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
-  // 1. 서버 헬스체크
+  // 1. 서버 헬스체크 및 경량 API 키·기기 검증
   if (req.method === 'GET' && pathname === '/api/health') {
     const env = readEnvFile();
     const providedApiKey = extractApiKey(req, reqUrl);
     const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
-    let isAuthorizedHealth = isAuthenticated(req);
+    const hasAdminSession = isAuthenticated(req);
+
+    let isAuthorizedHealth = false;
+    let apiKeyValid = null;
+    let authReason = null;
+    let deviceAuthorized = null;
+    let deviceReason = null;
+    let userRole = null;
 
     if (providedApiKey) {
       const rootMasterKey = env.STORAGE_API_KEY?.trim();
       if (rootMasterKey && providedApiKey === rootMasterKey) {
         isAuthorizedHealth = true;
+        apiKeyValid = true;
+        authReason = 'ROOT_KEY';
+        deviceAuthorized = true;
+        userRole = 'root';
         auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
       } else {
-        const auth = apiKeyManager.authenticateApiKey(providedApiKey);
+        const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
         if (auth.authenticated && auth.user) {
-          isAuthorizedHealth = true;
-          auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
-          if (deviceId) {
-            apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
+          apiKeyValid = true;
+          authReason = 'VALID';
+          userRole = auth.user.role || 'user';
+
+          const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
+            deviceId,
+            deviceName,
+            clientIp
+          });
+          deviceAuthorized = Boolean(deviceResult.allowed);
+          deviceReason = deviceResult.allowed ? null : (deviceResult.reason || 'DEVICE_UNAUTHORIZED');
+
+          if (deviceResult.allowed) {
+            isAuthorizedHealth = true;
+            auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
           }
+        } else {
+          apiKeyValid = false;
+          authReason = auth.reason || 'API_KEY_NOT_FOUND';
         }
       }
+    } else if (hasAdminSession) {
+      isAuthorizedHealth = true;
+      apiKeyValid = true;
+      authReason = 'ADMIN_SESSION';
+      deviceAuthorized = true;
+      userRole = 'admin';
     }
 
     sendJsonResponse(req, res, 200, {
@@ -64,6 +95,11 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       sharedBooksDir: isAuthorizedHealth ? (env.SHARED_BOOKS_DIR || null) : null,
       hasStorageApiKey: Boolean(env.STORAGE_API_KEY),
       enforceApiKey: env.ENFORCE_STORAGE_API_KEY === 'true',
+      apiKeyValid,
+      authReason,
+      deviceAuthorized,
+      deviceReason,
+      userRole,
       timestamp: new Date().toISOString()
     });
     return true;

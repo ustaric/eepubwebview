@@ -1,7 +1,7 @@
 /**
  * @file src/apiKeyManager.js
  * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 6자리 단기 기기 연결 OTP 관리 엔진
- * - 🛡️ [2단계 화이트리스트 기기 거버넌스] 유효 API 키 + 서버 정식 승인 기기 2중 검증 (삭제/미승인 기기 자동 재등록 원천 차단)
+ * - 🛡️ [2단계 화이트리스트 기기 거버넌스] 유효 API 키 + 서버 정식 승인 기기 2중 검증 (삭제/미승인 기기 자동 재등록 및 deviceId 누락 우회 원천 차단)
  * - 📱 [최초 기기 마스터 자동 안착] 등록 기기가 0대인 최초 상태에서만 1번째 기기로 자동 등록 허용
  * - 🔢 [6자리 OTP 정식 기기 등록 결속] verifyAndExchangeDeviceOtp 성공 시점에만 게스트 기기를 정식 장부에 등록 (슬롯 6대 한도, 폐기키/차단기기 방어)
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
@@ -311,9 +311,10 @@ export const apiKeyManager = {
   /**
    * 🛡️ [API 키 인증 및 24시간 활성화 상태 전이]
    * @param {string} rawKey - 클라이언트가 전달한 원문 API 키
+   * @param {{ activatePending?: boolean }} [options={}] - PENDING 키의 즉시 ACTIVE 전이 여부
    * @returns {ApiKeyAuthResult}
    */
-  authenticateApiKey(rawKey = '') {
+  authenticateApiKey(rawKey = '', { activatePending = true } = {}) {
     if (!rawKey || typeof rawKey !== 'string') {
       return { authenticated: false, reason: 'API_KEY_EMPTY' };
     }
@@ -344,21 +345,25 @@ export const apiKeyManager = {
         return { authenticated: false, reason: 'API_KEY_EXPIRED' };
       }
 
-      user.status = 'ACTIVE';
-      user.activatedAt = new Date(now).toISOString();
-      user.expiresAt = null;
-      mustFlushImmediately = true;
-      console.log(`✨ [ApiKeyManager:Activated] 사용자 서재 활성화 완료: 폴더='${user.folderName}'`);
+      if (activatePending) {
+        user.status = 'ACTIVE';
+        user.activatedAt = new Date(now).toISOString();
+        user.expiresAt = null;
+        mustFlushImmediately = true;
+        console.log(`✨ [ApiKeyManager:Activated] 사용자 서재 활성화 완료: 폴더='${user.folderName}'`);
+      }
     } else if (user.status === 'EXPIRED') {
       return { authenticated: false, reason: 'API_KEY_EXPIRED' };
     }
 
-    user.lastAccessedAt = new Date(now).toISOString();
-    list[index] = user;
-    isApiKeysDirty = true;
+    if (activatePending || user.status === 'ACTIVE') {
+      user.lastAccessedAt = new Date(now).toISOString();
+      list[index] = user;
+      isApiKeysDirty = true;
 
-    if (mustFlushImmediately || (now - lastApiKeysDiskFlushAt) >= TOUCH_FLUSH_INTERVAL_MS) {
-      writeJsonAtomic(API_KEYS_FILE, list);
+      if (mustFlushImmediately || (now - lastApiKeysDiskFlushAt) >= TOUCH_FLUSH_INTERVAL_MS) {
+        writeJsonAtomic(API_KEYS_FILE, list);
+      }
     }
 
     const safeCheck = validateSafePath(USERS_DIR, user.folderName);
@@ -447,7 +452,7 @@ export const apiKeyManager = {
       return { success: false, error: '유효 시간(3분)이 초과되었습니다. 번호를 다시 발급받으세요.' };
     }
 
-    // 🔒 [계정 및 기기 차단 상태 선제 검증] 루트 관리자가 아닌 일반 사용자 계정의 폐기·만료·기기차단 여부 확인
+    // 🔒 [계정 및 기기 차단 상태 선제 검증] 루트 관리자가 아닌 일반 사용자 계정의 폐기·만료·기기차단·deviceId 누락 여부 확인
     if (item.folderName !== 'root') {
       const list = readApiKeysData();
       const index = list.findIndex(u => u.folderName === item.folderName);
@@ -469,44 +474,50 @@ export const apiKeyManager = {
         return { success: false, error: '활성화 기한이 만료된 API 키입니다.' };
       }
 
-      if (deviceId) {
-        const cleanDeviceId = String(deviceId).trim().slice(0, 64);
-        const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
-        const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
-
-        user.devices = user.devices || {};
-        const existingDevice = user.devices[cleanDeviceId];
-        if (existingDevice && existingDevice.status === 'blocked') {
-          console.warn(`⛔ [ApiKeyManager:OTPBlocked] 차단된 기기의 OTP 우회 승인 차단: '${cleanDeviceId}' ➔ '${user.memo}'`);
-          return {
-            success: false,
-            error: '관리자에 의해 차단된 기기입니다. 관리자 화면에서 차단을 먼저 해제해 주세요.'
-          };
-        }
-
-        const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
-        const currentCount = Object.keys(user.devices).length;
-
-        if (!existingDevice && currentCount >= maxLimit) {
-          return {
-            success: false,
-            error: `기기 등록 한도(${maxLimit}대)를 초과했습니다. 기존 기기를 먼저 정리해 주세요.`
-          };
-        }
-
-        const nowIso = new Date().toISOString();
-        user.devices[cleanDeviceId] = {
-          deviceId: cleanDeviceId,
-          deviceName: cleanDeviceName,
-          firstSeen: existingDevice?.firstSeen || nowIso,
-          lastSeen: nowIso,
-          lastIp: cleanIp,
-          status: 'active'
+      const rawDeviceId = String(deviceId || '').trim();
+      if (!rawDeviceId) {
+        return {
+          success: false,
+          error: '기기 식별자(X-Device-Id)가 누락되었습니다. 브라우저를 새로고침한 뒤 다시 시도해 주세요.'
         };
-
-        writeJsonAtomic(API_KEYS_FILE, list);
-        console.log(`📱 [ApiKeyManager:OTPRegister] OTP 인증을 통한 기기 정식 승인 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
       }
+
+      const cleanDeviceId = rawDeviceId.slice(0, 64);
+      const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
+      const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
+
+      user.devices = user.devices || {};
+      const existingDevice = user.devices[cleanDeviceId];
+      if (existingDevice && existingDevice.status === 'blocked') {
+        console.warn(`⛔ [ApiKeyManager:OTPBlocked] 차단된 기기의 OTP 우회 승인 차단: '${cleanDeviceId}' ➔ '${user.memo}'`);
+        return {
+          success: false,
+          error: '관리자에 의해 차단된 기기입니다. 관리자 화면에서 차단을 먼저 해제해 주세요.'
+        };
+      }
+
+      const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
+      const currentCount = Object.keys(user.devices).length;
+
+      if (!existingDevice && currentCount >= maxLimit) {
+        return {
+          success: false,
+          error: `기기 등록 한도(${maxLimit}대)를 초과했습니다. 기존 기기를 먼저 정리해 주세요.`
+        };
+      }
+
+      const nowIso = new Date().toISOString();
+      user.devices[cleanDeviceId] = {
+        deviceId: cleanDeviceId,
+        deviceName: cleanDeviceName,
+        firstSeen: existingDevice?.firstSeen || nowIso,
+        lastSeen: nowIso,
+        lastIp: cleanIp,
+        status: 'active'
+      };
+
+      writeJsonAtomic(API_KEYS_FILE, list);
+      console.log(`📱 [ApiKeyManager:OTPRegister] OTP 인증을 통한 기기 정식 승인 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
     }
 
     // 1회성 즉시 파기 (Replay Attack 방어)
@@ -525,16 +536,25 @@ export const apiKeyManager = {
 
   /**
    * 접속 기기의 유효성을 화이트리스트 기반으로 엄격 검증합니다.
+   * - deviceId 누락 시: DEVICE_ID_REQUIRED 차단 (화이트리스트 우회 원천 차단)
    * - 기기 0대인 완전 최초 상태: 1번째 기기(Master) 자동 등록 허용
    * - 이미 기기가 있는 상태: 승인 장부에 없으면 자동 등록 차단(DEVICE_UNREGISTERED)
    * @param {string} folderName 
-   * @param {Object} params 
+   * @param {Object} [params={}] 
+   * @param {string} [params.deviceId]
+   * @param {string} [params.deviceName]
+   * @param {string} [params.clientIp]
+   * @returns {{ allowed: boolean, reason?: string, message?: string, device?: DeviceRecord|null }}
    */
   verifyAndTouchDevice(folderName, { deviceId, deviceName = '', clientIp = '' } = {}) {
     if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
 
     if (!deviceId || typeof deviceId !== 'string' || !deviceId.trim()) {
-      return { allowed: true, device: null };
+      return {
+        allowed: false,
+        reason: 'DEVICE_ID_REQUIRED',
+        message: '기기 식별자(X-Device-Id)가 필요합니다.'
+      };
     }
 
     const cleanDeviceId = String(deviceId).trim().slice(0, 64);
