@@ -1,18 +1,19 @@
 /**
  * @file src/apiKeyManager.js
- * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기 및 6자리 단기 기기 연결 OTP 관리 엔진
- * - 🛡️ [2단계 화이트리스트 기기 거버넌스] 유효 API 키 + 서버 정식 승인 기기 2중 검증 (삭제/미승인 기기 자동 재등록 및 deviceId 누락 우회 원천 차단)
- * - 📱 [최초 기기 마스터 자동 안착] 등록 기기가 0대인 최초 상태에서만 1번째 기기로 자동 등록 허용
- * - 🔢 [6자리 OTP 정식 기기 등록 결속] verifyAndExchangeDeviceOtp 성공 시점에만 게스트 기기를 정식 장부에 등록 (슬롯 6대 한도, 폐기키/차단기기 방어)
+ * @description 다중 사용자 API 키 발급, SHA-256 해싱, 24시간 수명 주기, 기기별 비밀 토큰(deviceToken) 바인딩 및 6자리 단기 OTP 관리 엔진
+ * - 🛡️ [2중 기기 위조 원천 방어] 유효 API 키 + X-Device-Id + 기기별 X-Device-Token(SHA-256 해시 + timingSafeEqual) 다중 바인딩 검증
+ * - 🧬 [프로토타입 오염 방어] __proto__/constructor 등 금지 deviceId 차단 및 Object.hasOwn 안전 조회 적용
+ * - 📱 [최초 1호기 명시 등록] 등록 기기 0대 상태에서만 registerOrVerifyDevice를 통해 마스터 deviceToken 발급 (GET /api/health 자동 발급 차단)
+ * - 🔢 [6자리 OTP 기기 토큰 발급·갱신] verifyAndExchangeDeviceOtp 성공 시 게스트 기기를 승인 장부에 등록하고 새 deviceToken 발급
  * - 📱 [기기 식별 및 개별 밴] verifyAndTouchDevice 탑재로 접속 기기 식별, 접속 이력 갱신 및 특정 기기 차단(Ban) 지원
  * - 📱 [계정당 기기 슬롯 거버넌스] updateUserMaxDevices 탑재로 기본 6대 기기 한도 검증 및 관리자 실시간 조절 지원
  * - ⚙️ [저장 용량 사후 조절] updateUserQuota 탑재로 관리자가 사용자별 도서 할당 용량(MB) 실시간 변경 지원
  * - 👥 [보관 도서 합산 집계] getUserListForAdmin에서 books/ 및 archive/ 도서 권수 동시 실측
- * - 🔑 [SHA-256 단방향 해싱] 서버 디스크에는 해시값만 저장하여 비밀 키 원문 유출 원천 차단
+ * - 🔑 [SHA-256 단방향 해싱] 서버 디스크에는 API 키 및 기기 토큰의 해시값만 저장하여 원문 유출 원천 차단
  * - ⏳ [24시간 활성화 윈도우 & 재발급 서재 보호] 신규 미사용 키만 고아 폴더 회수, 재발급·기존 데이터 보유 서재는 EXPIRED 전환 후 도서 보존
  * - 🟢 [원터치 활성화] 발급 후 24시간 내 최초 1회 인증 성공 시 ACTIVE 상태로 자동 영구 활성화
  * - 📁 [사용자 샌드박스 골격 자동 생성] user_xxxx 채번 시 books/, settings/, archive/ 디렉터리 즉시 준비
- * - 🔄 [무손실 재발급] 키 분실 시 기존 도서/설정 100% 보존 상태로 새 API 키만 교체 발급
+ * - 🔄 [무손실 재발급] 키 분실 시 기존 도서/설정/기기 100% 보존 상태로 새 API 키만 교체 발급
  * - 🛡️ [원자적 메타데이터 저장 & 쓰기 스로틀링] .tmp 쓰기 후 renameSync 교체 + 인메모리 캐시/60초 Flush로 디스크 I/O 병목 완화
  */
 
@@ -40,6 +41,19 @@ const OTP_TTL_MS = 3 * 60 * 1000;
 
 // ⚡ 단순 접속 시각(lastAccessedAt / lastSeen) 디스크 쓰기 스로틀링 주기 (60초)
 const TOUCH_FLUSH_INTERVAL_MS = 60 * 1000;
+
+// 🧬 객체 프로토타입 오염 방지용 금지 deviceId 키 목록
+const FORBIDDEN_OBJECT_KEYS = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+  'toString',
+  'valueOf',
+  'hasOwnProperty',
+  'isPrototypeOf',
+  'propertyIsEnumerable',
+  'toLocaleString'
+]);
 
 /** @type {Array<ApiKeyRecord>|null} */
 let cachedApiKeysList = null;
@@ -75,6 +89,7 @@ process.on('exit', () => {
  * @typedef {Object} DeviceRecord
  * @property {string} deviceId - 클라이언트 고유 기기 식별자
  * @property {string} deviceName - 기기 모델/브라우저 라벨
+ * @property {string} [tokenHash] - 기기 전용 비밀 토큰(X-Device-Token)의 SHA-256 해시값
  * @property {string} firstSeen - 최초 등록 일시 (ISO)
  * @property {string} lastSeen - 마지막 접속 일시 (ISO)
  * @property {string} lastIp - 마지막 접속 IP
@@ -129,6 +144,44 @@ function ensureDir(dirPath) {
 export function hashApiKey(rawKey = '') {
   if (!rawKey || typeof rawKey !== 'string') return '';
   return crypto.createHash('sha256').update(rawKey.trim()).digest('hex');
+}
+
+/**
+ * 상수 시간(Constant-Time) 해시 문자열 대조 헬퍼
+ * @param {string} hexA 
+ * @param {string} hexB 
+ * @returns {boolean}
+ */
+function safeEqualHex(hexA = '', hexB = '') {
+  if (!hexA || !hexB || typeof hexA !== 'string' || typeof hexB !== 'string') return false;
+  if (hexA.length !== hexB.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hexA, 'utf8'), Buffer.from(hexB, 'utf8'));
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 기기 고유 식별자(deviceId) 정규화 및 프로토타입 오염 방지 검증 헬퍼
+ * @param {string} rawDeviceId 
+ * @returns {string|null} 안전하게 정제된 deviceId (유효하지 않으면 null)
+ */
+function sanitizeDeviceId(rawDeviceId = '') {
+  if (!rawDeviceId || typeof rawDeviceId !== 'string') return null;
+  const trimmed = rawDeviceId.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+  if (FORBIDDEN_OBJECT_KEYS.has(trimmed)) return null;
+  if (/[\s/\\<>"'`\x00-\x1f]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+/**
+ * 기기 전용 랜덤 비밀 토큰 생성 (192-bit)
+ * @returns {string}
+ */
+function generateDeviceToken() {
+  return `dt_${crypto.randomBytes(24).toString('hex')}`;
 }
 
 /**
@@ -315,13 +368,13 @@ export const apiKeyManager = {
    * @returns {ApiKeyAuthResult}
    */
   authenticateApiKey(rawKey = '', { activatePending = true } = {}) {
-    if (!rawKey || typeof rawKey !== 'string') {
+    if (!rawKey || typeof rawKey !== 'string' || !rawKey.trim()) {
       return { authenticated: false, reason: 'API_KEY_EMPTY' };
     }
 
     const keyHash = hashApiKey(rawKey);
     const list = readApiKeysData();
-    const index = list.findIndex(item => item.keyHash === keyHash);
+    const index = list.findIndex(item => safeEqualHex(item.keyHash, keyHash));
 
     if (index === -1) {
       return { authenticated: false, reason: 'API_KEY_NOT_FOUND' };
@@ -425,13 +478,13 @@ export const apiKeyManager = {
   },
 
   /**
-   * 🔢 [Guest 기기] 6자리 연결 번호 검증, 기기 정식 등록 및 API 키 교환 (1회성 파쇄)
+   * 🔢 [Guest 기기] 6자리 연결 번호 검증, 기기 정식 등록, 기기 비밀 토큰(deviceToken) 발급 및 API 키 교환 (1회성 파쇄)
    * @param {string} inputCode - 6자리 숫자 코드
    * @param {Object} [deviceInfo] - 게스트 기기 식별 정보
    * @param {string} [deviceInfo.deviceId]
    * @param {string} [deviceInfo.deviceName]
    * @param {string} [deviceInfo.clientIp]
-   * @returns {{ success: boolean, folderName?: string, apiKey?: string, error?: string }}
+   * @returns {{ success: boolean, folderName?: string, apiKey?: string, deviceToken?: string|null, error?: string }}
    */
   verifyAndExchangeDeviceOtp(inputCode, { deviceId = '', deviceName = '', clientIp = '' } = {}) {
     if (!inputCode) return { success: false, error: '연결 번호를 입력해 주세요.' };
@@ -452,7 +505,9 @@ export const apiKeyManager = {
       return { success: false, error: '유효 시간(3분)이 초과되었습니다. 번호를 다시 발급받으세요.' };
     }
 
-    // 🔒 [계정 및 기기 차단 상태 선제 검증] 루트 관리자가 아닌 일반 사용자 계정의 폐기·만료·기기차단·deviceId 누락 여부 확인
+    let issuedDeviceToken = null;
+
+    // 🔒 [계정 및 기기 차단 상태 선제 검증] 루트 관리자가 아닌 일반 사용자 계정의 폐기·만료·기기차단·deviceId 검증
     if (item.folderName !== 'root') {
       const list = readApiKeysData();
       const index = list.findIndex(u => u.folderName === item.folderName);
@@ -474,20 +529,19 @@ export const apiKeyManager = {
         return { success: false, error: '활성화 기한이 만료된 API 키입니다.' };
       }
 
-      const rawDeviceId = String(deviceId || '').trim();
-      if (!rawDeviceId) {
+      const cleanDeviceId = sanitizeDeviceId(deviceId);
+      if (!cleanDeviceId) {
         return {
           success: false,
-          error: '기기 식별자(X-Device-Id)가 누락되었습니다. 브라우저를 새로고침한 뒤 다시 시도해 주세요.'
+          error: '유효한 기기 식별자(X-Device-Id)가 누락되었습니다. 브라우저를 새로고침한 뒤 다시 시도해 주세요.'
         };
       }
 
-      const cleanDeviceId = rawDeviceId.slice(0, 64);
       const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
       const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
 
       user.devices = user.devices || {};
-      const existingDevice = user.devices[cleanDeviceId];
+      const existingDevice = Object.hasOwn(user.devices, cleanDeviceId) ? user.devices[cleanDeviceId] : null;
       if (existingDevice && existingDevice.status === 'blocked') {
         console.warn(`⛔ [ApiKeyManager:OTPBlocked] 차단된 기기의 OTP 우회 승인 차단: '${cleanDeviceId}' ➔ '${user.memo}'`);
         return {
@@ -506,10 +560,15 @@ export const apiKeyManager = {
         };
       }
 
+      // 🔐 기기 전용 비밀 토큰 신규 발급 (디스크엔 SHA-256 해시만 보관)
+      issuedDeviceToken = generateDeviceToken();
+      const tokenHash = hashApiKey(issuedDeviceToken);
       const nowIso = new Date().toISOString();
+
       user.devices[cleanDeviceId] = {
         deviceId: cleanDeviceId,
         deviceName: cleanDeviceName,
+        tokenHash,
         firstSeen: existingDevice?.firstSeen || nowIso,
         lastSeen: nowIso,
         lastIp: cleanIp,
@@ -517,7 +576,7 @@ export const apiKeyManager = {
       };
 
       writeJsonAtomic(API_KEYS_FILE, list);
-      console.log(`📱 [ApiKeyManager:OTPRegister] OTP 인증을 통한 기기 정식 승인 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
+      console.log(`📱 [ApiKeyManager:OTPRegister] OTP 인증 기기 등록 & 비밀 토큰 발급 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}'`);
     }
 
     // 1회성 즉시 파기 (Replay Attack 방어)
@@ -526,38 +585,35 @@ export const apiKeyManager = {
     return {
       success: true,
       folderName: item.folderName,
-      apiKey: item.apiKey
+      apiKey: item.apiKey,
+      deviceToken: issuedDeviceToken
     };
   },
 
   /* ========================================================================= */
-  /* 📱 기기 화이트리스트 검증 & 개별 차단(Ban) 거버넌스 (자동 재등록 원천 차단)  */
+  /* 📱 기기 화이트리스트 + deviceToken 바인딩 검증 & 마스터 등록                */
   /* ========================================================================= */
 
   /**
-   * 접속 기기의 유효성을 화이트리스트 기반으로 엄격 검증합니다.
-   * - deviceId 누락 시: DEVICE_ID_REQUIRED 차단 (화이트리스트 우회 원천 차단)
-   * - 기기 0대인 완전 최초 상태: 1번째 기기(Master) 자동 등록 허용
-   * - 이미 기기가 있는 상태: 승인 장부에 없으면 자동 등록 차단(DEVICE_UNREGISTERED)
+   * 🔑 [POST /api/auth/device/register 전용]
+   * - 등록 기기가 0대인 최초 상태: 1번째 마스터 기기로 등록하고 새 `deviceToken`을 발급합니다.
+   * - 이미 기기가 1대 이상 등록된 상태: 동일 `deviceId` + 유효한 `deviceToken`을 가진 기기만 통과시키며, 미등록·토큰불일치·차단 기기는 모두 거부합니다.
    * @param {string} folderName 
    * @param {Object} [params={}] 
-   * @param {string} [params.deviceId]
-   * @param {string} [params.deviceName]
-   * @param {string} [params.clientIp]
-   * @returns {{ allowed: boolean, reason?: string, message?: string, device?: DeviceRecord|null }}
+   * @returns {{ allowed: boolean, newlyRegistered?: boolean, deviceToken?: string|null, reason?: string, message?: string, device?: DeviceRecord|null }}
    */
-  verifyAndTouchDevice(folderName, { deviceId, deviceName = '', clientIp = '' } = {}) {
+  registerOrVerifyDevice(folderName, { deviceId, deviceName = '', deviceToken = '', clientIp = '' } = {}) {
     if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
 
-    if (!deviceId || typeof deviceId !== 'string' || !deviceId.trim()) {
+    const cleanDeviceId = sanitizeDeviceId(deviceId);
+    if (!cleanDeviceId) {
       return {
         allowed: false,
         reason: 'DEVICE_ID_REQUIRED',
-        message: '기기 식별자(X-Device-Id)가 필요합니다.'
+        message: '유효한 기기 식별자(X-Device-Id)가 필요합니다.'
       };
     }
 
-    const cleanDeviceId = String(deviceId).trim().slice(0, 64);
     const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
     const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
 
@@ -570,17 +626,115 @@ export const apiKeyManager = {
     const user = list[index];
     user.devices = user.devices || {};
     const maxLimit = user.maxDevices || DEFAULT_MAX_DEVICES;
+    const now = new Date().toISOString();
+    const existingDevice = Object.hasOwn(user.devices, cleanDeviceId) ? user.devices[cleanDeviceId] : null;
+
+    // 1. 이미 등록된 기기인 경우: 반드시 기존 tokenHash와 일치하는 X-Device-Token이 있어야 통과
+    if (existingDevice) {
+      if (existingDevice.status === 'blocked') {
+        return { allowed: false, reason: 'DEVICE_BLOCKED', device: existingDevice };
+      }
+      if (!existingDevice.tokenHash || !deviceToken || typeof deviceToken !== 'string' || !deviceToken.trim()) {
+        return {
+          allowed: false,
+          reason: 'DEVICE_TOKEN_REQUIRED',
+          message: '보안 기기 토큰이 필요합니다. 6자리 연결 번호로 로그인하거나 관리자 페이지에서 기존 기기 슬롯을 삭제한 뒤 다시 연결해 주세요.'
+        };
+      }
+      const providedHash = hashApiKey(deviceToken);
+      if (!safeEqualHex(providedHash, existingDevice.tokenHash)) {
+        return {
+          allowed: false,
+          reason: 'DEVICE_TOKEN_INVALID',
+          message: '기기 보안 토큰이 일치하지 않습니다. 6자리 연결 번호로 다시 로그인해 주세요.'
+        };
+      }
+
+      existingDevice.lastSeen = now;
+      existingDevice.lastIp = cleanIp;
+      if (cleanDeviceName && cleanDeviceName !== '웹 리더 기기') {
+        existingDevice.deviceName = cleanDeviceName;
+      }
+      writeJsonAtomic(API_KEYS_FILE, list);
+      return { allowed: true, newlyRegistered: false, deviceToken: null, device: existingDevice };
+    }
+
+    const currentDeviceCount = Object.keys(user.devices).length;
+
+    // 2. 최초 0대 상태일 때만 1호기(Master) 등록 및 비밀 토큰 발급 허용
+    if (currentDeviceCount === 0) {
+      const issuedDeviceToken = generateDeviceToken();
+      const tokenHash = hashApiKey(issuedDeviceToken);
+      const newDevice = {
+        deviceId: cleanDeviceId,
+        deviceName: cleanDeviceName,
+        tokenHash,
+        firstSeen: now,
+        lastSeen: now,
+        lastIp: cleanIp,
+        status: 'active'
+      };
+      user.devices[cleanDeviceId] = newDevice;
+      writeJsonAtomic(API_KEYS_FILE, list);
+      console.log(`📱 [ApiKeyManager:MasterRegistered] 1번째 마스터 기기 등록 & 토큰 발급 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ '${user.memo}' (1/${maxLimit}대)`);
+      return { allowed: true, newlyRegistered: true, deviceToken: issuedDeviceToken, device: newDevice };
+    }
+
+    // 3. 이미 1대 이상 등록된 상태에서 미등록 기기는 자동 등록 불가
+    return {
+      allowed: false,
+      reason: 'DEVICE_UNREGISTERED',
+      message: '등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.'
+    };
+  },
+
+  /**
+   * 접속 기기의 유효성과 기기별 비밀 토큰(X-Device-Token) 일치 여부를 엄격 검증합니다.
+   * - `deviceId` 누락/위조 키: `DEVICE_ID_REQUIRED`
+   * - 등록 기기 0대 상태: `MASTER_DEVICE_REGISTRATION_REQUIRED` (GET 요청에서 비밀 토큰 자동 발급 차단)
+   * - 등록 기기 `tokenHash` 부재 또는 `X-Device-Token` 누락: `DEVICE_TOKEN_REQUIRED`
+   * - `X-Device-Token` 해시 불일치: `DEVICE_TOKEN_INVALID`
+   * - 미등록 기기(1대 이상 존재): `DEVICE_UNREGISTERED`
+   * @param {string} folderName 
+   * @param {Object} [params={}] 
+   * @param {string} [params.deviceId]
+   * @param {string} [params.deviceName]
+   * @param {string} [params.deviceToken]
+   * @param {string} [params.clientIp]
+   * @returns {{ allowed: boolean, reason?: string, message?: string, device?: DeviceRecord|null }}
+   */
+  verifyAndTouchDevice(folderName, { deviceId, deviceName = '', deviceToken = '', clientIp = '' } = {}) {
+    if (!folderName) return { allowed: false, reason: 'INVALID_FOLDER_NAME' };
+
+    const cleanDeviceId = sanitizeDeviceId(deviceId);
+    if (!cleanDeviceId) {
+      return {
+        allowed: false,
+        reason: 'DEVICE_ID_REQUIRED',
+        message: '유효한 기기 식별자(X-Device-Id)가 필요합니다.'
+      };
+    }
+
+    const cleanDeviceName = String(deviceName || '').trim().slice(0, 50) || '웹 리더 기기';
+    const cleanIp = String(clientIp || '').trim().slice(0, 45) || '127.0.0.1';
+
+    const list = readApiKeysData();
+    const index = list.findIndex(item => item.folderName === folderName);
+    if (index === -1) {
+      return { allowed: false, reason: 'USER_NOT_FOUND' };
+    }
+
+    const user = list[index];
+    user.devices = user.devices || {};
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
 
-    let device = user.devices[cleanDeviceId];
+    const device = Object.hasOwn(user.devices, cleanDeviceId) ? user.devices[cleanDeviceId] : null;
 
     // 1. 이미 정식 등록된 기기인 경우
     if (device) {
-      const isNameChanged = Boolean(cleanDeviceName && cleanDeviceName !== '웹 리더 기기' && device.deviceName !== cleanDeviceName);
-      const isIpChanged = device.lastIp !== cleanIp;
-
       if (device.status === 'blocked') {
+        const isIpChanged = device.lastIp !== cleanIp;
         device.lastSeen = now;
         device.lastIp = cleanIp;
         isApiKeysDirty = true;
@@ -589,6 +743,28 @@ export const apiKeyManager = {
         }
         return { allowed: false, reason: 'DEVICE_BLOCKED', device };
       }
+
+      // 🔐 기기 비밀 토큰(X-Device-Token) 엄격 검증
+      if (!device.tokenHash || !deviceToken || typeof deviceToken !== 'string' || !deviceToken.trim()) {
+        return {
+          allowed: false,
+          reason: 'DEVICE_TOKEN_REQUIRED',
+          message: '보안 기기 토큰이 필요합니다. 6자리 번호로 다시 로그인하거나 관리자 화면에서 기기 슬롯을 초기화한 뒤 다시 연결해 주세요.'
+        };
+      }
+
+      const providedHash = hashApiKey(deviceToken);
+      if (!safeEqualHex(providedHash, device.tokenHash)) {
+        console.warn(`⛔ [ApiKeyManager:InvalidDeviceToken] 기기 토큰 불일치 차단: 폴더='${folderName}', 기기='${cleanDeviceId}'`);
+        return {
+          allowed: false,
+          reason: 'DEVICE_TOKEN_INVALID',
+          message: '기기 보안 토큰이 유효하지 않습니다. 다시 로그인해 주세요.'
+        };
+      }
+
+      const isNameChanged = Boolean(cleanDeviceName && cleanDeviceName !== '웹 리더 기기' && device.deviceName !== cleanDeviceName);
+      const isIpChanged = device.lastIp !== cleanIp;
 
       device.lastSeen = now;
       device.lastIp = cleanIp;
@@ -605,24 +781,16 @@ export const apiKeyManager = {
 
     const currentDeviceCount = Object.keys(user.devices).length;
 
-    // 2. 🌟 [핵심] 등록된 기기가 0대인 완전 최초 상태인 경우에만 1번째 기기(Master) 자동 등록 허용!
+    // 2. 등록 기기가 0대인 최초 상태: 명시적 POST /api/auth/device/register를 통해 마스터 등록 유도
     if (currentDeviceCount === 0) {
-      device = {
-        deviceId: cleanDeviceId,
-        deviceName: cleanDeviceName,
-        firstSeen: now,
-        lastSeen: now,
-        lastIp: cleanIp,
-        status: 'active'
+      return {
+        allowed: false,
+        reason: 'MASTER_DEVICE_REGISTRATION_REQUIRED',
+        message: '최초 마스터 기기 등록이 필요합니다. 설정에서 [연결] 버튼을 눌러 기기 토큰을 발급받아 주세요.'
       };
-      user.devices[cleanDeviceId] = device;
-      writeJsonAtomic(API_KEYS_FILE, list);
-      console.log(`📱 [ApiKeyManager:MasterRegistered] 1번째 마스터 기기 자동 등록 완료: '${cleanDeviceName}' (${cleanDeviceId}) ➔ 사용자: '${user.memo}' (1/${maxLimit}대)`);
-      return { allowed: true, device };
     }
 
     // 3. 🚨 [화이트리스트 방어] 이미 1대 이상 등록되어 있는데 장부에 없는 기기 (삭제된 기기 또는 미승인 기기)
-    // ➔ 자동 등록하지 않고 칼같이 403 차단! (다시 들어오려면 반드시 6자리 OTP 인증 필요)
     console.warn(`⛔ [ApiKeyManager:UnregisteredDevice] 미등록(또는 삭제된) 기기 접근 차단: 폴더='${folderName}', 기기='${cleanDeviceId}'`);
     return {
       allowed: false,
@@ -637,53 +805,66 @@ export const apiKeyManager = {
     const user = list.find(item => item.folderName === folderName);
     if (!user || !user.devices) return [];
 
-    return Object.values(user.devices).sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+    return Object.values(user.devices)
+      .map(d => ({
+        deviceId: d.deviceId,
+        deviceName: d.deviceName,
+        firstSeen: d.firstSeen,
+        lastSeen: d.lastSeen,
+        lastIp: d.lastIp,
+        status: d.status,
+        hasToken: Boolean(d.tokenHash)
+      }))
+      .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
   },
 
   blockDevice(folderName, deviceId) {
-    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+    const cleanId = sanitizeDeviceId(deviceId);
+    if (!folderName || !cleanId) return { success: false, error: '인자가 유효하지 않습니다.' };
 
     const list = readApiKeysData();
     const user = list.find(item => item.folderName === folderName);
-    if (!user || !user.devices || !user.devices[deviceId]) {
+    if (!user || !user.devices || !Object.hasOwn(user.devices, cleanId)) {
       return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
     }
 
-    user.devices[deviceId].status = 'blocked';
+    user.devices[cleanId].status = 'blocked';
     writeJsonAtomic(API_KEYS_FILE, list);
-    console.log(`⛔ [ApiKeyManager:DeviceBlocked] 기기 차단됨: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+    console.log(`⛔ [ApiKeyManager:DeviceBlocked] 기기 차단됨: '${cleanId}' ➔ 사용자: '${user.memo}'`);
 
-    return { success: true, device: user.devices[deviceId] };
+    return { success: true, device: user.devices[cleanId] };
   },
 
   unblockDevice(folderName, deviceId) {
-    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+    const cleanId = sanitizeDeviceId(deviceId);
+    if (!folderName || !cleanId) return { success: false, error: '인자가 유효하지 않습니다.' };
 
     const list = readApiKeysData();
     const user = list.find(item => item.folderName === folderName);
-    if (!user || !user.devices || !user.devices[deviceId]) {
+    if (!user || !user.devices || !Object.hasOwn(user.devices, cleanId)) {
       return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
     }
 
-    user.devices[deviceId].status = 'active';
+    user.devices[cleanId].status = 'active';
     writeJsonAtomic(API_KEYS_FILE, list);
-    console.log(`🟢 [ApiKeyManager:DeviceUnblocked] 기기 차단 해제됨: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+    console.log(`🟢 [ApiKeyManager:DeviceUnblocked] 기기 차단 해제됨: '${cleanId}' ➔ 사용자: '${user.memo}'`);
 
-    return { success: true, device: user.devices[deviceId] };
+    return { success: true, device: user.devices[cleanId] };
   },
 
   deleteDevice(folderName, deviceId) {
-    if (!folderName || !deviceId) return { success: false, error: '인자가 비어 있습니다.' };
+    const cleanId = sanitizeDeviceId(deviceId);
+    if (!folderName || !cleanId) return { success: false, error: '인자가 유효하지 않습니다.' };
 
     const list = readApiKeysData();
     const user = list.find(item => item.folderName === folderName);
-    if (!user || !user.devices || !user.devices[deviceId]) {
+    if (!user || !user.devices || !Object.hasOwn(user.devices, cleanId)) {
       return { success: false, error: '해당 기기를 찾을 수 없습니다.' };
     }
 
-    delete user.devices[deviceId];
+    delete user.devices[cleanId];
     writeJsonAtomic(API_KEYS_FILE, list);
-    console.log(`🗑️ [ApiKeyManager:DeviceDeleted] 기기 삭제 및 슬롯 반환: '${deviceId}' ➔ 사용자: '${user.memo}'`);
+    console.log(`🗑️ [ApiKeyManager:DeviceDeleted] 기기 삭제 및 슬롯 반환: '${cleanId}' ➔ 사용자: '${user.memo}'`);
 
     return { success: true };
   },
@@ -895,7 +1076,17 @@ export const apiKeyManager = {
         maxDevices: u.maxDevices || DEFAULT_MAX_DEVICES,
         deviceCount: devicesList.length,
         blockedDeviceCount,
-        devices: devicesList.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen)),
+        devices: devicesList
+          .map(d => ({
+            deviceId: d.deviceId,
+            deviceName: d.deviceName,
+            firstSeen: d.firstSeen,
+            lastSeen: d.lastSeen,
+            lastIp: d.lastIp,
+            status: d.status,
+            hasToken: Boolean(d.tokenHash)
+          }))
+          .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen)),
         createdAt: u.createdAt,
         activatedAt: u.activatedAt,
         expiresAt: u.expiresAt,

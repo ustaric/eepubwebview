@@ -1,7 +1,7 @@
 /**
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
- * - 🩺 [서버 헬스체크 & 경량 키·기기 검증] GET /api/health 스토리지 상태, 토큰 보유 및 API 키·기기 승인 결과 반환
+ * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, X-Device-Token 포함 경량 검증 및 미인증/비승인 시 userRole·경로 비노출
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
  * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장 (관리자 세션 필수)
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
@@ -16,6 +16,7 @@ import { isAuthenticated } from '../adminController.js';
 import {
   extractApiKey,
   extractDeviceInfo,
+  checkRateLimit,
   sendJsonResponse,
   readRequestBodyBuffer
 } from '../httpUtils.js';
@@ -31,11 +32,17 @@ import {
  * @returns {Promise<boolean>} 라우트 처리 여부
  */
 export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
-  // 1. 서버 헬스체크 및 경량 API 키·기기 검증
+  // 1. 서버 헬스체크 및 경량 API 키·기기 토큰 검증
   if (req.method === 'GET' && pathname === '/api/health') {
+    if (!checkRateLimit(req, 120)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '헬스체크 요청 초과 차단', target: pathname, status: 429 });
+      sendJsonResponse(req, res, 429, { error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
+      return true;
+    }
+
     const env = readEnvFile();
     const providedApiKey = extractApiKey(req, reqUrl);
-    const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+    const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     const hasAdminSession = isAuthenticated(req);
 
     let isAuthorizedHealth = false;
@@ -45,37 +52,44 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     let deviceReason = null;
     let userRole = null;
 
-    if (providedApiKey) {
-      const rootMasterKey = env.STORAGE_API_KEY?.trim();
-      if (rootMasterKey && providedApiKey === rootMasterKey) {
-        isAuthorizedHealth = true;
-        apiKeyValid = true;
-        authReason = 'ROOT_KEY';
-        deviceAuthorized = true;
-        userRole = 'root';
-        auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
+    if (providedApiKey !== null) {
+      if (!providedApiKey) {
+        apiKeyValid = false;
+        authReason = 'API_KEY_EMPTY';
       } else {
-        const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
-        if (auth.authenticated && auth.user) {
+        const rootMasterKey = env.STORAGE_API_KEY?.trim();
+        if (rootMasterKey && providedApiKey === rootMasterKey) {
+          isAuthorizedHealth = true;
           apiKeyValid = true;
-          authReason = 'VALID';
-          userRole = auth.user.role || 'user';
-
-          const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
-            deviceId,
-            deviceName,
-            clientIp
-          });
-          deviceAuthorized = Boolean(deviceResult.allowed);
-          deviceReason = deviceResult.allowed ? null : (deviceResult.reason || 'DEVICE_UNAUTHORIZED');
-
-          if (deviceResult.allowed) {
-            isAuthorizedHealth = true;
-            auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
-          }
+          authReason = 'ROOT_KEY';
+          deviceAuthorized = true;
+          userRole = 'root';
+          auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
         } else {
-          apiKeyValid = false;
-          authReason = auth.reason || 'API_KEY_NOT_FOUND';
+          // /api/health 조회만으로는 PENDING 키를 ACTIVE로 전이하지 않음
+          const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: false });
+          if (auth.authenticated && auth.user) {
+            apiKeyValid = true;
+            authReason = 'VALID';
+
+            const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
+              deviceId,
+              deviceName,
+              deviceToken,
+              clientIp
+            });
+            deviceAuthorized = Boolean(deviceResult.allowed);
+            deviceReason = deviceResult.allowed ? null : (deviceResult.reason || 'DEVICE_UNAUTHORIZED');
+
+            if (deviceResult.allowed) {
+              isAuthorizedHealth = true;
+              userRole = auth.user.role || 'user';
+              auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: auth.user.memo });
+            }
+          } else {
+            apiKeyValid = false;
+            authReason = auth.reason || 'API_KEY_NOT_FOUND';
+          }
         }
       }
     } else if (hasAdminSession) {
@@ -99,7 +113,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       authReason,
       deviceAuthorized,
       deviceReason,
-      userRole,
+      userRole: isAuthorizedHealth ? userRole : null,
       timestamp: new Date().toISOString()
     });
     return true;

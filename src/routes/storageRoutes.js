@@ -1,8 +1,8 @@
 /**
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
- * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 미제공 시 관리자 웹 세션(admin_session) 지원
- * - 🚫 [미등록/삭제/식별자누락 기기 403 즉시 차단] 장부에서 삭제된 기기 및 X-Device-Id 누락 요청 원천 거부
+ * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 빈 키 명시 시 즉시 401 차단, 미제공 시 관리자 웹 세션 지원
+ * - 🚫 [미등록/삭제/식별자누락/토큰불일치 기기 403 차단] X-Device-Id 형식·예약어 검증, deviceToken 바인딩 전달 및 차단 기기 원천 거부
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp(GET/HEAD) 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
@@ -31,6 +31,10 @@ import {
 
 // 📁 다중 공유 폴더 설정 저장 파일 경로
 const SHARED_FOLDERS_CONFIG_FILE = './data/shared_folders.json';
+
+// 🛡️ 기기 식별자 형식 및 프로토타입 오염 예약어 가드
+const DEVICE_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+const FORBIDDEN_DEVICE_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty']);
 
 /**
  * 📂 다중 공유 폴더 설정 안전 조회 헬퍼 (하위 호환성 100% 보장)
@@ -120,6 +124,47 @@ function getAuthDiagnosticState(req, reqUrl) {
   return `${apiKeyPart}|${authPart}`;
 }
 
+/**
+ * 🛡️ API 키 헤더/Bearer/쿼리가 명시되었으나 공백·빈 문자열인지 판별합니다.
+ * @param {import('http').IncomingMessage} req
+ * @param {URL} reqUrl
+ * @returns {boolean}
+ */
+function hasExplicitEmptyApiKey(req, reqUrl) {
+  if (req.headers['x-api-key'] !== undefined && !String(req.headers['x-api-key']).trim()) {
+    return true;
+  }
+  const authHeader = req.headers['authorization'];
+  if (authHeader !== undefined) {
+    const trimmedAuth = String(authHeader).trim();
+    if (!trimmedAuth || (trimmedAuth.toLowerCase().startsWith('bearer') && !trimmedAuth.replace(/^Bearer\s*/i, '').trim())) {
+      return true;
+    }
+  }
+  if (reqUrl.searchParams.has('apiKey') && !String(reqUrl.searchParams.get('apiKey') || '').trim()) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 🔑 기기 전용 검증 토큰(X-Device-Token)을 안전 추출합니다.
+ * @param {import('http').IncomingMessage} req
+ * @param {URL} reqUrl
+ * @returns {string}
+ */
+function extractDeviceToken(req, reqUrl) {
+  const headerToken = req.headers['x-device-token'];
+  if (headerToken !== undefined) {
+    return String(headerToken).trim();
+  }
+  const queryToken = reqUrl.searchParams.get('deviceToken');
+  if (queryToken !== undefined && queryToken !== null) {
+    return String(queryToken).trim();
+  }
+  return '';
+}
+
 export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
   if (!pathname.startsWith('/api/storage/')) {
     return false;
@@ -168,6 +213,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
   const providedApiKey = extractApiKey(req, reqUrl);
   const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+  const deviceToken = extractDeviceToken(req, reqUrl);
   const authState = getAuthDiagnosticState(req, reqUrl);
   const isAdminConfigRoute = pathname === '/api/storage/admin/shared-folders';
   const hasAdminSession = isAuthenticated(req);
@@ -176,6 +222,21 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     isRootAdmin = true;
     targetUserFolder = null;
     authenticatedUserMemo = 'Root Admin (Web Session)';
+  } else if (!providedApiKey && hasExplicitEmptyApiKey(req, reqUrl)) {
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: '빈 API 키 헤더 차단',
+      target: pathname,
+      status: 401,
+      method: req.method,
+      deviceId,
+      deviceName,
+      origin: safeOrigin,
+      authState
+    });
+    sendJsonResponse(req, res, 401, { error: 'EMPTY_API_KEY: 빈 API 키가 전달되었습니다.' });
+    return true;
   } else if (providedApiKey) {
     if (rootMasterKey && providedApiKey === rootMasterKey) {
       targetUserFolder = null;
@@ -183,13 +244,54 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       isRootAdmin = true;
       auditLogger.recordApiKeyUsage({ ip: clientIp, userAgent, path: pathname, method: req.method, userMemo: 'Root Admin' });
     } else {
-      const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
+      const hasValidDeviceFormat = Boolean(deviceId && !FORBIDDEN_DEVICE_KEYS.has(deviceId) && DEVICE_ID_REGEX.test(deviceId));
+      const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: hasValidDeviceFormat });
+
       if (auth.authenticated && auth.user) {
         targetUserFolder = auth.user.folderName;
         userQuotaBytes = auth.user.storageQuotaBytes || (1024 * 1024 * 1024);
         authenticatedUserMemo = `${auth.user.memo} (${auth.user.folderName})`;
 
-        const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, { deviceId, deviceName, clientIp });
+        if (!deviceId) {
+          auditLogger.recordAccessLog({
+            ip: clientIp,
+            userAgent,
+            action: '🚫 기기 식별자 누락 차단',
+            target: `${pathname} (${auth.user.memo})`,
+            status: 403,
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
+          });
+          sendJsonResponse(req, res, 403, { error: 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.' });
+          return true;
+        }
+
+        if (!hasValidDeviceFormat) {
+          auditLogger.recordAccessLog({
+            ip: clientIp,
+            userAgent,
+            action: '🚫 비정상 기기 식별자 차단',
+            target: `${pathname} (${auth.user.memo})`,
+            status: 403,
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId: String(deviceId).slice(0, 32),
+            deviceName,
+            origin: safeOrigin
+          });
+          sendJsonResponse(req, res, 403, { error: 'INVALID_DEVICE_ID: 유효하지 않은 기기 식별자 형식입니다.' });
+          return true;
+        }
+
+        const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
+          deviceId,
+          deviceName,
+          clientIp,
+          deviceToken
+        });
 
         if (!deviceResult.allowed && deviceResult.reason === 'DEVICE_ID_REQUIRED') {
           auditLogger.recordAccessLog({
@@ -205,6 +307,27 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
             origin: safeOrigin
           });
           sendJsonResponse(req, res, 403, { error: 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.' });
+          return true;
+        }
+
+        if (!deviceResult.allowed && (deviceResult.reason === 'DEVICE_TOKEN_REQUIRED' || deviceResult.reason === 'DEVICE_TOKEN_INVALID')) {
+          auditLogger.recordAccessLog({
+            ip: clientIp,
+            userAgent,
+            action: `🚫 기기 검증 토큰 오류 차단 (${deviceResult.reason})`,
+            target: `${deviceName || deviceId} (${auth.user.memo})`,
+            status: 403,
+            user: authenticatedUserMemo,
+            method: req.method,
+            deviceId,
+            deviceName,
+            origin: safeOrigin
+          });
+          sendJsonResponse(req, res, 403, {
+            error: `${deviceResult.reason}: 기기 보안 토큰 검증에 실패했습니다. 6자리 번호 또는 연결 버튼으로 다시 인증해 주세요.`,
+            reason: deviceResult.reason,
+            deviceId
+          });
           return true;
         }
 

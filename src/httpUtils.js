@@ -1,11 +1,11 @@
 /**
  * @file src/httpUtils.js
  * @description HTTP 요청 파싱, CORS, Rate Limiting 및 응답 생성 전담 공통 인프라 유틸리티 모듈
- * - 🛡️ [CORS & 보안 헤더 자동 주입] injectSecurityHeaders 연동, ALLOWED_ORIGIN 기반 동적 CORS 및 Vary: Origin 캐시 격리 헤더 제어
+ * - 🛡️ [CORS & 보안 헤더 자동 주입] injectSecurityHeaders 연동, ALLOWED_ORIGIN 기반 동적 CORS(X-Device-Token 포함) 및 Vary: Origin 캐시 격리 헤더 제어
  * - 🚦 [IP 기반 요청 폭주 방어] 1분 단위 요청 제한 및 5분 주기 메모리 자가 소독(GC)
  * - 🔒 [OTP 무차별 대입 방어] 1분 내 5회 실패 시 10분 강제 락 및 실시간 대기 시간(분) 산출
- * - 🔑 [인증 식별자 지능형 추출] Header(X-API-KEY / Authorization Bearer) 및 URL Query(?apiKey) 통합 파싱
- * - 📱 [기기 식별 헤더 정규화] X-Device-Id 및 안전하게 URL 디코딩된 X-Device-Name 추출
+ * - 🔑 [인증 식별자 지능형 추출] Header(X-API-KEY / Authorization Bearer) 및 URL Query(?apiKey) 통합 파싱 (빈/공백 명시와 미전달 엄격 분리)
+ * - 📱 [기기 식별 및 토큰 헤더 정규화] X-Device-Id, URL 디코딩된 X-Device-Name 및 X-Device-Token 추출
  * - 📦 [차등 바디 수신 버퍼] 스트리밍 청크 누적 및 한도 초과 즉시 연결 파기(Fail-Safe)
  */
 
@@ -130,36 +130,43 @@ export function clearOtpFailure(ip) {
 
 /**
  * 헤더, Bearer 토큰, 쿼리 파라미터에서 API 키를 통합 추출합니다.
+ * - 키가 아예 전달되지 않은 경우 `null` 반환
+ * - 키 헤더/파라미터가 명시되었으나 빈 문자열·공백만 있는 경우 `""` 반환 (호출부에서 401 차단)
  * @param {import('http').IncomingMessage} req 
  * @param {URL} reqUrl 
  * @returns {string|null}
  */
 export function extractApiKey(req, reqUrl) {
   const customHeader = req.headers['x-api-key'];
-  if (customHeader) return String(customHeader).trim();
-
-  const authHeader = req.headers['authorization'];
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    return authHeader.substring(7).trim();
+  if (customHeader !== undefined) {
+    return String(customHeader).trim();
   }
 
-  const queryKey = reqUrl.searchParams.get('apiKey');
-  if (queryKey) return queryKey.trim();
+  const authHeader = req.headers['authorization'];
+  if (authHeader && String(authHeader).startsWith('Bearer ')) {
+    return String(authHeader).substring(7).trim();
+  }
+
+  if (reqUrl.searchParams.has('apiKey')) {
+    return String(reqUrl.searchParams.get('apiKey') || '').trim();
+  }
 
   return null;
 }
 
 /**
- * 헤더 또는 쿼리에서 기기 식별 정보를 안전하게 추출합니다.
+ * 헤더 또는 쿼리에서 기기 식별 정보 및 기기 비밀 토큰을 안전하게 추출합니다.
  * @param {import('http').IncomingMessage} req 
  * @param {URL} reqUrl 
- * @returns {{ deviceId: string, deviceName: string }}
+ * @returns {{ deviceId: string, deviceName: string, deviceToken: string }}
  */
 export function extractDeviceInfo(req, reqUrl) {
   let deviceId = req.headers['x-device-id'] || reqUrl.searchParams.get('deviceId') || '';
   let deviceName = req.headers['x-device-name'] || reqUrl.searchParams.get('deviceName') || '';
+  let deviceToken = req.headers['x-device-token'] || reqUrl.searchParams.get('deviceToken') || '';
 
   if (deviceId) deviceId = String(deviceId).trim();
+  if (deviceToken) deviceToken = String(deviceToken).trim();
   if (deviceName) {
     try {
       deviceName = decodeURIComponent(String(deviceName).trim());
@@ -168,7 +175,7 @@ export function extractDeviceInfo(req, reqUrl) {
     }
   }
 
-  return { deviceId, deviceName };
+  return { deviceId, deviceName, deviceToken };
 }
 
 /**
@@ -231,7 +238,7 @@ export function setCorsHeaders(req, res) {
 
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY, X-Device-Id, X-Device-Name');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-KEY, X-Device-Id, X-Device-Name, X-Device-Token');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 

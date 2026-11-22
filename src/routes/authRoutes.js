@@ -1,11 +1,12 @@
 /**
  * @file src/routes/authRoutes.js
- * @description Google OAuth 및 6자리 단기 기기 연결 번호(OTP) 인증 전담 라우터
+ * @description Google OAuth, 1호기 마스터 기기 등록 및 6자리 단기 연결 번호(OTP) 인증 전담 라우터
+ * - 📱 [최초 마스터 기기 등록] POST /api/auth/device/register 등록 기기 0대 상태에서만 1호기 deviceToken 안전 발급
  * - ⚡ [구글 공식 로그인 0초 직통 점프] GET /auth/google 클릭 즉시 302 구글 계정 선택 화면으로 다이렉트 이동
  * - 🔄 [Google OAuth 콜백 & 토큰 교환] GET /auth/google/callback 승인 코드 수신 및 암호화 보관
- * - 🕒 [백그라운드 자동 갱신] GET /api/access-token 호출 시 ENFORCE_STORAGE_API_KEY·기기 화이트리스트·출처 검증 후 신선한 Google Access Token 즉시 발급
- * - 🔢 [6자리 OTP 번호 발급] POST /api/auth/otp/issue Rate Limit 및 기기 승인 검증 후 3분 유효 일회용 번호 생성
- * - ✨ [6자리 OTP 기기 등록 결속] POST /api/auth/otp/verify 인증 성공 시 해당 기기를 정식 승인 장부에 자동 각인
+ * - 🕒 [백그라운드 자동 갱신] GET /api/access-token 호출 시 ENFORCE_STORAGE_API_KEY·기기 화이트리스트·X-Device-Token·출처 검증 후 토큰 발급
+ * - 🔢 [6자리 OTP 번호 발급] POST /api/auth/otp/issue Rate Limit, 기기 화이트리스트 및 X-Device-Token 검증 후 3분 유효 일회용 번호 생성
+ * - ✨ [6자리 OTP 기기 등록 & 토큰 발급] POST /api/auth/otp/verify 인증 성공 시 기기 등록 및 새 deviceToken 반환
  */
 
 import { generateAuthUrl, verifyState, exchangeCodeForTokens, getFreshAccessToken } from '../../googleAuth.js';
@@ -27,6 +28,30 @@ import {
 } from '../httpUtils.js';
 
 /**
+ * 기기 검증 실패 사유에 따른 표준 403 오류 메시지를 반환합니다.
+ * @param {string} reason 
+ * @returns {string}
+ */
+function resolveDeviceErrorMessage(reason) {
+  if (reason === 'DEVICE_BLOCKED') {
+    return 'DEVICE_BLOCKED: 관리자에 의해 차단된 기기입니다.';
+  }
+  if (reason === 'DEVICE_ID_REQUIRED') {
+    return 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.';
+  }
+  if (reason === 'DEVICE_TOKEN_REQUIRED') {
+    return 'DEVICE_TOKEN_REQUIRED: 보안 기기 토큰이 필요합니다. 6자리 번호로 다시 로그인하거나 관리자 화면에서 기기 슬롯을 초기화한 뒤 다시 연결해 주세요.';
+  }
+  if (reason === 'DEVICE_TOKEN_INVALID') {
+    return 'DEVICE_TOKEN_INVALID: 기기 보안 토큰이 유효하지 않습니다. 다시 로그인해 주세요.';
+  }
+  if (reason === 'MASTER_DEVICE_REGISTRATION_REQUIRED') {
+    return 'MASTER_DEVICE_REGISTRATION_REQUIRED: 최초 마스터 기기 등록이 필요합니다. 설정에서 [연결] 버튼을 눌러 기기를 등록해 주세요.';
+  }
+  return 'DEVICE_UNREGISTERED: 등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.';
+}
+
+/**
  * 인증 및 OTP 관련 HTTP 요청을 처리합니다.
  * @param {import('http').IncomingMessage} req 
  * @param {import('http').ServerResponse} res 
@@ -39,6 +64,87 @@ import {
  * @returns {Promise<boolean>} 라우트 처리 여부
  */
 export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, userAgent, protocol, host) {
+  // 0. 최초 1호기(Master) 기기 등록 및 기기 토큰 검증 (POST /api/auth/device/register)
+  if (req.method === 'POST' && pathname === '/api/auth/device/register') {
+    if (!checkRateLimit(req, 30)) {
+      auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '기기 등록 횟수 초과 차단', target: pathname, status: 429 });
+      sendJsonResponse(req, res, 429, { error: 'RATE_LIMIT_EXCEEDED: 요청 횟수가 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
+      return true;
+    }
+
+    const providedApiKey = extractApiKey(req, reqUrl);
+    if (providedApiKey === null || !providedApiKey) {
+      sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
+      return true;
+    }
+
+    const env = readEnvFile();
+    const rootMasterKey = env.STORAGE_API_KEY?.trim();
+    const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
+
+    if (rootMasterKey && providedApiKey === rootMasterKey) {
+      sendJsonResponse(req, res, 200, {
+        ok: true,
+        role: 'root',
+        newlyRegistered: false,
+        deviceToken: null
+      });
+      return true;
+    }
+
+    const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
+    if (!auth.authenticated || !auth.user) {
+      const statusMsg = auth.reason === 'API_KEY_EXPIRED'
+        ? 'API_KEY_EXPIRED: 사용 기간이 종료된 키입니다.'
+        : (auth.reason === 'API_KEY_REVOKED'
+          ? 'API_KEY_REVOKED: 폐기된 API 키입니다.'
+          : 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.');
+      sendJsonResponse(req, res, 401, { error: statusMsg, reason: auth.reason });
+      return true;
+    }
+
+    const regResult = apiKeyManager.registerOrVerifyDevice(auth.user.folderName, {
+      deviceId,
+      deviceName,
+      deviceToken,
+      clientIp
+    });
+
+    if (!regResult.allowed) {
+      const reason = regResult.reason || 'DEVICE_UNAUTHORIZED';
+      auditLogger.recordAccessLog({
+        ip: clientIp,
+        userAgent,
+        action: `🚫 마스터 기기 등록 거부 (${reason})`,
+        target: `${deviceName || deviceId || 'missing-device-id'} (${auth.user.memo})`,
+        status: 403,
+        user: `${auth.user.memo} (${auth.user.folderName})`,
+        method: req.method,
+        deviceId,
+        deviceName
+      });
+      sendJsonResponse(req, res, 403, { error: resolveDeviceErrorMessage(reason), reason, deviceId });
+      return true;
+    }
+
+    auditLogger.recordAccessLog({
+      ip: clientIp,
+      userAgent,
+      action: regResult.newlyRegistered ? '📱 1호기 마스터 기기 등록' : '📱 등록 기기 재확인',
+      target: `${deviceName || deviceId} (${auth.user.memo})`,
+      status: 200,
+      user: `${auth.user.memo} (${auth.user.folderName})`
+    });
+
+    sendJsonResponse(req, res, 200, {
+      ok: true,
+      role: auth.user.role || 'user',
+      newlyRegistered: Boolean(regResult.newlyRegistered),
+      deviceToken: regResult.deviceToken || null
+    });
+    return true;
+  }
+
   // 1. 6자리 일회용 연결 번호(OTP) 발급
   if (req.method === 'POST' && pathname === '/api/auth/otp/issue') {
     if (!checkRateLimit(req, 60)) {
@@ -48,14 +154,14 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     }
 
     const providedApiKey = extractApiKey(req, reqUrl);
-    if (!providedApiKey) {
+    if (providedApiKey === null || !providedApiKey) {
       sendJsonResponse(req, res, 401, { error: 'API 키가 필요합니다.' });
       return true;
     }
 
     const env = readEnvFile();
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
-    const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+    const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     let folderName = 'root';
 
     if (rootMasterKey && providedApiKey === rootMasterKey) {
@@ -75,6 +181,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
         deviceId,
         deviceName,
+        deviceToken,
         clientIp
       });
       if (!deviceResult.allowed) {
@@ -90,12 +197,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
           deviceId,
           deviceName
         });
-        const errorText = reason === 'DEVICE_BLOCKED'
-          ? 'DEVICE_BLOCKED: 관리자에 의해 차단된 기기입니다.'
-          : (reason === 'DEVICE_ID_REQUIRED'
-            ? 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.'
-            : 'DEVICE_UNREGISTERED: 등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.');
-        sendJsonResponse(req, res, 403, { error: errorText, reason, deviceId });
+        sendJsonResponse(req, res, 403, { error: resolveDeviceErrorMessage(reason), reason, deviceId });
         return true;
       }
 
@@ -126,7 +228,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     return true;
   }
 
-  // 2. 6자리 일회용 연결 번호(OTP) 검증 및 정식 기기 등록 (화이트리스트 각인)
+  // 2. 6자리 일회용 연결 번호(OTP) 검증 및 정식 기기 등록 + deviceToken 발급
   if (req.method === 'POST' && pathname === '/api/auth/otp/verify') {
     const otpGuard = checkOtpRateLimit(clientIp);
     if (!otpGuard.allowed) {
@@ -174,6 +276,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
         ok: true,
         serverUrl: currentServerUrl,
         apiKey: exchangeResult.apiKey,
+        deviceToken: exchangeResult.deviceToken || null,
         folderName: exchangeResult.folderName
       });
       return true;
@@ -252,19 +355,34 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       return true;
     }
 
-    // 🔒 [보안 가드] API 키(우선) + 기기 화이트리스트, 관리자 세션, ENFORCE_STORAGE_API_KEY, 허용 출처 검증
+    // 🔒 [보안 가드] API 키(우선) + 기기 화이트리스트·X-Device-Token, 관리자 세션, ENFORCE_STORAGE_API_KEY, 허용 출처 검증
     const providedApiKey = extractApiKey(req, reqUrl);
-    const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
+    const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     const env = readEnvFile();
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
     let isAuthorizedTokenRequest = false;
 
-    if (providedApiKey) {
+    if (providedApiKey !== null) {
+      if (!providedApiKey) {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '🚫 토큰 발급 빈 API 키 차단',
+          target: pathname,
+          status: 401,
+          method: req.method,
+          deviceId,
+          deviceName
+        });
+        sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
+        return true;
+      }
+
       if (rootMasterKey && providedApiKey === rootMasterKey) {
         isAuthorizedTokenRequest = true;
       } else {
-        const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
+        const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId && deviceToken) });
         if (!auth.authenticated || !auth.user) {
           const errMessage = auth.reason === 'API_KEY_EXPIRED'
             ? 'API_KEY_EXPIRED: 사용 기간이 종료된 키입니다.'
@@ -288,15 +406,11 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
         const deviceResult = apiKeyManager.verifyAndTouchDevice(auth.user.folderName, {
           deviceId,
           deviceName,
+          deviceToken,
           clientIp
         });
         if (!deviceResult.allowed) {
           const reason = deviceResult.reason || 'DEVICE_UNAUTHORIZED';
-          const errMessage = reason === 'DEVICE_BLOCKED'
-            ? 'DEVICE_BLOCKED: 관리자에 의해 차단된 기기입니다.'
-            : (reason === 'DEVICE_ID_REQUIRED'
-              ? 'DEVICE_ID_REQUIRED: 기기 식별자(X-Device-Id)가 필요합니다.'
-              : 'DEVICE_UNREGISTERED: 등록되지 않았거나 삭제된 기기입니다. 6자리 번호로 다시 로그인해 주세요.');
           auditLogger.recordAccessLog({
             ip: clientIp,
             userAgent,
@@ -308,7 +422,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
             deviceId,
             deviceName
           });
-          sendJsonResponse(req, res, 403, { error: errMessage, reason, deviceId });
+          sendJsonResponse(req, res, 403, { error: resolveDeviceErrorMessage(reason), reason, deviceId });
           return true;
         }
 
