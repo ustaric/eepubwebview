@@ -1,14 +1,15 @@
 /**
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
- * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 빈 키 명시 시 즉시 401 차단, 미제공 시 관리자 웹 세션 지원
+ * - 🔒 [상수 시간 Root 키 비교] safeCompareSecret 연동으로 timingSafeEqual 기반 안전 대조 적용
+ * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 빈 키 명시 시 즉시 401 차단
+ * - 🛑 [크래시 리포트 수신 거버넌스] ENABLE_CRASH_REPORTS=false 환경변수 설정 시 403 차단 가드 적용 (기본 활성 유지)
  * - 🚫 [미등록/삭제/식별자누락/토큰불일치 기기 403 차단] X-Device-Id 형식·예약어 검증, deviceToken 바인딩 전달 및 차단 기기 원천 거부
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp(GET/HEAD) 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
  * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
  * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
- * - 🔍 [차단 감사 메타데이터 보강] 401/403/429 차단 로그에 method, deviceId, deviceName, origin, authState(원문 비노출) 기록
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
  */
 
@@ -25,6 +26,7 @@ import {
   isAllowedClientOrigin,
   checkRateLimit,
   setCorsHeaders,
+  safeCompareSecret,
   sendJsonResponse,
   readRequestBodyBuffer
 } from '../httpUtils.js';
@@ -53,7 +55,6 @@ function getSharedFoldersConfig(env) {
     }
   }
 
-  // 기존 .env의 SHARED_BOOKS_DIR가 있고 폴더 목록이 비어있다면 자동 1개 등록 (마이그레이션)
   const legacyDir = env.SHARED_BOOKS_DIR;
   if (config.folders.length === 0 && legacyDir && fs.existsSync(legacyDir)) {
     config.folders.push({
@@ -61,7 +62,7 @@ function getSharedFoldersConfig(env) {
       name: '기본 공유 서재',
       path: legacyDir,
       enabled: true,
-      allowedDevices: ['*'] // '*' = 전체 기기 허용
+      allowedDevices: ['*']
     });
     saveSharedFoldersConfig(config);
   }
@@ -147,24 +148,6 @@ function hasExplicitEmptyApiKey(req, reqUrl) {
   return false;
 }
 
-/**
- * 🔑 기기 전용 검증 토큰(X-Device-Token)을 안전 추출합니다.
- * @param {import('http').IncomingMessage} req
- * @param {URL} reqUrl
- * @returns {string}
- */
-function extractDeviceToken(req, reqUrl) {
-  const headerToken = req.headers['x-device-token'];
-  if (headerToken !== undefined) {
-    return String(headerToken).trim();
-  }
-  const queryToken = reqUrl.searchParams.get('deviceToken');
-  if (queryToken !== undefined && queryToken !== null) {
-    return String(queryToken).trim();
-  }
-  return '';
-}
-
 export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, userAgent) {
   if (!pathname.startsWith('/api/storage/')) {
     return false;
@@ -172,7 +155,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
 
   const safeOrigin = getSafeOriginLabel(req);
 
-  // 1. 스토리지 API 요청 횟수 제한 (1분 600회: 대량 마이그레이션 및 표지·메타 일괄 동기화 허용)
+  // 1. 스토리지 API 요청 횟수 제한 (1분 600회)
   if (!checkRateLimit(req, 600)) {
     auditLogger.recordAccessLog({
       ip: clientIp,
@@ -212,8 +195,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   const rootMasterKey = env.STORAGE_API_KEY?.trim();
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
   const providedApiKey = extractApiKey(req, reqUrl);
-  const { deviceId, deviceName } = extractDeviceInfo(req, reqUrl);
-  const deviceToken = extractDeviceToken(req, reqUrl);
+  const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
   const authState = getAuthDiagnosticState(req, reqUrl);
   const isAdminConfigRoute = pathname === '/api/storage/admin/shared-folders';
   const hasAdminSession = isAuthenticated(req);
@@ -238,7 +220,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     sendJsonResponse(req, res, 401, { error: 'EMPTY_API_KEY: 빈 API 키가 전달되었습니다.' });
     return true;
   } else if (providedApiKey) {
-    if (rootMasterKey && providedApiKey === rootMasterKey) {
+    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       targetUserFolder = null;
       authenticatedUserMemo = 'Root Admin';
       isRootAdmin = true;
@@ -420,7 +402,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         sendJsonResponse(req, res, 401, { error: 'API_KEY_REVOKED: 폐기된 API 키입니다.' });
         return true;
       } else {
-        // 명시적으로 전달된 API 키가 무효인 경우 ENFORCE_STORAGE_API_KEY 여부와 무관하게 Root 우회를 차단하고 401 응답
         auditLogger.recordAccessLog({
           ip: clientIp,
           userAgent,
@@ -473,8 +454,13 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 4. 크래시 리포트 수신 (인증/RateLimit/STORAGE_MODE 가드 통과 후 처리)
+  // 4. 크래시 리포트 수신 (거버넌스 가드: ENABLE_CRASH_REPORTS=false 시 안전 차단)
   if (req.method === 'POST' && pathname.startsWith('/api/storage/crash-reports/')) {
+    if (env.ENABLE_CRASH_REPORTS === 'false') {
+      sendJsonResponse(req, res, 403, { error: 'CRASH_REPORTS_DISABLED: 크래시 리포트 수신이 비활성화되어 있습니다.' });
+      return true;
+    }
+
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
     try {
       const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
@@ -544,9 +530,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // -------------------------------------------------------------------------
-  // 🎛️ [신규] 관리자용 다중 공유 폴더 및 기기별 권한 제어 REST API
-  // -------------------------------------------------------------------------
+  // 7. 🎛️ 관리자용 다중 공유 폴더 및 기기별 권한 제어 REST API
   if (pathname === '/api/storage/admin/shared-folders') {
     if (!isRootAdmin) {
       sendJsonResponse(req, res, 403, { error: 'ROOT_ADMIN_REQUIRED: 공유 폴더 설정은 루트 관리자만 가능합니다.' });
@@ -612,7 +596,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 7. ⚡ 공유 도서 내부 복사 (/api/storage/remote-library/import)
+  // 8. ⚡ 공유 도서 내부 복사 (/api/storage/remote-library/import)
   if (req.method === 'POST' && pathname === '/api/storage/remote-library/import') {
     const config = getSharedFoldersConfig(env);
     if (!config.enabled) {
@@ -631,14 +615,12 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         return true;
       }
 
-      // 🌟 [보안 및 경로 정규화] 슬래시 통일 및 상위 디렉터리 탈출(..) 차단
       const normalizedRelPath = rawRelativePath.replace(/\\/g, '/').replace(/^\/+/, '');
       if (normalizedRelPath.includes('..')) {
         sendJsonResponse(req, res, 400, { error: 'INVALID_PATH: 잘못된 경로 형식입니다 (상위 경로 이동 불가).' });
         return true;
       }
 
-      // 대상 공유 폴더 결정
       let matchedFolder = null;
       if (targetFolderId) {
         matchedFolder = config.folders.find(f => f.id === targetFolderId && f.enabled);
@@ -651,7 +633,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         return true;
       }
 
-      // 권한 검증
       if (!isRootAdmin && !matchedFolder.allowedDevices.includes('*') && (!deviceId || !matchedFolder.allowedDevices.includes(deviceId))) {
         sendJsonResponse(req, res, 403, { ok: false, error: 'PERMISSION_DENIED', message: '해당 공유 폴더에 접근할 수 있는 권한이 없습니다.' });
         return true;
@@ -676,7 +657,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 8. 📚 공유 도서 목록 조회 (/api/storage/remote-library)
+  // 9. 📚 공유 도서 목록 조회 (/api/storage/remote-library)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library') {
     const config = getSharedFoldersConfig(env);
 
@@ -685,7 +666,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       return true;
     }
 
-    // 🌟 [기기별 폴더 칩 Stealth 필터링] 요청한 기기에 권한이 부여된 폴더만 엄격 선별
     const allowedFolders = config.folders.filter(f => {
       if (!f.enabled) return false;
       if (!fs.existsSync(f.path)) return false;
@@ -746,7 +726,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 9. 공유 도서 파일 스트리밍 다운로드 (/api/storage/remote-library/download)
+  // 10. 공유 도서 파일 스트리밍 다운로드 (/api/storage/remote-library/download)
   if (req.method === 'GET' && pathname === '/api/storage/remote-library/download') {
     const config = getSharedFoldersConfig(env);
     const reqFile = reqUrl.searchParams.get('file');
@@ -757,7 +737,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       return true;
     }
 
-    // 🌟 [보안 및 경로 정규화] 상위 디렉터리 탈출(..) 차단
     const normalizedReqFile = reqFile.replace(/\\/g, '/').replace(/^\/+/, '');
     if (normalizedReqFile.includes('..')) {
       sendJsonResponse(req, res, 400, { error: 'INVALID_PATH: 잘못된 경로 형식입니다 (상위 경로 이동 불가).' });
@@ -776,7 +755,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       return true;
     }
 
-    // 🔒 [기기별 폴더 접근 권한 검증] /import와 동일한 allowedDevices 검사 적용
     if (!isRootAdmin && !targetFolder.allowedDevices.includes('*') && (!deviceId || !targetFolder.allowedDevices.includes(deviceId))) {
       auditLogger.recordAccessLog({
         ip: clientIp,
@@ -819,7 +797,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 10. 서재 스냅샷 조회 (/api/storage/snapshot)
+  // 11. 서재 스냅샷 조회 (/api/storage/snapshot)
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
     try {
       const snapshot = await storageService.getUnifiedSnapshot(targetUserFolder);
@@ -840,7 +818,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 11. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
+  // 12. 도서 메타데이터 저장 및 조회 (/api/storage/books/:id)
   if (pathname.startsWith('/api/storage/books/') && !pathname.endsWith('/epub')) {
     const rawEnd = pathname.replace('/api/storage/books/', '');
     const decodedEnd = decodeURIComponent(rawEnd);
@@ -922,7 +900,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 11-B. 보관함(archive/) 도서 메타데이터 조회 (/api/storage/archive/:id)
+  // 12-B. 보관함(archive/) 도서 메타데이터 조회 (/api/storage/archive/:id)
   if (req.method === 'GET' && pathname.startsWith('/api/storage/archive/')) {
     const rawEnd = pathname.replace('/api/storage/archive/', '');
     const bookId = decodeURIComponent(rawEnd).replace(/\.json$/i, '');
@@ -937,7 +915,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     return true;
   }
 
-  // 12. EPUB 도서 바이너리 업로드 및 다운로드 (/api/storage/books/:id/epub)
+  // 13. EPUB 도서 바이너리 업로드 및 다운로드 (/api/storage/books/:id/epub)
   if (pathname.startsWith('/api/storage/books/') && pathname.endsWith('/epub')) {
     const rawSegment = pathname.replace('/api/storage/books/', '').replace(/\/epub$/, '');
     const bookId = decodeURIComponent(rawSegment);
@@ -1016,7 +994,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 13. 표지 이미지 관리 (/api/storage/covers/:fileName)
+  // 14. 표지 이미지 관리 (/api/storage/covers/:fileName)
   if (pathname.startsWith('/api/storage/covers/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
 
@@ -1071,7 +1049,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     }
   }
 
-  // 14. 시스템 및 동기화 설정 파일 관리 (/api/storage/settings/:fileName)
+  // 15. 시스템 및 동기화 설정 파일 관리 (/api/storage/settings/:fileName)
   if (pathname.startsWith('/api/storage/settings/')) {
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
 
@@ -1104,11 +1082,6 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   return false;
 }
 
-/**
- * 파일 크기 헤더용 안전 변환 헬퍼
- * @param {number} size 
- * @returns {number}
- */
 function infoSizeFallback(size) {
   return Number.isFinite(size) && size >= 0 ? size : 0;
 }

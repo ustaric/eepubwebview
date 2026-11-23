@@ -1,7 +1,7 @@
 /**
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
- * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, X-Device-Token 포함 경량 검증 및 needsDeviceRegistration 플래그 제공
+ * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, safeCompareSecret 상수 시간 Root 키 검증 및 needsDeviceRegistration 플래그 제공
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
  * - 🔔 [Discord 웹훅 설정 & 조회] GET/POST /api/admin/discord-webhook 웹훅 URL 및 6대 알림 필터, 정기보고 설정 영구 저장 (관리자 세션 필수)
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 실시간 체크된 alertTypes, dailyDigest를 수신하여 디스코드 카드로 전송
@@ -17,6 +17,7 @@ import {
   extractApiKey,
   extractDeviceInfo,
   checkRateLimit,
+  safeCompareSecret,
   sendJsonResponse,
   readRequestBodyBuffer
 } from '../httpUtils.js';
@@ -59,7 +60,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
         authReason = 'API_KEY_EMPTY';
       } else {
         const rootMasterKey = env.STORAGE_API_KEY?.trim();
-        if (rootMasterKey && providedApiKey === rootMasterKey) {
+        if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
           isAuthorizedHealth = true;
           apiKeyValid = true;
           authReason = 'ROOT_KEY';
@@ -82,7 +83,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
             deviceAuthorized = Boolean(deviceResult.allowed);
             deviceReason = deviceResult.allowed ? null : (deviceResult.reason || 'DEVICE_UNAUTHORIZED');
 
-            // 🌟 등록 기기 0대이거나 재발급 직후라 마스터 등록이 필요한 상태임을 명시 전달
+            // 등록 기기 0대이거나 재발급 직후라 마스터 등록이 필요한 상태임을 명시 전달
             if (deviceResult.reason === 'MASTER_DEVICE_REGISTRATION_REQUIRED') {
               needsDeviceRegistration = true;
             }
@@ -155,7 +156,6 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       return true;
     }
 
-    // 🌟 [GET] 현재 저장된 웹훅 URL 및 알림 필터 목록, 정기보고 설정 반환
     if (req.method === 'GET') {
       const env = readEnvFile();
       sendJsonResponse(req, res, 200, {
@@ -173,7 +173,6 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
         const payload = JSON.parse(buffer.toString('utf-8') || '{}');
         const { webhookUrl, action, alertTypes, dailyDigest } = payload;
 
-        // 🌟 [테스트 발송] 체크된 6대 항목 및 정기보고 옵션을 systemMonitor로 함께 전달
         if (action === 'test') {
           const env = readEnvFile();
           const targetAlertTypes = alertTypes !== undefined ? alertTypes : (env.DISCORD_ALERT_TYPES || '500,RESOURCE');
@@ -187,11 +186,9 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
           return true;
         }
 
-        // 🌟 [설정 저장]
         if (action === 'save') {
           const cleanUrl = (webhookUrl || '').trim();
 
-          // alertTypes 정규화 (배열 또는 문자열 대응)
           let cleanAlertTypes = '500,RESOURCE';
           if (Array.isArray(alertTypes)) {
             cleanAlertTypes = alertTypes.join(',');
@@ -201,7 +198,6 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
 
           const isDailyDigest = dailyDigest === true || dailyDigest === 'true';
 
-          // .env 파일에 알림 옵션 3종 영구 저장
           writeEnvFile({
             DISCORD_WEBHOOK_URL: cleanUrl,
             DISCORD_ALERT_TYPES: cleanAlertTypes,

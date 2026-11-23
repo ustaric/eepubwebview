@@ -1,6 +1,7 @@
 /**
  * @file src/routes/authRoutes.js
  * @description Google OAuth, 1호기 마스터 기기 등록 및 6자리 단기 연결 번호(OTP) 인증 전담 라우터
+ * - 🔒 [상수 시간 Root 키 비교] safeCompareSecret 연동으로 timingSafeEqual 기반 안전 대조 적용
  * - 📱 [최초 마스터 기기 등록] POST /api/auth/device/register 등록 기기 0대 상태에서만 1호기 deviceToken 안전 발급
  * - ⚡ [구글 공식 로그인 0초 직통 점프] GET /auth/google 클릭 즉시 302 구글 계정 선택 화면으로 다이렉트 이동
  * - 🔄 [Google OAuth 콜백 & 토큰 교환] GET /auth/google/callback 승인 코드 수신 및 암호화 보관
@@ -21,6 +22,7 @@ import {
   checkOtpRateLimit,
   recordOtpFailure,
   clearOtpFailure,
+  safeCompareSecret,
   sendJsonResponse,
   sendHtmlResponse,
   readRequestBodyBuffer,
@@ -82,7 +84,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
 
-    if (rootMasterKey && providedApiKey === rootMasterKey) {
+    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       sendJsonResponse(req, res, 200, {
         ok: true,
         role: 'root',
@@ -164,7 +166,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     let folderName = 'root';
 
-    if (rootMasterKey && providedApiKey === rootMasterKey) {
+    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       folderName = 'root';
     } else {
       const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
@@ -243,7 +245,6 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       const payload = JSON.parse(buffer.toString('utf-8') || '{}');
       const inputCode = payload.code;
 
-      // 헤더 및 바디에서 게스트 기기 식별 정보 추출
       const headerDevice = extractDeviceInfo(req, reqUrl);
       const guestDeviceId = payload.deviceId || headerDevice.deviceId || '';
       const guestDeviceName = payload.deviceName || headerDevice.deviceName || '';
@@ -355,7 +356,6 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
       return true;
     }
 
-    // 🔒 [보안 가드] API 키(우선) + 기기 화이트리스트·X-Device-Token, 관리자 세션, ENFORCE_STORAGE_API_KEY, 허용 출처 검증
     const providedApiKey = extractApiKey(req, reqUrl);
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     const env = readEnvFile();
@@ -379,7 +379,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
         return true;
       }
 
-      if (rootMasterKey && providedApiKey === rootMasterKey) {
+      if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
         isAuthorizedTokenRequest = true;
       } else {
         const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId && deviceToken) });
