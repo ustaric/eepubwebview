@@ -12,14 +12,15 @@
  * - 🛡️ [실시간 폴더 권한 실측 API] POST /admin/test-folder 제공으로 프로세스 읽기 권한 즉시 검증
  * - 📥 [보안 감사 로그 & 리포트 바로보기/다운로드] ?preview=1 인라인 JSON 열람 및 다운로드/삭제 지원
  * - 🔒 [로그인 5회 브루트포스 락] IP별 실패 횟수 추적 및 1분 내 5회 오류 시 15분 차단 가드 캡슐화
- * - 🔔 [디스코드 환경변수 무손실 보존] 전체 설정 저장 시 DISCORD_ALERT_TYPES, DISCORD_DAILY_DIGEST 보존
+ * - 🛡️ [비밀키 마스킹·덮어쓰기 방어 & 루트 API 스위치] STORAGE_API_KEY 무손실 보존, ENABLE_ROOT_API_KEY 저장, 마스킹 문자열 덮어쓰기 차단
+ * - 🔔 [디스코드 환경변수 무손실 보존] 전체 설정 저장 시 DISCORD_ALERT_TYPES('NONE' 포함), DISCORD_DAILY_DIGEST 보존
  */
 
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { readEnvFile, writeEnvFile, ensureStorageDirectories } from './envManager.js';
+import { readEnvFile, writeEnvFile, ensureStorageDirectories, isMaskedSecretValue } from './envManager.js';
 import { storageService } from './storageService.js';
 import { auditLogger } from './auditLogger.js';
 import { validateSafePath } from './securityGuard.js';
@@ -911,17 +912,20 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
       try {
         const params = new URLSearchParams(body);
         const updates = {};
-        
-        // 🌟 [핵심 개선] 기존 env에 저장되어 있던 Discord 관제 3대 설정 무손실 보존
+
+        // 🌟 [무손실 보존] 기존 env에 저장되어 있던 Discord 관제 3대 설정 및 STORAGE_API_KEY 보존
         const currentEnv = readEnvFile();
         if (currentEnv.DISCORD_WEBHOOK_URL) {
           updates.DISCORD_WEBHOOK_URL = currentEnv.DISCORD_WEBHOOK_URL;
         }
-        if (currentEnv.DISCORD_ALERT_TYPES) {
+        if (currentEnv.DISCORD_ALERT_TYPES !== undefined) {
           updates.DISCORD_ALERT_TYPES = currentEnv.DISCORD_ALERT_TYPES;
         }
-        if (currentEnv.DISCORD_DAILY_DIGEST) {
+        if (currentEnv.DISCORD_DAILY_DIGEST !== undefined) {
           updates.DISCORD_DAILY_DIGEST = currentEnv.DISCORD_DAILY_DIGEST;
+        }
+        if (currentEnv.STORAGE_API_KEY) {
+          updates.STORAGE_API_KEY = currentEnv.STORAGE_API_KEY;
         }
 
         const port = params.get('PORT')?.trim();
@@ -942,8 +946,8 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         const sharedBooksDir = params.get('SHARED_BOOKS_DIR')?.trim() || '';
         updates.SHARED_BOOKS_DIR = sharedBooksDir;
 
-        const storageApiKey = params.get('STORAGE_API_KEY')?.trim() || '';
-        updates.STORAGE_API_KEY = storageApiKey;
+        const isEnableRootApiKey = params.get('ENABLE_ROOT_API_KEY') === 'true';
+        updates.ENABLE_ROOT_API_KEY = isEnableRootApiKey ? 'true' : 'false';
 
         const isEnforceApiKey = params.get('ENFORCE_STORAGE_API_KEY') === 'true';
         updates.ENFORCE_STORAGE_API_KEY = isEnforceApiKey ? 'true' : 'false';
@@ -952,20 +956,36 @@ export async function handleAdminRoute(req, res, pathname, clientIp, userAgent) 
         if (clientId) updates.GOOGLE_CLIENT_ID = clientId;
 
         const clientSecret = params.get('GOOGLE_CLIENT_SECRET')?.trim();
-        if (clientSecret) updates.GOOGLE_CLIENT_SECRET = clientSecret;
+        if (clientSecret) {
+          if (isMaskedSecretValue(clientSecret)) {
+            console.warn('🛡️ [AdminSave] 마스킹 문자열로 GOOGLE_CLIENT_SECRET 덮어쓰기 차단');
+          } else {
+            updates.GOOGLE_CLIENT_SECRET = clientSecret;
+          }
+        }
 
         const redirectUri = params.get('GOOGLE_REDIRECT_URI')?.trim();
         if (redirectUri) updates.GOOGLE_REDIRECT_URI = redirectUri;
 
         const encKey = params.get('TOKEN_ENCRYPTION_KEY')?.trim();
-        if (encKey) updates.TOKEN_ENCRYPTION_KEY = encKey;
+        if (encKey) {
+          if (isMaskedSecretValue(encKey)) {
+            console.warn('🛡️ [AdminSave] 마스킹 문자열로 TOKEN_ENCRYPTION_KEY 덮어쓰기 차단');
+          } else {
+            updates.TOKEN_ENCRYPTION_KEY = encKey;
+          }
+        }
 
         const origin = params.get('ALLOWED_ORIGIN')?.trim();
         if (origin) updates.ALLOWED_ORIGIN = origin;
 
         const newAdminPassword = params.get('NEW_ADMIN_PASSWORD')?.trim();
         if (newAdminPassword) {
-          updates.ADMIN_PASSWORD = newAdminPassword;
+          if (isMaskedSecretValue(newAdminPassword)) {
+            console.warn('🛡️ [AdminSave] 마스킹 문자열로 ADMIN_PASSWORD 덮어쓰기 차단');
+          } else {
+            updates.ADMIN_PASSWORD = newAdminPassword;
+          }
         }
 
         writeEnvFile(updates);

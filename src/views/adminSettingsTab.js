@@ -1,15 +1,17 @@
 /**
  * @file src/views/adminSettingsTab.js
  * @description 관리자 제어 센터 [탭 2: ⚙️ 시스템 설정] HTML 렌더러 모듈
- * - 🔔 [Discord 관제 알림 센터] 웹훅 URL 입력, 실시간 체크 옵션 포함 연결 테스트, 6대 체크박스 필터 및 로그 있을 때만 정기보고 UI 완비
+ * - 🔔 [Discord 관제 알림 센터] 웹훅 URL 마스킹 출력, 저장 즉시 마스킹 동기화, 6대 필터 전체 해제('NONE') 및 정기보고 UI 완비
  * - 📦 [1KB 분기 정책 안내] 1KB 이하 본문 codeblock / 1KB 초과 시 .json 첨부 발송 안내 배지 탑재
- * - 🛡️ [스토리지 API 보안 설정 단일화] 번잡한 박스를 제거하고 엄격 검증 모드 토글만 단정하게 유지
+ * - 🛡️ [스토리지 API 보안 설정 & 루트 키 스위치] 마스터 키 hidden 원문 노출 제거, 엄격 검증 토글 및 ENABLE_ROOT_API_KEY On/Off 스위치 제공
  * - 📋 [주요 접속 정보 복사] GitHub 저장소, 서버 주소, OAuth 리디렉션 URI 원클릭 복사 카드
  * - 🔑 [Google OAuth 연동] 토큰 보유 상태 표출 및 로그인 링크
  * - 📁 [스토리지 모드 토글] 개인 서버 자체 저장소 모드 On/Off 스위치
  * - 📚 [공유 라이브러리 지정] 공유 도서 폴더 경로 입력 및 실측 권한 배지
- * - 🛠️ [시스템 상세 설정 폼] PORT, HOST, CORS, 구글 인증키, 관리자 비밀번호 변경 등 14대 환경변수 폼
+ * - 🛠️ [시스템 상세 설정 폼] PORT, HOST, CORS, 구글 인증키, 관리자 비밀번호 변경 등 환경변수 폼 (escapeHtml 적용)
  */
+
+import { maskSecretValue } from '../envManager.js';
 
 // 공식 깃허브 저장소 주소
 const GITHUB_REPO_URL = 'https://github.com/ustaric/refresh-server';
@@ -26,6 +28,14 @@ function escapeHtml(str = '') {
 
 /**
  * ⚙️ [탭 2] 시스템 설정 HTML 템플릿 렌더러
+ * @param {Object} params
+ * @param {Record<string, string>} [params.env={}]
+ * @param {Object} [params.config={}]
+ * @param {string} [params.currentServerUrl='']
+ * @param {string} [params.redirectUri='']
+ * @param {boolean} [params.hasToken=false]
+ * @param {string} [params.sharedDirBadge='']
+ * @returns {string}
  */
 export function renderSettingsTab({
   env = {},
@@ -37,11 +47,13 @@ export function renderSettingsTab({
 }) {
   const isStorageMode = env.STORAGE_MODE === 'true';
   const sharedBooksDir = env.SHARED_BOOKS_DIR || '';
-  const storageApiKey = env.STORAGE_API_KEY || '';
+  const hasRootApiKey = Boolean(env.STORAGE_API_KEY?.trim());
+  const isEnableRootApiKey = env.ENABLE_ROOT_API_KEY === 'true';
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
 
-  // 🔔 Discord 설정 파싱
+  // 🔔 Discord 설정 파싱 (웹훅 URL은 마스킹 처리하여 HTML DOM 원문 노출 차단)
   const discordWebhookUrl = env.DISCORD_WEBHOOK_URL || '';
+  const maskedDiscordWebhookUrl = maskSecretValue(discordWebhookUrl);
   const alertTypes = (env.DISCORD_ALERT_TYPES || '500,RESOURCE').split(',').map(s => s.trim());
   const isDailyDigest = env.DISCORD_DAILY_DIGEST === 'true';
 
@@ -73,16 +85,16 @@ export function renderSettingsTab({
       <div class="form-group">
         <label>🌐 현재 서버 주소 (웹 뷰어 설정창에 입력할 주소)</label>
         <div class="copy-box">
-          <span class="copy-text" id="text-server">${currentServerUrl}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${currentServerUrl}', this)">복사</button>
+          <span class="copy-text" id="text-server">${escapeHtml(currentServerUrl)}</span>
+          <button type="button" class="btn-copy" onclick="copyToClipboard('${escapeHtml(currentServerUrl)}', this)">복사</button>
         </div>
       </div>
 
       <div class="form-group">
         <label>🔗 구글 콘솔에 등록할 리디렉션 URI (Redirect URI)</label>
         <div class="copy-box">
-          <span class="copy-text" id="text-redirect">${redirectUri}</span>
-          <button type="button" class="btn-copy" onclick="copyToClipboard('${redirectUri}', this)">복사</button>
+          <span class="copy-text" id="text-redirect">${escapeHtml(redirectUri)}</span>
+          <button type="button" class="btn-copy" onclick="copyToClipboard('${escapeHtml(redirectUri)}', this)">복사</button>
         </div>
       </div>
     </div>
@@ -97,13 +109,13 @@ export function renderSettingsTab({
       </div>
       <p style="font-size: 13px; color: var(--text-muted); margin: 0 0 14px 0;">
         서버 내부 장애, 침입 차단 및 자원 과부하 발생 시 디스코드 채널로 실시간 알림 카드를 발송합니다.<br>
-        <span style="color: var(--primary); font-size: 12px;">ℹ️ 로그가 1KB 이하인 경우 본문에 즉시 출력되며, 1KB 초과 시 .json 파일로 자동 첨부됩니다.</span>
+        <span style="color: var(--primary); font-size: 12px;">ℹ️ 로그가 1KB 이하인 경우 본문에 즉시 출력되며, 1KB 초과 시 .json 파일로 자동 첨부됩니다. 등록된 웹훅은 마스킹되어 표시됩니다.</span>
       </p>
 
       <div class="form-group">
         <label>Discord 웹훅 URL (Incoming Webhook URL)</label>
         <div class="input-btn-group">
-          <input type="password" id="input-discord-webhook" value="${escapeHtml(discordWebhookUrl)}" placeholder="https://discord.com/api/webhooks/..." autocomplete="new-password">
+          <input type="password" id="input-discord-webhook" value="${escapeHtml(maskedDiscordWebhookUrl)}" placeholder="https://discord.com/api/webhooks/..." autocomplete="new-password">
           <button type="button" class="btn-copy" onclick="toggleWebhookVisibility(this)">👁️ 보기</button>
           <button type="button" class="btn-browse" id="btn-test-discord" onclick="testDiscordWebhook()">🧪 연결 테스트</button>
         </div>
@@ -111,7 +123,7 @@ export function renderSettingsTab({
 
       <div style="margin-top: 16px; padding: 14px; background: rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid var(--border-color);">
         <label style="font-weight: 600; font-size: 13.5px; display: block; margin-bottom: 10px;">
-          🎯 수신할 알림 이벤트 선택 (6대 필터)
+          🎯 수신할 알림 이벤트 선택 (6대 필터 · 전부 해제 시 미수신)
         </label>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; font-size: 13px;">
           <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -159,9 +171,6 @@ export function renderSettingsTab({
     </div>
 
     <form method="POST" action="/admin/save">
-      <!-- 🌟 기존 마스터 API 키 환경변수 무손실 보존 히든 필드 -->
-      <input type="hidden" name="STORAGE_API_KEY" value="${escapeHtml(storageApiKey)}">
-
       <!-- 3. Google OAuth 토큰 상태 및 재인증 -->
       <div class="card">
         <div class="section-title">
@@ -197,7 +206,7 @@ export function renderSettingsTab({
         </div>
       </div>
 
-      <!-- 5. 🛡️ 스토리지 전용 엄격 API 키 검증 모드 (단일화) -->
+      <!-- 5. 🛡️ 서버 API 보안 방어선 -->
       <div class="card">
         <div class="section-title">
           <span>🛡️ 서버 API 보안 방어선</span>
@@ -222,6 +231,23 @@ export function renderSettingsTab({
             <span class="slider"></span>
           </label>
         </div>
+
+        <div class="toggle-row" style="margin-top: 12px;">
+          <div class="toggle-info">
+            <h4>루트 마스터 API 키 허용 (ENABLE_ROOT_API_KEY)</h4>
+            <p style="margin-bottom: 4px;">
+              체크 해제 시(권장) .env의 <code>STORAGE_API_KEY</code> 인증 경로를 끄고 <strong>[👥 사용자 관리]</strong> 개별 <code>X-API-KEY</code>만 허용합니다.
+            </p>
+            <p style="color: var(--text-muted); font-size: 11.5px; margin: 0;">
+              현재: ${isEnableRootApiKey ? '<span style="color: var(--warning); font-weight: 600;">활성 (루트 키 우회 허용)</span>' : '<span style="color: var(--success); font-weight: 600;">비활성 (유저 키 전용)</span>'}
+              · ${hasRootApiKey ? '.env 루트 키 등록됨 (원문 비노출)' : '.env 루트 키 미설정'}
+            </p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="ENABLE_ROOT_API_KEY" value="true" ${isEnableRootApiKey ? 'checked' : ''}>
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
 
       <!-- 6. 공유 도서 라이브러리 폴더 지정 (간이 탐색기 연동) -->
@@ -238,7 +264,7 @@ export function renderSettingsTab({
         <div class="form-group">
           <label>공유 도서 폴더 절대 경로</label>
           <div class="input-btn-group">
-            <input type="text" id="input-shared-books-dir" name="SHARED_BOOKS_DIR" value="${sharedBooksDir}" placeholder="/home/ubuntu/books 또는 /mnt/storage/books">
+            <input type="text" id="input-shared-books-dir" name="SHARED_BOOKS_DIR" value="${escapeHtml(sharedBooksDir)}" placeholder="/home/ubuntu/books 또는 /mnt/storage/books">
             <button type="button" class="btn-browse" onclick="openFolderPicker()">🔍 폴더 찾아보기</button>
           </div>
         </div>
@@ -253,32 +279,32 @@ export function renderSettingsTab({
         <div class="form-row">
           <div class="form-group">
             <label>포트 (PORT)</label>
-            <input type="text" name="PORT" value="${port}" placeholder="3001">
+            <input type="text" name="PORT" value="${escapeHtml(port)}" placeholder="3001">
           </div>
           <div class="form-group">
             <label>바인딩 호스트 (HOST)</label>
-            <input type="text" name="HOST" value="${serverHost}" placeholder="127.0.0.1">
+            <input type="text" name="HOST" value="${escapeHtml(serverHost)}" placeholder="127.0.0.1">
           </div>
         </div>
 
         <div class="form-group">
           <label>웹 서재 주소 (READER_URL - 서재로 돌아가기 버튼 대상)</label>
-          <input type="text" name="READER_URL" value="${readerUrl}" placeholder="https://epubwebview.vercel.app">
+          <input type="text" name="READER_URL" value="${escapeHtml(readerUrl)}" placeholder="https://epubwebview.vercel.app">
         </div>
 
         <div class="form-group">
           <label>암호화 토큰 파일 경로 (TOKEN_FILE)</label>
-          <input type="text" name="TOKEN_FILE" value="${tokenFile}" placeholder="./data/token.enc">
+          <input type="text" name="TOKEN_FILE" value="${escapeHtml(tokenFile)}" placeholder="./data/token.enc">
         </div>
 
         <div class="form-group">
           <label>허용 웹 뷰어 Origin (ALLOWED_ORIGIN - CORS 및 방화벽 화이트리스트)</label>
-          <input type="text" name="ALLOWED_ORIGIN" value="${allowedOrigin}" placeholder="https://내뷰어주소.vercel.app,http://localhost:5173">
+          <input type="text" name="ALLOWED_ORIGIN" value="${escapeHtml(allowedOrigin)}" placeholder="https://내뷰어주소.vercel.app,http://localhost:5173">
         </div>
 
         <div class="form-group">
           <label>Google Client ID</label>
-          <input type="text" name="GOOGLE_CLIENT_ID" value="${clientId}" placeholder="your-client-id.apps.googleusercontent.com">
+          <input type="text" name="GOOGLE_CLIENT_ID" value="${escapeHtml(clientId)}" placeholder="your-client-id.apps.googleusercontent.com">
         </div>
 
         <div class="form-group">
@@ -288,7 +314,7 @@ export function renderSettingsTab({
 
         <div class="form-group">
           <label>Google Redirect URI</label>
-          <input type="text" name="GOOGLE_REDIRECT_URI" value="${redirectUri}" placeholder="https://내서버도메인/auth/google/callback">
+          <input type="text" name="GOOGLE_REDIRECT_URI" value="${escapeHtml(redirectUri)}" placeholder="https://내서버도메인/auth/google/callback">
         </div>
 
         <div class="form-group">
@@ -317,7 +343,7 @@ export function renderSettingsTab({
         }
       }
 
-      // 🌟 [고도화] 테스트 전송 시 현재 체크된 6대 항목 및 정기보고 옵션을 실시간 수집하여 함께 전송
+      // 🌟 [고도화] 테스트 전송 시 현재 체크된 6대 항목(전체 해제 시 NONE) 및 정기보고 옵션을 실시간 수집하여 함께 전송
       async function testDiscordWebhook() {
         const urlInput = document.getElementById('input-discord-webhook');
         const webhookUrl = urlInput.value.trim();
@@ -330,7 +356,8 @@ export function renderSettingsTab({
         }
 
         const checkboxes = document.querySelectorAll('.discord-filter-cb:checked');
-        const selectedAlertTypes = Array.from(checkboxes).map(cb => cb.value).join(',');
+        const selectedArray = Array.from(checkboxes).map(cb => cb.value);
+        const selectedAlertTypes = selectedArray.length > 0 ? selectedArray.join(',') : 'NONE';
         const dailyDigest = document.getElementById('cb-discord-daily-digest').checked;
 
         testBtn.disabled = true;
@@ -348,7 +375,7 @@ export function renderSettingsTab({
             })
           });
           const data = await res.json();
-          alert(data.message || (data.ok ? '테스트 알림이 발송되었습니다!' : '발송 실패'));
+          alert(data.message || (data.ok ? '테스트 알림이 발송되었습니다!' : (data.error || '발송 실패')));
         } catch (err) {
           alert('테스트 전송 오류: ' + err.message);
         } finally {
@@ -364,7 +391,8 @@ export function renderSettingsTab({
         const badge = document.getElementById('badge-discord-status');
 
         const checkboxes = document.querySelectorAll('.discord-filter-cb:checked');
-        const selectedAlertTypes = Array.from(checkboxes).map(cb => cb.value).join(',');
+        const selectedArray = Array.from(checkboxes).map(cb => cb.value);
+        const selectedAlertTypes = selectedArray.length > 0 ? selectedArray.join(',') : 'NONE';
         const dailyDigest = document.getElementById('cb-discord-daily-digest').checked;
 
         saveBtn.disabled = true;
@@ -384,10 +412,14 @@ export function renderSettingsTab({
           const data = await res.json();
 
           if (data.ok) {
+            if (typeof data.webhookUrl === 'string') {
+              urlInput.value = data.webhookUrl;
+            }
             alert('✅ Discord 관제 알림 설정이 안전하게 저장되었습니다!');
             if (badge) {
-              badge.textContent = webhookUrl ? '연동 중' : '미연동';
-              badge.className = webhookUrl ? 'badge badge-success' : 'badge badge-warning';
+              const isConnected = Boolean(data.hasWebhook);
+              badge.textContent = isConnected ? '연동 중' : '미연동';
+              badge.className = isConnected ? 'badge badge-success' : 'badge badge-warning';
             }
           } else {
             alert('❌ 설정 저장 실패: ' + (data.error || '알 수 없는 오류'));

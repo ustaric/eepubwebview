@@ -1,7 +1,7 @@
 /**
  * @file src/routes/authRoutes.js
  * @description Google OAuth, 1호기 마스터 기기 등록 및 6자리 단기 연결 번호(OTP) 인증 전담 라우터
- * - 🔒 [상수 시간 Root 키 비교] safeCompareSecret 연동으로 timingSafeEqual 기반 안전 대조 적용
+ * - 🔒 [상수 시간 Root 키 비교 & 스위치 제어] ENABLE_ROOT_API_KEY === 'true'일 때만 safeCompareSecret 기반 Root 키 인증 허용
  * - 📱 [최초 마스터 기기 등록] POST /api/auth/device/register 등록 기기 0대 상태에서만 1호기 deviceToken 안전 발급
  * - ⚡ [구글 공식 로그인 0초 직통 점프] GET /auth/google 클릭 즉시 302 구글 계정 선택 화면으로 다이렉트 이동
  * - 🔄 [Google OAuth 콜백 & 토큰 교환] GET /auth/google/callback 승인 코드 수신 및 암호화 보관
@@ -81,10 +81,11 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     }
 
     const env = readEnvFile();
+    const isRootApiKeyEnabled = env.ENABLE_ROOT_API_KEY === 'true';
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
 
-    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
+    if (isRootApiKeyEnabled && rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       sendJsonResponse(req, res, 200, {
         ok: true,
         role: 'root',
@@ -162,11 +163,12 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     }
 
     const env = readEnvFile();
+    const isRootApiKeyEnabled = env.ENABLE_ROOT_API_KEY === 'true';
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     let folderName = 'root';
 
-    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
+    if (isRootApiKeyEnabled && rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       folderName = 'root';
     } else {
       const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId) });
@@ -359,6 +361,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
     const providedApiKey = extractApiKey(req, reqUrl);
     const { deviceId, deviceName, deviceToken } = extractDeviceInfo(req, reqUrl);
     const env = readEnvFile();
+    const isRootApiKeyEnabled = env.ENABLE_ROOT_API_KEY === 'true';
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
     const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
     let isAuthorizedTokenRequest = false;
@@ -379,7 +382,7 @@ export async function handleAuthRoute(req, res, pathname, reqUrl, clientIp, user
         return true;
       }
 
-      if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
+      if (isRootApiKeyEnabled && rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
         isAuthorizedTokenRequest = true;
       } else {
         const auth = apiKeyManager.authenticateApiKey(providedApiKey, { activatePending: Boolean(deviceId && deviceToken) });

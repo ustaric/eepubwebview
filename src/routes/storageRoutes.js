@@ -1,7 +1,7 @@
 /**
  * @file src/routes/storageRoutes.js
  * @description 자체 스토리지 모드(/api/storage/*) REST API 및 보안 가드 전담 라우터
- * - 🔒 [상수 시간 Root 키 비교] safeCompareSecret 연동으로 timingSafeEqual 기반 안전 대조 적용
+ * - 🔒 [상수 시간 Root 키 비교 & 스위치 제어] ENABLE_ROOT_API_KEY === 'true'일 때만 safeCompareSecret 기반 Root 키 인증 허용
  * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 빈 키 명시 시 즉시 401 차단
  * - 🛑 [크래시 리포트 수신 거버넌스] ENABLE_CRASH_REPORTS=false 환경변수 설정 시 403 차단 가드 적용 (기본 활성 유지)
  * - 🚫 [미등록/삭제/식별자누락/토큰불일치 기기 403 차단] X-Device-Id 형식·예약어 검증, deviceToken 바인딩 전달 및 차단 기기 원천 거부
@@ -192,6 +192,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   let authenticatedUserMemo = 'Root Admin';
   let isRootAdmin = false;
 
+  const isRootApiKeyEnabled = env.ENABLE_ROOT_API_KEY === 'true';
   const rootMasterKey = env.STORAGE_API_KEY?.trim();
   const isEnforceApiKey = env.ENFORCE_STORAGE_API_KEY === 'true';
   const providedApiKey = extractApiKey(req, reqUrl);
@@ -220,7 +221,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     sendJsonResponse(req, res, 401, { error: 'EMPTY_API_KEY: 빈 API 키가 전달되었습니다.' });
     return true;
   } else if (providedApiKey) {
-    if (rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
+    if (isRootApiKeyEnabled && rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
       targetUserFolder = null;
       authenticatedUserMemo = 'Root Admin';
       isRootAdmin = true;
