@@ -1,7 +1,7 @@
 /**
  * @file src/routes/systemRoutes.js
  * @description 시스템 헬스체크, 자원 관제 및 Discord 웹훅 라우터
- * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, ENABLE_ROOT_API_KEY 스위치 기반 Root 키 제어 및 needsDeviceRegistration 플래그 제공
+ * - 🩺 [서버 헬스체크 & 최소 노출 검증] GET /api/health Rate Limit 적용, ENABLE_ROOT_API_KEY 스위치 기반 Root 키 제어, needsDeviceRegistration 및 remoteLibraryAccessible 플래그 제공
  * - 📊 [실시간 자원 사용량] GET /api/admin/system-stats CPU(1분 평균), RAM, DISK 점유율 반환 (관리자 세션 필수)
  * - 🔔 [Discord 웹훅 마스킹 조회·안전 저장] GET/POST /api/admin/discord-webhook 웹훅 URL 마스킹 반환, 마스킹 값 전송 시 기존 URL 보존 및 6대 필터 전체 해제('NONE') 지원
  * - 🧪 [고도화된 테스트 연계] POST action: "test" 시 마스킹 URL 자동 복원 및 실시간 체크된 alertTypes, dailyDigest를 디스코드 카드로 전송
@@ -13,6 +13,7 @@ import { auditLogger } from '../auditLogger.js';
 import { readEnvFile, writeEnvFile, maskSecretValue, isMaskedSecretValue } from '../envManager.js';
 import { systemMonitor } from '../systemMonitor.js';
 import { isAuthenticated } from '../adminController.js';
+import { checkRemoteLibraryAccessible } from '../services/storage/remoteLibraryEngine.js';
 import {
   extractApiKey,
   extractDeviceInfo,
@@ -49,6 +50,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
     const rootMasterKey = env.STORAGE_API_KEY?.trim();
 
     let isAuthorizedHealth = false;
+    let isRootHealth = false;
     let apiKeyValid = null;
     let authReason = null;
     let deviceAuthorized = null;
@@ -62,6 +64,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
         authReason = 'API_KEY_EMPTY';
       } else if (isRootApiKeyEnabled && rootMasterKey && safeCompareSecret(providedApiKey, rootMasterKey)) {
         isAuthorizedHealth = true;
+        isRootHealth = true;
         apiKeyValid = true;
         authReason = 'ROOT_KEY';
         deviceAuthorized = true;
@@ -100,11 +103,16 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       }
     } else if (hasAdminSession) {
       isAuthorizedHealth = true;
+      isRootHealth = true;
       apiKeyValid = true;
       authReason = 'ADMIN_SESSION';
       deviceAuthorized = true;
       userRole = 'admin';
     }
+
+    const remoteLibraryAccessible = (isAuthorizedHealth && env.STORAGE_MODE === 'true')
+      ? checkRemoteLibraryAccessible(env, { isRootAdmin: isRootHealth, deviceId })
+      : null;
 
     sendJsonResponse(req, res, 200, {
       ok: true,
@@ -113,6 +121,7 @@ export async function handleSystemRoute(req, res, pathname, reqUrl, clientIp, us
       storageMode: env.STORAGE_MODE === 'true',
       multiUserReady: true,
       sharedBooksDir: isAuthorizedHealth ? (env.SHARED_BOOKS_DIR || null) : null,
+      remoteLibraryAccessible,
       hasStorageApiKey: Boolean(isRootApiKeyEnabled && rootMasterKey),
       rootApiKeyEnabled: isRootApiKeyEnabled,
       enforceApiKey: env.ENFORCE_STORAGE_API_KEY === 'true',

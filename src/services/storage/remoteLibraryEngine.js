@@ -2,6 +2,7 @@
  * @file src/services/storage/remoteLibraryEngine.js
  * @description 관리자 디렉터리 트리 탐색, 권한 실측, 외부 공유 서재 스캔 및 서버 내부 0초 도서 직통 복사(Import) 엔진
  * - 🔍 [디렉터리 트리 & 권한 실측] testDirectoryPermissions 및 getDirectoryTree로 관리자 탐색기 제어
+ * - 🛡️ [O(1) 권한 판정 SSOT] checkRemoteLibraryAccessible로 도서 재귀 스캔 없이 기기별 공유 도서함 접근 가능 여부 판정
  * - 📚 [공유 폴더 도서 재귀 스캔] getRemoteBooks로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집
  * - ⚡ [서버 내부 0초 직통 복사 & 기존 기록 보존] importRemoteBookToLibrary로 books/ 안착 시 기존 독서 진행률/CFI/표지 무손실 보존
  * - 🛡️ [확장자 & 심볼릭 링크 보안] isAllowedBookFile 및 resolveSafeRelativePath로 탈출 시도 실측 차단
@@ -17,6 +18,99 @@ import {
   ensureDir
 } from './storageContext.js';
 import { getBookMetadata, saveBookMetadata } from './bookStorageEngine.js';
+
+// 📁 다중 공유 폴더 설정 저장 파일 경로
+const SHARED_FOLDERS_CONFIG_FILE = './data/shared_folders.json';
+
+/**
+ * 💾 다중 공유 폴더 설정 안전 저장 헬퍼
+ * @param {Object} config - 저장할 공유 폴더 설정 객체
+ * @returns {void}
+ */
+export function saveSharedFoldersConfig(config) {
+  try {
+    const dir = path.dirname(SHARED_FOLDERS_CONFIG_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SHARED_FOLDERS_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('❌ [StorageService] shared_folders.json 저장 실패:', e.message);
+  }
+}
+
+/**
+ * 📂 다중 공유 폴더 설정 안전 조회 헬퍼 (하위 호환성 100% 보장)
+ * @param {Object} [env={}] - 환경 변수 객체
+ * @returns {{ enabled: boolean, folders: Array<{ id: string, name: string, path: string, enabled: boolean, allowedDevices: string[] }> }}
+ */
+export function getSharedFoldersConfig(env = {}) {
+  let config = { enabled: true, folders: [] };
+
+  if (fs.existsSync(SHARED_FOLDERS_CONFIG_FILE)) {
+    try {
+      const raw = fs.readFileSync(SHARED_FOLDERS_CONFIG_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        config = {
+          enabled: parsed.enabled !== false,
+          folders: Array.isArray(parsed.folders) ? parsed.folders : []
+        };
+      }
+    } catch (e) {
+      console.warn('⚠️ [StorageService] shared_folders.json 파싱 실패 (기본값 복구):', e.message);
+    }
+  }
+
+  const legacyDir = env?.SHARED_BOOKS_DIR;
+  if (config.folders.length === 0 && legacyDir && fs.existsSync(legacyDir)) {
+    config.folders.push({
+      id: 'default',
+      name: '기본 공유 서재',
+      path: legacyDir,
+      enabled: true,
+      allowedDevices: ['*']
+    });
+    saveSharedFoldersConfig(config);
+  }
+
+  return config;
+}
+
+/**
+ * 🛡️ 도서 재귀 스캔 없이 현재 기기/계정의 공유 도서함 접근 가능 여부를 O(1) 폴더 실측으로 판정합니다.
+ * @param {Object} [env={}] - 환경 변수 객체
+ * @param {Object} [context={}] - 인증 컨텍스트
+ * @param {boolean} [context.isRootAdmin=false] - 루트 관리자/웹 세션 여부
+ * @param {string} [context.deviceId=''] - 요청 기기 식별자
+ * @returns {boolean} 공유 도서함 접근 가능 여부
+ */
+export function checkRemoteLibraryAccessible(env = {}, { isRootAdmin = false, deviceId = '' } = {}) {
+  if (env?.STORAGE_MODE !== 'true') {
+    return false;
+  }
+
+  const config = getSharedFoldersConfig(env);
+  if (!config.enabled || !Array.isArray(config.folders) || config.folders.length === 0) {
+    return false;
+  }
+
+  for (const folder of config.folders) {
+    if (!folder || !folder.enabled || !folder.path) continue;
+
+    const allowedDevices = Array.isArray(folder.allowedDevices) ? folder.allowedDevices : [];
+    const hasDevicePermission = Boolean(isRootAdmin)
+      || allowedDevices.includes('*')
+      || Boolean(deviceId && allowedDevices.includes(deviceId));
+
+    if (!hasDevicePermission) continue;
+
+    const permCheck = testDirectoryPermissions(folder.path);
+    if (permCheck.readable) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 // =========================================================================
 // 🔍 1. 서버 디렉터리 탐색 및 권한 실측 엔진

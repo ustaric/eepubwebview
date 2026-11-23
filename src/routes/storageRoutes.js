@@ -8,18 +8,22 @@
  * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices(사용자별 maxDevices 반영) 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp(GET/HEAD) 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
- * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
+ * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증, 기기별 Stealth 권한 필터링 및 snapshot 접근 가능 플래그 연동
  * - ⚡ [하위 폴더 깊은 경로 복사 지원] 2024년/05월/15일/책이름.epub 형태의 경로 정규화 및 안전한 0초 복사(/import) 지원
  * - 📖 [도서 메타 & EPUB 바이너리] 스트리밍 송수신, 무손실 파쇄 및 IndexedDB 캐싱 완비
  */
 
 import fs from 'fs';
-import path from 'path';
 import { storageService } from '../storageService.js';
 import { auditLogger } from '../auditLogger.js';
 import { apiKeyManager } from '../apiKeyManager.js';
 import { readEnvFile } from '../envManager.js';
 import { isAuthenticated } from '../adminController.js';
+import {
+  getSharedFoldersConfig,
+  saveSharedFoldersConfig,
+  checkRemoteLibraryAccessible
+} from '../services/storage/remoteLibraryEngine.js';
 import {
   extractApiKey,
   extractDeviceInfo,
@@ -31,58 +35,9 @@ import {
   readRequestBodyBuffer
 } from '../httpUtils.js';
 
-// 📁 다중 공유 폴더 설정 저장 파일 경로
-const SHARED_FOLDERS_CONFIG_FILE = './data/shared_folders.json';
-
 // 🛡️ 기기 식별자 형식 및 프로토타입 오염 예약어 가드
 const DEVICE_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
 const FORBIDDEN_DEVICE_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty']);
-
-/**
- * 📂 다중 공유 폴더 설정 안전 조회 헬퍼 (하위 호환성 100% 보장)
- * @param {Object} env 
- * @returns {{ enabled: boolean, folders: Array<{ id: string, name: string, path: string, enabled: boolean, allowedDevices: string[] }> }}
- */
-function getSharedFoldersConfig(env) {
-  let config = { enabled: true, folders: [] };
-
-  if (fs.existsSync(SHARED_FOLDERS_CONFIG_FILE)) {
-    try {
-      const raw = fs.readFileSync(SHARED_FOLDERS_CONFIG_FILE, 'utf-8');
-      config = JSON.parse(raw);
-    } catch (e) {
-      console.warn('⚠️ [StorageRoutes] shared_folders.json 파싱 실패 (기본값 복구):', e.message);
-    }
-  }
-
-  const legacyDir = env.SHARED_BOOKS_DIR;
-  if (config.folders.length === 0 && legacyDir && fs.existsSync(legacyDir)) {
-    config.folders.push({
-      id: 'default',
-      name: '기본 공유 서재',
-      path: legacyDir,
-      enabled: true,
-      allowedDevices: ['*']
-    });
-    saveSharedFoldersConfig(config);
-  }
-
-  return config;
-}
-
-/**
- * 💾 다중 공유 폴더 설정 안전 저장 헬퍼
- * @param {Object} config 
- */
-function saveSharedFoldersConfig(config) {
-  try {
-    const dir = path.dirname(SHARED_FOLDERS_CONFIG_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(SHARED_FOLDERS_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('❌ [StorageRoutes] shared_folders.json 저장 실패:', e.message);
-  }
-}
 
 /**
  * 🔍 요청 출처(Origin 또는 Referer origin) 안전 추출 헬퍼
@@ -804,6 +759,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   if (req.method === 'GET' && pathname === '/api/storage/snapshot') {
     try {
       const snapshot = await storageService.getUnifiedSnapshot(targetUserFolder);
+      const remoteLibraryAccessible = checkRemoteLibraryAccessible(env, { isRootAdmin, deviceId });
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
@@ -812,7 +768,10 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
         status: 200,
         user: authenticatedUserMemo
       });
-      sendJsonResponse(req, res, 200, snapshot);
+      sendJsonResponse(req, res, 200, {
+        ...snapshot,
+        remoteLibraryAccessible
+      });
       return true;
     } catch (err) {
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '서재 스냅샷 실패', target: err.message, status: 500, user: authenticatedUserMemo });
