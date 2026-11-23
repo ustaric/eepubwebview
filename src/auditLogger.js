@@ -10,7 +10,7 @@
  * - 🔍 [차단 요청 추적 메타데이터] method, deviceId, deviceName, origin, authState(원문 비노출) 선택 기록 지원
  * - 🔔 [선택적 디스코드 실시간 알림] DISCORD_ALERT_TYPES(500, 401, 403, 429, ATTACK) 설정에 따른 조건부 웹훅 연동
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
- * - 🧹 [민감정보 마스킹] securityGuard.maskSensitiveLog 연동으로 토큰/비밀번호 디스크/RAM 평문 노출 차단
+ * - 🧹 [민감정보 마스킹 & 심볼릭 경로 검증] maskSensitiveLog 및 validateSafePath 이중 방어 적용
  * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
  * - 💾 [디스크/도서 메트릭 집계] books/, archive/, users/, logs/ 실측 용량 및 권수 60초 캐싱 연산
  */
@@ -18,7 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { maskSensitiveLog } from './securityGuard.js';
+import { maskSensitiveLog, validateSafePath } from './securityGuard.js';
 import { readEnvFile } from './envManager.js';
 import { systemMonitor } from './systemMonitor.js';
 
@@ -463,13 +463,16 @@ export const auditLogger = {
   getFormattedLogContent(relativePath) {
     if (!relativePath || !fs.existsSync(LOGS_DIR)) return null;
 
-    const fullPath = path.resolve(LOGS_DIR, relativePath);
-    if (!fullPath.startsWith(LOGS_DIR) || !fs.existsSync(fullPath)) {
+    const pathCheck = validateSafePath(LOGS_DIR, relativePath);
+    if (!pathCheck.safe || !pathCheck.realPath || !fs.existsSync(pathCheck.realPath)) {
       return null;
     }
 
     try {
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      if (!fs.statSync(pathCheck.realPath).isFile()) {
+        return null;
+      }
+      const content = fs.readFileSync(pathCheck.realPath, 'utf-8');
       const lines = content.trim().split('\n').filter(Boolean);
       const parsedArray = lines.map(line => {
         try {
@@ -493,13 +496,16 @@ export const auditLogger = {
   deleteLogFile(relativePath) {
     if (!relativePath || !fs.existsSync(LOGS_DIR)) return false;
 
-    const fullPath = path.resolve(LOGS_DIR, relativePath);
-    if (!fullPath.startsWith(LOGS_DIR) || !fs.existsSync(fullPath)) {
+    const pathCheck = validateSafePath(LOGS_DIR, relativePath);
+    if (!pathCheck.safe || !pathCheck.realPath || !fs.existsSync(pathCheck.realPath)) {
       return false;
     }
 
     try {
-      fs.unlinkSync(fullPath);
+      if (!fs.statSync(pathCheck.realPath).isFile()) {
+        return false;
+      }
+      fs.unlinkSync(pathCheck.realPath);
       console.log(`🗑️ [AuditLogger] 일자별 로그 파일 삭제 완료: '${relativePath}'`);
       return true;
     } catch (err) {

@@ -4,7 +4,7 @@
  * - 🛡️ [심볼릭 링크 및 Path Traversal 원천 차단] fs.realpathSync 기반 실물 물리 경로 검증
  * - 🔒 [도서 확장자 및 파일명 엄격 화이트리스트] .epub, .txt, .webp, .json 외의 임의 시스템 파일 접근 차단
  * - 🚦 [HTTP 보안 응답 헤더 주입] nosniff, SAMEORIGIN, Referrer-Policy 자동 주입
- * - 🧹 [로그 민감정보 실시간 마스킹] 비밀번호, Access Token, Secret 등의 감사 로그 노출 원천 봉쇄
+ * - 🧹 [로그 민감정보 실시간 마스킹] 비밀번호, Access Token, Secret, sk_live/dt_ 토큰, apiKey 쿼리, Discord 웹훅 URL 비식별화
  */
 
 import fs from 'fs';
@@ -94,7 +94,7 @@ export function injectSecurityHeaders(res) {
 
 /**
  * 🧹 [로그 민감정보 마스킹]
- * 로그 링 버퍼나 콘솔 출력에 노출될 수 있는 토큰, 비밀번호를 안전하게 비식별화
+ * 로그 링 버퍼나 콘솔 출력에 노출될 수 있는 토큰, 비밀번호, API 키, 웹훅 URL을 안전하게 비식별화
  * @param {string} rawText 
  * @returns {string} 마스킹된 텍스트
  */
@@ -102,10 +102,14 @@ export function maskSensitiveLog(rawText = '') {
   if (!rawText || typeof rawText !== 'string') return '';
 
   return rawText
+    // Discord 웹훅 URL 마스킹
+    .replace(/https:\/\/discord\.com\/api\/webhooks\/[^\s"'`<>]+/gi, 'https://discord.com/api/webhooks/********')
+    // 서버 발급 사용자 API 키(sk_live_*) 및 기기 보안 토큰(dt_*) 마스킹
+    .replace(/\b(sk_live|dt)_[a-zA-Z0-9_-]{16,}\b/g, '$1_********')
     // 비밀번호 필드 마스킹
     .replace(/(password|pass|currentPass|newPass)=([^& \t\r\n]+)/gi, '$1=********')
-    // 토큰 파라미터 마스킹
-    .replace(/(access_token|refresh_token|token|session|auth|code)=([^& \t\r\n]+)/gi, (match, key, val) => {
+    // 토큰 및 API 키 파라미터 마스킹
+    .replace(/(access_token|refresh_token|api_?key|token|session|auth|code)=([^& \t\r\n]+)/gi, (match, key, val) => {
       const masked = val.length > 8 ? `${val.substring(0, 4)}...${val.substring(val.length - 4)}` : '****';
       return `${key}=${masked}`;
     })

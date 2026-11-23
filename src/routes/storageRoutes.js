@@ -5,7 +5,7 @@
  * - 🔑 [지능형 API 키 우선 & 관리자 쿠키 검증] API 키 명시 시 사용자/Root 키 우선 판정, 빈 키 명시 시 즉시 401 차단
  * - 🛑 [크래시 리포트 수신 거버넌스] ENABLE_CRASH_REPORTS=false 환경변수 설정 시 403 차단 가드 적용 (기본 활성 유지)
  * - 🚫 [미등록/삭제/식별자누락/토큰불일치 기기 403 차단] X-Device-Id 형식·예약어 검증, deviceToken 바인딩 전달 및 차단 기기 원천 거부
- * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
+ * - 📱 [등록 기기 관리 REST API 탑재] GET /api/storage/devices(사용자별 maxDevices 반영) 및 DELETE /api/storage/devices/:id 슬롯 반환
  * - 🖼️ [표지 이미지 books/ 직통 매칭] /covers/ 및 /books/*.webp(GET/HEAD) 요청 시 books/ 폴더 내 실물 WebP 표지 100% 반환
  * - 🚦 [용량 초과 사전 차단 & 동기화 여유 한도] Content-Length 할당량 초과 시 413 거부 및 분당 600회 대량 동기화 허용
  * - 📂 [다중 공유 라이브러리 & 기기별 폴더 칩 권한] shared_folders.json 기반 On/Off 스위치, 다중 폴더, 스키마 검증 및 기기별 Stealth 권한 필터링 완비
@@ -189,6 +189,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
   // 3. API 키 우선 인증 및 관리자 쿠키 세션·기기 화이트리스트 가드
   let targetUserFolder = null;
   let userQuotaBytes = 1073741824;
+  let userMaxDevices = 6;
   let authenticatedUserMemo = 'Root Admin';
   let isRootAdmin = false;
 
@@ -233,6 +234,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
       if (auth.authenticated && auth.user) {
         targetUserFolder = auth.user.folderName;
         userQuotaBytes = auth.user.storageQuotaBytes || (1024 * 1024 * 1024);
+        userMaxDevices = auth.user.maxDevices || 6;
         authenticatedUserMemo = `${auth.user.memo} (${auth.user.folderName})`;
 
         if (!deviceId) {
@@ -497,7 +499,7 @@ export async function handleStorageRoute(req, res, pathname, reqUrl, clientIp, u
     const devices = targetUserFolder ? apiKeyManager.getUserDevices(targetUserFolder) : [];
     sendJsonResponse(req, res, 200, {
       ok: true,
-      maxDevices: 6,
+      maxDevices: userMaxDevices,
       totalDevices: devices.length,
       devices
     });

@@ -14,7 +14,7 @@
  * - 🟢 [원터치 활성화] 발급 후 24시간 내 최초 1회 인증 성공 시 ACTIVE 상태로 자동 영구 활성화
  * - 📁 [사용자 샌드박스 골격 자동 생성] user_xxxx 채번 시 books/, settings/, archive/ 디렉터리 즉시 준비
  * - 🔄 [무손실 재발급 & 기기 슬롯 클린 리셋] 키 분실 시 도서/설정/진행률 100% 보존 상태로 기기 슬롯을 초기화하여 첫 기기 즉시 연결 지원
- * - 🛡️ [원자적 메타데이터 저장 & 쓰기 스로틀링] .tmp 쓰기 후 renameSync 교체 + 인메모리 캐시/60초 Flush로 디스크 I/O 병목 완화
+ * - 🛡️ [원자적 메타데이터 저장 & 쓰기 스로틀링] .tmp 쓰기 후 renameSync 교체 + 인메모리 캐시/60초 Flush + flushPendingChanges 종료 즉시 저장
  */
 
 import fs from 'fs';
@@ -304,6 +304,15 @@ function generateUniqueFolderName() {
 }
 
 export const apiKeyManager = {
+  /**
+   * 💾 지연 저장 대기 중인 접속 이력(dirty 상태)을 즉시 디스크에 반영합니다.
+   * 주로 SIGTERM/SIGINT 등 프로세스 정상 종료 훅에서 호출합니다.
+   * @returns {void}
+   */
+  flushPendingChanges() {
+    flushDirtyApiKeys(true);
+  },
+
   /**
    * 🎲 [신규 API 키 발급 및 서재 폴더 골격 즉시 생성]
    * @param {Object} options
