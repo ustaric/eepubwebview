@@ -2,7 +2,8 @@
  * @file src/services/storage/adminLibraryInspector.js
  * @description 관리자용 사용자 서재(user_xxxx) 디스크 실측, 이상 파일 탐지, 개별/전체 삭제, CFI 초기화 및 묘비 관리 ESM 서비스
  * - 🔒 [엄격 사용자 샌드박스] user_xxxx 폴더만 허용하고 validateSafePath 실측 검증을 거쳐 Root 영역 접근 원천 차단
- * - 🔍 [디스크 실측 그룹핑] books/ 및 archive/ 실물 파일(.json/.epub/.cover_*.webp/찌꺼기) 전수 스캔 및 7대 이상 징후 탐지
+ * - 🔍 [디스크 실측 그룹핑] books/ 및 archive/ 실물 파일(.json/.epub/.cover_*.webp/찌꺼기) 전수 스캔 및 이상 징후 탐지
+ * - 🖼️ [표지 실물 판정 정합성] bookStorageEngine.getCoverImagePath 규격(covers/ 제거·후보군·실물 폴백)과 일치한 표지 실물 유무 판정
  * - 🎯 [동기화 규칙 완벽 호응] 표지 삭제·CFI 초기화 시 lastModified를 현재 시각으로 갱신하여 웹뷰어 역덮어쓰기(Push) 차단
  * - 🪦 [묘비 정밀 제어] 전체 삭제 시 선택적 deleted-books.json 등록 및 특정 bookId 묘비 핀포인트 해제 지원
  */
@@ -14,7 +15,8 @@ import {
   USERS_DIR,
   resolveStorageContext,
   readJsonSafely,
-  writeJsonSafely
+  writeJsonSafely,
+  generateFilenameCandidates
 } from './storageContext.js';
 import { deleteBookAll, deleteCoverImage } from './bookStorageEngine.js';
 
@@ -59,6 +61,31 @@ function parseDiskAssetFile(fileName) {
     return { type: 'cover', bookId: coverMatch[1] };
   }
   return { type: 'other', bookId: null };
+}
+
+/**
+ * 🖼️ 메타데이터의 cloudCoverFileName에 대응하는 실물 표지가 디스크(coverFiles)에 존재하는지 판별합니다.
+ * bookStorageEngine.getCoverImagePath()와 동일한 정규화(covers/ 제거, 후보군 매칭, 실물 .cover_*.webp 폴백) 기준을 적용합니다.
+ * @param {string} cloudCoverFileName - JSON 메타에 기록된 표지 파일명
+ * @param {Array<{ fileName: string, location: string, sizeBytes: number }>} [coverFiles=[]] - 동일 bookId로 스캔된 디스크 표지 목록
+ * @returns {boolean} 실물 표지 존재 여부
+ */
+function hasMatchingCoverOnDisk(cloudCoverFileName, coverFiles = []) {
+  if (!Array.isArray(coverFiles) || coverFiles.length === 0) return false;
+
+  const cleanCoverRef = String(cloudCoverFileName || '').replace(/^covers[/\\]/i, '').trim();
+  if (!cleanCoverRef || cleanCoverRef === '없음') return true;
+
+  const candidates = new Set(generateFilenameCandidates(cleanCoverRef));
+  const exactOrNormalizedMatch = coverFiles.some(
+    (c) => c.sizeBytes > 0 && (candidates.has(c.fileName) || candidates.has(c.fileName.normalize('NFC')))
+  );
+  if (exactOrNormalizedMatch) {
+    return true;
+  }
+
+  // getCoverImagePath() 2차 폴백과 동일하게 동일 bookId의 정상 실물 표지(0B 초과)가 존재하면 실물 보유로 판정
+  return coverFiles.some((c) => c.sizeBytes > 0);
 }
 
 /**
@@ -194,7 +221,7 @@ export function inspectUserLibrary(userFolder) {
       !item.jsonCorrupted &&
       item.cloudCoverFileName &&
       item.cloudCoverFileName !== '없음' &&
-      !item.coverFiles.some((c) => c.fileName === item.cloudCoverFileName)
+      !hasMatchingCoverOnDisk(item.cloudCoverFileName, item.coverFiles)
     ) {
       item.anomalies.push('ORPHAN_COVER_REF');
     }
