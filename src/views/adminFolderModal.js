@@ -5,6 +5,7 @@
  * - 🎯 [범용 인풋 주입 지원] openFolderPicker(targetInputId) 지원으로 시스템 설정 및 공유 서재 등록 폼 어디든 경로 주입 가능
  * - ⚡ [원클릭 즉시 주입] 번거로운 alert() 확인 팝업을 제거하고 대상 인풋에 경로 즉시 주입 및 모달 자동 닫기
  * - 🔍 [fs-tree 비동기 브라우징 & 실측] /admin/fs-tree 및 /admin/test-folder 연동 안전한 디렉터리 탐색
+ * - 🛡️ [속성 기반 클릭 위임 & HTML 이스케이프] 특수문자·따옴표 포함 폴더명 안전 처리
  */
 
 /**
@@ -116,6 +117,15 @@ export function renderFolderModalAndScript() {
   </div>
 
   <script>
+    function escModalHtml(str) {
+      return String(str == null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function copyToClipboard(text, btnElement) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(function() {
@@ -192,10 +202,10 @@ export function renderFolderModalAndScript() {
           var accessClass = d.readable ? '' : 'no-access';
           var icon = d.readable ? '📁' : '🔒';
           var badge = d.readable ? '' : '<span style="font-size:10px;color:var(--danger);margin-left:auto;">(권한 없음)</span>';
-          var safePath = d.path.replace(/\\\\/g, '/');
+          var safePath = String(d.path || '').replace(/\\\\/g, '/');
 
-          html += '<div class="folder-item ' + accessClass + '" onclick="handleFolderClick(\\'' + safePath + '\\', ' + d.readable + ')">' +
-                  '<span class="folder-name"><span>' + icon + '</span> ' + d.name + '</span>' +
+          html += '<div class="folder-item ' + accessClass + '" data-folder-path="' + escModalHtml(safePath) + '" data-folder-readable="' + (d.readable ? '1' : '0') + '">' +
+                  '<span class="folder-name"><span>' + icon + '</span> ' + escModalHtml(d.name) + '</span>' +
                   badge +
                   '</div>';
         });
@@ -203,7 +213,7 @@ export function renderFolderModalAndScript() {
 
       } catch (err) {
         pathEl.textContent = targetPath;
-        listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--danger);font-size:12px;">폴더를 읽을 수 없습니다: ' + err.message + '</div>';
+        listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--danger);font-size:12px;">폴더를 읽을 수 없습니다: ' + escModalHtml(err.message) + '</div>';
         if (targetPath !== '/') {
           setTimeout(function() { loadDirectoryTree('/'); }, 1200);
         }
@@ -248,12 +258,20 @@ export function renderFolderModalAndScript() {
           }
           closeFolderPicker();
         } else {
-          msgEl.innerHTML = '<span style="color:var(--danger);">❌ 지정 불가: ' + (result.error || '읽기 권한이 없습니다.') + '</span>';
+          msgEl.innerHTML = '<span style="color:var(--danger);">❌ 지정 불가: ' + escModalHtml(result.error || '읽기 권한이 없습니다.') + '</span>';
         }
       } catch (err) {
-        msgEl.innerHTML = '<span style="color:var(--danger);">❌ 검증 오류: ' + err.message + '</span>';
+        msgEl.innerHTML = '<span style="color:var(--danger);">❌ 검증 오류: ' + escModalHtml(err.message) + '</span>';
       }
     }
+
+    document.getElementById('explorer-folder-list')?.addEventListener('click', function(e) {
+      var itemEl = e.target.closest('.folder-item[data-folder-path]');
+      if (!itemEl) return;
+      var folderPath = itemEl.getAttribute('data-folder-path') || '';
+      var isReadable = itemEl.getAttribute('data-folder-readable') === '1';
+      handleFolderClick(folderPath, isReadable);
+    });
   </script>
   `;
 }

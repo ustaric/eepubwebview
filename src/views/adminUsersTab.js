@@ -6,7 +6,7 @@
  * - 📱 [1-Click 기기 모달 직통 연결] 테이블의 '2/6대' 배지 클릭 즉시 해당 사용자의 등록 기기 관제 팝업 오픈
  * - 📱 [기기 관리 모달 탑재] #modal-user-devices 지원으로 사용자별 등록 기기 목록(기기명, IP, 최근 접속) 및 개별 차단/해제/삭제
  * - 🔄 [테이블 실시간 동기화] 기기·도서 모달 변경 사항을 뒤쪽 사용자 목록 테이블 배지에 즉시 반영
- * - 🛡️ [XSS 및 속성 위임 안전] data-* 속성 클릭 위임과 HTML 이스케이프로 특수문자 기기명·메모 안전 처리
+ * - 🛡️ [XSS 및 속성 위임 안전] data-* 속성 클릭 위임, HTML 이스케이프 및 <script> 인라인 JSON 유니코드 이스케이프로 특수문자 기기명·메모 안전 처리
  */
 
 import { apiKeyManager } from '../apiKeyManager.js';
@@ -20,6 +20,14 @@ function escapeHtml(str = '') {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function serializeJsonForInlineScript(data) {
+  return JSON.stringify(data)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 export function renderUsersTab(env = {}) {
@@ -148,7 +156,7 @@ export function renderUsersTab(env = {}) {
     }).join('');
   }
 
-  const clientDataScript = `<script>window.__USER_DEVICES_MAP__ = ${JSON.stringify(userDevicesDataMap)};</script>`;
+  const clientDataScript = `<script>window.__USER_DEVICES_MAP__ = ${serializeJsonForInlineScript(userDevicesDataMap)};</script>`;
 
   return `
     ${clientDataScript}

@@ -2,8 +2,18 @@
  * @file src/views/adminAuthViews.js
  * @description 관리자 인증 화면(로그인 및 Google 직통 연동 리디렉터) 순수 HTML 템플릿 렌더러
  * - ⚡ [Google 비밀번호 관문 영구 제거] renderAuthGateHtml: 비밀번호 입력창 없이 Google 로그인으로 0초 즉시 자동 점프
- * - 🔑 [관리자 로그인] renderLoginPageHtml: 최초 설정 및 일상 로그인을 지원하는 비밀번호 관문 화면 보존
+ * - 🔑 [관리자 로그인] renderLoginPageHtml: 최초 설정 및 일상 로그인을 지원하는 비밀번호 관문 화면 보존 (errorMessage 이스케이프 적용)
  */
+
+function escapeHtml(str = '') {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 /**
  * ⚡ [비밀번호 관문 영구 제거] Google 로그인 직통 자동 이동 HTML 렌더러
@@ -100,7 +110,7 @@ export function renderLoginPageHtml(errorMessage = null, isInitialSetup = false)
 
   let errorBanner = '';
   if (errorMessage) {
-    errorBanner = `<div class="alert alert-error" style="padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); text-align: left;">❌ ${errorMessage}</div>`;
+    errorBanner = `<div class="alert alert-error" style="padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); text-align: left;">❌ ${escapeHtml(errorMessage)}</div>`;
   }
 
   return `<!DOCTYPE html>
