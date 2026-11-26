@@ -4,7 +4,7 @@
  * - 🇰🇷 [한국 표준시(KST) 통일] 크래시 리포트 발생 시각을 Asia/Seoul 기준으로 정확히 변환 표출
  * - 👁️ [JSON 바로 보기 모달] 감사 로그·크래시 리포트 파일명 클릭 또는 👁️ 아이콘 클릭 시 즉시 프리뷰/복사 모달 오픈
  * - 🖥️ [상단 실시간 가로 1줄 게이지 바] CPU(1분 평균), RAM, DISK 점유율 가로 1줄 콤팩트 실시간 표출 (80% 이상 경고 점멸)
- * - 👥 [사용자 칼럼 표출] 활동 로그 테이블에 사용자 메모/서재 칼럼 완벽 표출
+ * - 👥 [사용자 칼럼 표출] 활동 로그 및 크래시 리포트 테이블에 사용자 서재/소유 폴더 칼럼 완벽 표출
  * - ↔️ [가로/세로 2D 스크롤 박스] max-height: 400px (10행 기준) + overflow: auto 로 오른쪽 끝 잘림 방지
  * - 📌 [스티키 헤더 탑재] 스크롤을 내려도 thead th가 상단에 고정되어 가독성 극대화
  * - 💾 [디스크 및 도서 메트릭] 활성/보관 도서 권수 및 실측 디스크 용량 현황 카드
@@ -30,11 +30,11 @@ function escapeHtml(str = '') {
 
 /**
  * 📊 [탭 1] 관제 대시보드 HTML 템플릿 렌더러
- * @param {Object} metrics 
- * @param {Array} recentLogs 
- * @param {Array} crashReports 
- * @param {Object} env 
- * @returns {string}
+ * @param {Object} metrics - 저장소 및 도서 집계 메트릭 객체
+ * @param {Array<Object>} recentLogs - 최근 30건 활동 로그 목록
+ * @param {Array<Object>} crashReports - 루트 및 사용자별 크래시 리포트 목록
+ * @param {Object} env - 환경변수 설정 맵
+ * @returns {string} 대시보드 탭 HTML 문자열
  */
 export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports = [], env = {}) {
   const allowedOrigin = env.ALLOWED_ORIGIN || '*';
@@ -177,7 +177,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
     `;
   }
 
-  // 3. 크래시 리포트 테이블 (KST 변환 + 파일명 클릭 바로 보기 + 1-이모지 버튼)
+  // 3. 크래시 리포트 테이블 (KST 변환 + 소유 폴더 표출 + 파일명 클릭 바로 보기 + 1-이모지 버튼)
   let crashReportsHtml = '';
   if (!crashReports || crashReports.length === 0) {
     crashReportsHtml = `
@@ -196,8 +196,13 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
       });
       const encodedName = encodeURIComponent(r.fileName);
       const safeName = escapeHtml(r.fileName);
+      const rawUserFolder = r.userFolder || 'root';
+      const safeUserFolder = escapeHtml(rawUserFolder);
+      const userFolderBadge = rawUserFolder === 'root'
+        ? `<span style="color:var(--text-muted); font-size:11.5px; font-family:monospace;">root</span>`
+        : `<span style="color:#38bdf8; font-weight:600; font-size:11.5px; font-family:monospace;">👤 ${safeUserFolder}</span>`;
       const previewUrl = `/admin/crash-reports/download/${encodedName}?preview=1`;
-      const previewTitle = `🔬 조판 리포트 (${safeName})`;
+      const previewTitle = `🔬 조판 리포트 (${safeName} · ${safeUserFolder})`;
 
       return `
         <tr>
@@ -205,6 +210,7 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
               data-json-preview-url="${previewUrl}" data-json-title="${previewTitle}" title="클릭하여 JSON 바로 보기">
             ${safeName}
           </td>
+          <td style="white-space: nowrap;">${userFolderBadge}</td>
           <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">${escapeHtml(dateStr)}</td>
           <td style="text-align: center; white-space: nowrap;">
             <span style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
@@ -224,10 +230,11 @@ export function renderDashboardTab(metrics = {}, recentLogs = [], crashReports =
 
     crashReportsHtml = `
       <div style="max-height: 380px; overflow: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: #0f172a;">
-        <table class="data-table" style="min-width: 580px; border-collapse: separate; border-spacing: 0;">
+        <table class="data-table" style="min-width: 660px; border-collapse: separate; border-spacing: 0;">
           <thead style="position: sticky; top: 0; background: #1e293b; z-index: 2;">
             <tr>
               <th style="background: #1e293b;">파일명 (클릭 바로보기)</th>
+              <th style="background: #1e293b;">소유 (폴더)</th>
               <th style="background: #1e293b;">발생 시각 (KST)</th>
               <th style="background: #1e293b; text-align: center;">결함 수</th>
               <th style="background: #1e293b; text-align: right;">크기</th>

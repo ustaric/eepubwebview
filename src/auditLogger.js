@@ -3,7 +3,7 @@
  * @description 개인 서버 활동 링 버퍼(RAM) 및 다중 사용자 저장소 실측 집계 엔진
  * - 🇰🇷 [한국 표준시(KST) 통일] Asia/Seoul 기준 타임스탬프·일자 및 일별 로그 디렉터리 생성 보장
  * - 👥 [활동 로그 사용자 표출] recordAccessLog에 user(메모/폴더명) 필드 탑재로 대시보드 사용자별 활동 추적
- * - 👥 [다중 사용자 실측 집계] data/users 하위 모든 서재의 도서 권수 및 실측 용량 60초 캐싱 집계
+ * - 👥 [다중 사용자 실측 집계] data/users 하위 모든 서재의 도서 권수, 크래시 리포트 및 실측 용량 60초 캐싱 집계
  * - 🔑 [스토리지 API 키 사용 추적] recordApiKeyUsage & getLastApiKeyUsage 탑재로 실시간 연동 기기 관제 지원
  * - 🚦 [30건 메모리 링 버퍼] 대시보드 실시간 표출용 30건 FIFO 안전 보관 (정상+차단 전체 관제)
  * - 📁 [순수 보안 위협/침입/실패 디스크 저장] status >= 400 (401, 403, 404, 405, 429, 500)만 선별 영구 저장
@@ -12,7 +12,7 @@
  * - 🛡️ [정상 200 OK 디스크 배제] 일상 독서 트래픽으로 인한 로그 파일 오염 및 디스크 낭비 원천 차단
  * - 🧹 [민감정보 마스킹 & 심볼릭 경로 검증] maskSensitiveLog 및 validateSafePath 이중 방어 적용
  * - 📥 [로그 아카이브 관리 API] getLogFilesList, getFormattedLogContent, deleteLogFile 완비
- * - 💾 [디스크/도서 메트릭 집계] books/, archive/, users/, logs/ 실측 용량 및 권수 60초 캐싱 연산
+ * - 💾 [디스크/도서 메트릭 집계] books/, archive/, users/, crash-reports/, logs/ 실측 용량 및 권수 60초 캐싱 연산
  */
 
 import fs from 'fs';
@@ -514,8 +514,9 @@ export const auditLogger = {
   },
 
   /**
-   * 💾 서버 저장소 실시간 현황 집계 (다중 사용자 폴더 data/users 합산 실측, 60초 캐싱 및 KST 시각 지원)
-   * @param {boolean} [forceRefresh=false]
+   * 💾 서버 저장소 실시간 현황 집계 (루트 및 다중 사용자 폴더 data/users의 도서·크래시 리포트 합산 실측, 60초 캐싱 및 KST 시각 지원)
+   * @param {boolean} [forceRefresh=false] - 캐시를 무시하고 즉시 디스크를 재집계할지 여부
+   * @returns {{ activeBooksCount: number, archivedBooksCount: number, crashReportsCount: number, totalDataSizeMb: string, totalDataSizeBytes: number, lastCalculatedAt: string }}
    */
   getStorageMetrics(forceRefresh = false) {
     const now = Date.now();
@@ -527,12 +528,12 @@ export const auditLogger = {
     const env = readEnvFile();
     const isStorageMode = env.STORAGE_MODE === 'true';
 
-    // 1. 루트 서재 카운트
+    // 1. 루트 서재 및 크래시 리포트 카운트
     let activeBooks = countFilesWithExt(BOOKS_DIR, '.json');
     let archivedBooks = countFilesWithExt(ARCHIVE_DIR, '.json');
-    const crashReports = countFilesWithExt(CRASH_REPORTS_DIR, '.json');
+    let crashReports = countFilesWithExt(CRASH_REPORTS_DIR, '.json');
 
-    // 2. 👥 다중 사용자 서재(data/users/*) 도서 합산 집계
+    // 2. 👥 다중 사용자 서재(data/users/*) 도서 및 크래시 리포트 합산 집계
     if (isStorageMode && fs.existsSync(USERS_DIR)) {
       try {
         const userDirs = fs.readdirSync(USERS_DIR, { withFileTypes: true });
@@ -540,8 +541,10 @@ export const auditLogger = {
           if (u.isDirectory()) {
             const userBooksDir = path.join(USERS_DIR, u.name, 'books');
             const userArchiveDir = path.join(USERS_DIR, u.name, 'archive');
+            const userCrashDir = path.join(USERS_DIR, u.name, 'crash-reports');
             activeBooks += countFilesWithExt(userBooksDir, '.json');
             archivedBooks += countFilesWithExt(userArchiveDir, '.json');
+            crashReports += countFilesWithExt(userCrashDir, '.json');
           }
         }
       } catch (e) {}
