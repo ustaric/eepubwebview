@@ -2,7 +2,7 @@
  * @file src/routes/storage/storageRemoteLibraryRoutes.js
  * @description 자체 스토리지 공유 폴더 설정 및 공유 도서함(/api/storage/remote-library*, /admin/shared-folders) 라우터
  * - 🎛️ [관리자 공유 폴더 설정] GET/POST /api/storage/admin/shared-folders 스키마 검증 및 저장
- * - ⚡ [서버 내부 0초 복사] POST /api/storage/remote-library/import 폴더·기기 권한 검증 후 직통 복사
+ * - ⚡ [서버 내부 0초 복사] POST /api/storage/remote-library/import 폴더·기기 권한 및 용량(413) 직렬화 검증 후 직통 복사
  * - 📚 [공유 도서 목록 조회] GET /api/storage/remote-library 기기별 허용 폴더 필터링 및 목록 수집
  * - 📖 [스트리밍 다운로드] GET /api/storage/remote-library/download 경로 탈출 방어 및 스트리밍 전송
  */
@@ -15,6 +15,7 @@ import {
   getSharedFoldersConfig,
   saveSharedFoldersConfig
 } from '../../services/storage/remoteLibraryEngine.js';
+import { withUserStorageLock } from '../../services/storage/storageContext.js';
 import {
   setCorsHeaders,
   sendJsonResponse,
@@ -45,6 +46,7 @@ export async function handleStorageRemoteLibraryRoute(req, res, pathname, reqUrl
   const {
     env,
     targetUserFolder,
+    userQuotaBytes,
     authenticatedUserMemo,
     isRootAdmin,
     deviceId
@@ -158,7 +160,14 @@ export async function handleStorageRemoteLibraryRoute(req, res, pathname, reqUrl
         return true;
       }
 
-      const importResult = storageService.importRemoteBookToLibrary(matchedFolder.path, normalizedRelPath, targetUserFolder);
+      const importResult = await withUserStorageLock(targetUserFolder, () =>
+        storageService.importRemoteBookToLibrary(
+          matchedFolder.path,
+          normalizedRelPath,
+          targetUserFolder,
+          targetUserFolder ? userQuotaBytes : null
+        )
+      );
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
@@ -171,6 +180,18 @@ export async function handleStorageRemoteLibraryRoute(req, res, pathname, reqUrl
       sendJsonResponse(req, res, 200, importResult);
       return true;
     } catch (err) {
+      if (err?.code === 'STORAGE_QUOTA_EXCEEDED' || err?.statusCode === 413 || String(err?.message || '').startsWith('STORAGE_QUOTA_EXCEEDED')) {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '용량 초과 공유 도서 복사 차단',
+          target: `${targetUserFolder || 'root'} (${err.message})`,
+          status: 413,
+          user: authenticatedUserMemo
+        });
+        sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+        return true;
+      }
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '공유 도서 복사 실패', target: err.message, status: 500, user: authenticatedUserMemo });
       sendJsonResponse(req, res, 500, { error: err.message });
       return true;

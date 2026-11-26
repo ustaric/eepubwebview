@@ -3,8 +3,8 @@
  * @description 스토리지 엔진 기반 컨텍스트, 경로 소독, 사용자 샌드박스 격리 및 공통 디스크 I/O 헬퍼 모듈
  * - 🛡️ [경로 소독 & 웹뷰 규격 일치] sanitizeFileName으로 대소괄호 보존 및 공백의 언더바(_) 치환
  * - 🎯 [6대 지능형 다중 후보군] generateFilenameCandidates로 NFC/NFD 유니코드 및 구버전 하위 호환 탐색 지원
- * - 👥 [다중 사용자 샌드박스 스코핑] resolveStorageContext로 data/users/{userFolder} 완전 격리
- * - 📊 [사용자 용량 한도 실측] checkUserStorageQuota로 디스크 실측 기반 할당량 통제
+ * - 👥 [다중 사용자 샌드박스 스코핑] resolveStorageContext로 data/users/{userFolder} 완전 격리 (crash-reports 포함)
+ * - 📊 [사용자 용량 한도 실측] checkUserStorageQuota로 덮어쓰기 순증가분 기반 할당량 통제 및 withUserStorageLock 동시성 직렬화
  * - 🔒 [보안 경로 검증] resolveSafeRelativePath로 심볼릭 링크 및 Path Traversal 실측 차단
  * - ✍️ [충돌 없는 원자적 쓰기] writeJsonSafely 임시 파일명 난수 접미사 적용으로 동시 쓰기 ENOENT 방어
  */
@@ -25,6 +25,9 @@ export const BASE_SETTINGS_DIR = path.resolve(ROOT_DIR, 'data/settings');
 export const BASE_ARCHIVE_DIR = path.resolve(ROOT_DIR, 'data/archive');
 export const CRASH_REPORTS_DIR = path.resolve(ROOT_DIR, 'data/crash-reports');
 export const USERS_DIR = path.resolve(ROOT_DIR, 'data/users');
+
+// 🔒 사용자별 쓰기/쿼터 검사 직렬화 큐 (동시 업로드 레이스 컨디션 방어)
+const userWriteQueues = new Map();
 
 /**
  * 🛡️ [경로 소독 및 언더바(_) 웹뷰 규격 일치화 헬퍼]
@@ -169,10 +172,10 @@ export function calculateDirSizeBytes(dirPath) {
 
 /**
  * 👥 [사용자 전용 디렉터리 경로 동적 해석 헬퍼]
- * userFolder가 지정되면 data/users/{userFolder}/books, settings, archive 반환
- * userFolder가 없으면 기존 최상위 data/books, settings, archive 반환 (100% 하위 호환)
+ * userFolder가 지정되면 data/users/{userFolder}/books, settings, archive, crash-reports 반환
+ * userFolder가 없으면 기존 최상위 data/books, settings, archive, crash-reports 반환 (관리자 호환)
  * @param {string|null} [userFolder=null] 
- * @returns {{ booksDir: string, settingsDir: string, archiveDir: string, userRoot: string }}
+ * @returns {{ booksDir: string, settingsDir: string, archiveDir: string, crashReportsDir: string, userRoot: string }}
  */
 export function resolveStorageContext(userFolder = null) {
   if (!userFolder || typeof userFolder !== 'string') {
@@ -180,13 +183,20 @@ export function resolveStorageContext(userFolder = null) {
       booksDir: BASE_BOOKS_DIR,
       settingsDir: BASE_SETTINGS_DIR,
       archiveDir: BASE_ARCHIVE_DIR,
+      crashReportsDir: CRASH_REPORTS_DIR,
       userRoot: ROOT_DIR
     };
   }
 
   const cleanFolder = path.basename(userFolder.trim());
+  if (!cleanFolder || cleanFolder === '.' || cleanFolder === '..') {
+    console.warn(`⛔ [SecurityGuard Blocked] 허용되지 않은 사용자 폴더명: '${userFolder}'`);
+    throw new Error('UNAUTHORIZED_USER_STORAGE_PATH');
+  }
+
   const safeCheck = validateSafePath(USERS_DIR, cleanFolder);
-  if (!safeCheck.safe) {
+  const resolvedUsersDir = fs.existsSync(USERS_DIR) ? fs.realpathSync(USERS_DIR) : path.resolve(USERS_DIR);
+  if (!safeCheck.safe || !safeCheck.realPath || safeCheck.realPath === resolvedUsersDir) {
     console.warn(`⛔ [SecurityGuard Blocked] 유효하지 않은 사용자 폴더 접근: '${userFolder}'`);
     throw new Error('UNAUTHORIZED_USER_STORAGE_PATH');
   }
@@ -195,32 +205,92 @@ export function resolveStorageContext(userFolder = null) {
   const booksDir = path.join(userRoot, 'books');
   const settingsDir = path.join(userRoot, 'settings');
   const archiveDir = path.join(userRoot, 'archive');
+  const crashReportsDir = path.join(userRoot, 'crash-reports');
 
   ensureDir(booksDir);
   ensureDir(settingsDir);
   ensureDir(archiveDir);
 
-  return { booksDir, settingsDir, archiveDir, userRoot };
+  return { booksDir, settingsDir, archiveDir, crashReportsDir, userRoot };
+}
+
+/**
+ * 🔒 [사용자별 디스크 쓰기·쿼터 검증 직렬화 락]
+ * 동일 사용자 폴더의 동시 업로드 요청이 용량 검사를 동시 통과하는 레이스 컨디션을 방지합니다.
+ * @template T
+ * @param {string|null} userFolder
+ * @param {() => (T | Promise<T>)} taskFn
+ * @returns {Promise<T>}
+ */
+export async function withUserStorageLock(userFolder, taskFn) {
+  if (!userFolder || typeof userFolder !== 'string') {
+    return await taskFn();
+  }
+
+  const lockKey = path.basename(userFolder.trim());
+  const prev = userWriteQueues.get(lockKey) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.then(() => current, () => current);
+  userWriteQueues.set(lockKey, chained);
+
+  await prev.catch(() => {});
+  try {
+    return await taskFn();
+  } finally {
+    release();
+    if (userWriteQueues.get(lockKey) === chained) {
+      userWriteQueues.delete(lockKey);
+    }
+  }
 }
 
 /**
  * 📊 [사용자 저장 용량 한도 실측 검사]
+ * 기존 파일을 덮어쓰는 경우(existingFilePath / existingPaths) 실제 순증가분만 반영해 오탐을 방지합니다.
  * @param {string} userFolder 
  * @param {number} incomingBytes - 저장하려는 파일 바이트 수
  * @param {number} quotaBytes - 사용자 할당 용량 바이트 수
- * @returns {{ allowed: boolean, currentBytes: number, quotaBytes: number, remainingBytes: number }}
+ * @param {{ existingFilePath?: string|null, existingPaths?: string[] }} [options={}] - 덮어쓰기 대상 기존 파일 경로 옵션
+ * @returns {{ allowed: boolean, currentBytes: number, quotaBytes: number, remainingBytes: number, netIncomingBytes?: number }}
  */
-export function checkUserStorageQuota(userFolder, incomingBytes = 0, quotaBytes = 1073741824) {
-  if (!userFolder) return { allowed: true, currentBytes: 0, quotaBytes, remainingBytes: quotaBytes };
+export function checkUserStorageQuota(userFolder, incomingBytes = 0, quotaBytes = 1073741824, options = {}) {
+  if (!userFolder) {
+    return { allowed: true, currentBytes: 0, quotaBytes, remainingBytes: quotaBytes, netIncomingBytes: 0 };
+  }
 
   const ctx = resolveStorageContext(userFolder);
+  const candidatePaths = [
+    ...(options?.existingFilePath ? [options.existingFilePath] : []),
+    ...(Array.isArray(options?.existingPaths) ? options.existingPaths : [])
+  ];
+
+  let existingBytes = 0;
+  for (const candidatePath of candidatePaths) {
+    if (candidatePath && fs.existsSync(candidatePath)) {
+      try {
+        const stat = fs.statSync(candidatePath);
+        if (stat.isFile()) {
+          existingBytes = stat.size;
+          break;
+        }
+      } catch (_) {}
+    }
+  }
+
+  const rawIncoming = Math.max(0, Number(incomingBytes || 0));
+  const netIncomingBytes = Math.max(0, rawIncoming - existingBytes);
   const currentBytes = calculateDirSizeBytes(ctx.userRoot);
-  const willUseBytes = currentBytes + Number(incomingBytes || 0);
+  const willUseBytes = currentBytes + netIncomingBytes;
+  const allowed = (existingBytes > 0 && rawIncoming <= existingBytes) || (willUseBytes <= quotaBytes);
 
   return {
-    allowed: willUseBytes <= quotaBytes,
+    allowed,
     currentBytes,
     quotaBytes,
-    remainingBytes: Math.max(0, quotaBytes - currentBytes)
+    remainingBytes: Math.max(0, quotaBytes - currentBytes),
+    netIncomingBytes
   };
 }

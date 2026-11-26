@@ -4,7 +4,7 @@
  * - 🔍 [디렉터리 트리 & 권한 실측] testDirectoryPermissions 및 getDirectoryTree로 관리자 탐색기 제어
  * - 🛡️ [O(1) 권한 판정 SSOT] checkRemoteLibraryAccessible로 도서 재귀 스캔 없이 기기별 공유 도서함 접근 가능 여부 판정
  * - 📚 [공유 폴더 도서 재귀 스캔] getRemoteBooks로 외부 라이브러리 내 .epub/.txt 도서 실시간 수집
- * - ⚡ [서버 내부 0초 직통 복사 & 기존 기록 보존] importRemoteBookToLibrary로 books/ 안착 시 기존 독서 진행률/CFI/표지 무손실 보존
+ * - ⚡ [서버 내부 0초 직통 복사 & 용량 통제] importRemoteBookToLibrary로 quotaBytes 실측 검증 후 books/ 안착 및 기존 기록 보존
  * - 🛡️ [확장자 & 심볼릭 링크 보안] isAllowedBookFile 및 resolveSafeRelativePath로 탈출 시도 실측 차단
  */
 
@@ -15,6 +15,7 @@ import {
   sanitizeFileName,
   resolveSafeRelativePath,
   resolveStorageContext,
+  checkUserStorageQuota,
   ensureDir
 } from './storageContext.js';
 import { getBookMetadata, saveBookMetadata } from './bookStorageEngine.js';
@@ -292,12 +293,14 @@ export function getRemoteBookFilePath(sharedDir, relativeFilePath) {
 /**
  * ⚡ 공유 폴더 도서를 서버 내부 디스크에서 books/ 로 직접 복사(Import)하고 메타데이터를 생성/병합합니다.
  * - 동일한 bookId의 기존 메타데이터(books/ 또는 archive/)가 이미 존재하면 독서 진행률, CFI, 표지 등 기존 기록을 보존합니다.
+ * - userFolder와 quotaBytes가 전달되면 복사 직전 사용자 할당 용량을 검증해 초과 시 STORAGE_QUOTA_EXCEEDED 예외를 발생시킵니다.
  * @param {string} sharedDir - 공유 폴더 절대 경로
  * @param {string} relativeFilePath - 공유 폴더 내 파일 상대 경로
  * @param {string|null} [userFolder=null] - 대상 사용자 폴더명
+ * @param {number|null} [quotaBytes=null] - 대상 사용자 저장 용량 한도(Byte)
  * @returns {Object|null} 복사 결과 및 도서 메타데이터
  */
-export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolder = null) {
+export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolder = null, quotaBytes = null) {
   if (!sharedDir || !relativeFilePath) return null;
 
   if (!isAllowedBookFile(relativeFilePath)) {
@@ -336,6 +339,23 @@ export function importRemoteBookToLibrary(sharedDir, relativeFilePath, userFolde
 
   // 기존 메타데이터 선조회 (재임포트 시 기존 독서 진행률·CFI·표지 무손실 보존용)
   const existingMeta = getBookMetadata(safeBookId, userFolder);
+
+  // 📊 사용자 저장 용량 한도 실측 검사 (기존 동일 EPUB 덮어쓰기 시 순증가분 기준)
+  if (userFolder && Number.isFinite(Number(quotaBytes)) && Number(quotaBytes) > 0) {
+    const metaOverheadBytes = existingMeta ? 0 : 1024;
+    const quotaCheck = checkUserStorageQuota(userFolder, stat.size + metaOverheadBytes, Number(quotaBytes), {
+      existingPaths: [
+        targetEpubPath,
+        path.join(ctx.archiveDir, `${safeBookId}.epub`)
+      ]
+    });
+    if (!quotaCheck.allowed) {
+      const err = new Error('STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.');
+      err.code = 'STORAGE_QUOTA_EXCEEDED';
+      err.statusCode = 413;
+      throw err;
+    }
+  }
 
   fs.copyFileSync(safeSourcePath, targetEpubPath);
 

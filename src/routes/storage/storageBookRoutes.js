@@ -2,15 +2,21 @@
  * @file src/routes/storage/storageBookRoutes.js
  * @description 자체 스토리지 스냅샷, 도서 메타데이터·보관·EPUB 바이너리 및 표지 이미지(/api/storage/snapshot, /books*, /archive*, /covers*) 라우터
  * - 📚 [통합 스냅샷] GET /api/storage/snapshot 및 기기별 remoteLibraryAccessible 권한 플래그 반환
- * - 📖 [도서 메타 & 보관함] GET/POST/DELETE /api/storage/books/:id, GET /api/storage/archive/:id
- * - 📦 [EPUB 바이너리 I/O] 용량 할당량(413) 사전 검사 및 GET/HEAD/POST /api/storage/books/:id/epub 스트리밍
- * - 🖼️ [표지 이미지 I/O] /api/storage/covers/* 및 /api/storage/books/*.webp 직통 매칭
+ * - 📖 [도서 메타 & 보관함] GET/POST/DELETE /api/storage/books/:id, GET /api/storage/archive/:id (메타 저장 용량 통제 포함)
+ * - 📦 [EPUB 바이너리 I/O] 사전·사후 실측 용량 할당량(413) 직렬화 검사 및 GET/HEAD/POST /api/storage/books/:id/epub 스트리밍
+ * - 🖼️ [표지 이미지 I/O] 용량 할당량(413) 직렬화 검사 및 /api/storage/covers/* · /api/storage/books/*.webp 직통 매칭
  */
 
 import fs from 'fs';
+import path from 'path';
 import { storageService } from '../../storageService.js';
 import { auditLogger } from '../../auditLogger.js';
 import { checkRemoteLibraryAccessible } from '../../services/storage/remoteLibraryEngine.js';
+import {
+  resolveStorageContext,
+  sanitizeFileName,
+  withUserStorageLock
+} from '../../services/storage/storageContext.js';
 import {
   setCorsHeaders,
   sendJsonResponse,
@@ -97,7 +103,33 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
       try {
         const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
         const bookData = JSON.parse(buffer.toString('utf-8'));
-        storageService.saveBookMetadata(bookId, bookData, targetUserFolder);
+
+        const writeResult = await withUserStorageLock(targetUserFolder, () => {
+          if (targetUserFolder) {
+            const safeId = sanitizeFileName(bookId);
+            const ctx = resolveStorageContext(targetUserFolder);
+            const existingPaths = safeId
+              ? [path.join(ctx.booksDir, `${safeId}.json`), path.join(ctx.archiveDir, `${safeId}.json`)]
+              : [];
+            const hasExistingMeta = existingPaths.some((p) => fs.existsSync(p));
+            const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, buffer.length, userQuotaBytes, {
+              existingPaths
+            });
+            const isSmallProgressUpdate = hasExistingMeta && (quotaCheck.netIncomingBytes || 0) <= 4096;
+            if (!quotaCheck.allowed && !isSmallProgressUpdate) {
+              return { quotaExceeded: true };
+            }
+          }
+
+          storageService.saveBookMetadata(bookId, bookData, targetUserFolder);
+          return { quotaExceeded: false };
+        });
+
+        if (writeResult.quotaExceeded) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 메타 저장 차단', target: `${bookId} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
 
         const actionName = bookData.isArchived ? '📁 도서 보관 처리' : '📖 도서 메타 저장';
         auditLogger.recordAccessLog({
@@ -130,7 +162,9 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
     }
 
     if (req.method === 'DELETE') {
-      const count = storageService.deleteBookAll(bookId, targetUserFolder);
+      const count = await withUserStorageLock(targetUserFolder, () =>
+        storageService.deleteBookAll(bookId, targetUserFolder)
+      );
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
@@ -165,10 +199,20 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
     const bookId = decodeURIComponent(rawSegment);
 
     if (req.method === 'POST') {
+      const safeId = sanitizeFileName(bookId);
+      const existingEpubPaths = (targetUserFolder && safeId)
+        ? (() => {
+            const ctx = resolveStorageContext(targetUserFolder);
+            return [path.join(ctx.booksDir, `${safeId}.epub`), path.join(ctx.archiveDir, `${safeId}.epub`)];
+          })()
+        : [];
+
       const contentLength = Number(req.headers['content-length'] || 0);
       if (targetUserFolder && contentLength > 0) {
-        const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes);
-        if (!quotaCheck.allowed) {
+        const preQuotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes, {
+          existingPaths: existingEpubPaths
+        });
+        if (!preQuotaCheck.allowed) {
           auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 업로드 차단', target: `${bookId} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
           sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
           return true;
@@ -177,7 +221,26 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
 
       try {
         const buffer = await readRequestBodyBuffer(req, 100 * 1024 * 1024);
-        storageService.saveBookEpub(bookId, buffer, targetUserFolder);
+
+        const writeResult = await withUserStorageLock(targetUserFolder, () => {
+          if (targetUserFolder) {
+            const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, buffer.length, userQuotaBytes, {
+              existingPaths: existingEpubPaths
+            });
+            if (!quotaCheck.allowed) {
+              return { quotaExceeded: true };
+            }
+          }
+
+          storageService.saveBookEpub(bookId, buffer, targetUserFolder);
+          return { quotaExceeded: false };
+        });
+
+        if (writeResult.quotaExceeded) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 업로드 차단 (실측)', target: `${bookId} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
 
         const sizeMb = (buffer.length / 1024 / 1024).toFixed(1);
         auditLogger.recordAccessLog({
@@ -243,9 +306,49 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
     const fileName = decodeURIComponent(pathname.replace('/api/storage/covers/', ''));
 
     if (req.method === 'POST') {
+      const safeCoverName = sanitizeFileName(String(fileName || '').replace(/^covers[/\\]/i, ''));
+      const existingCoverPaths = (targetUserFolder && safeCoverName)
+        ? (() => {
+            const ctx = resolveStorageContext(targetUserFolder);
+            return [path.join(ctx.booksDir, safeCoverName), path.join(ctx.archiveDir, safeCoverName)];
+          })()
+        : [];
+
+      const contentLength = Number(req.headers['content-length'] || 0);
+      if (targetUserFolder && contentLength > 0) {
+        const preQuotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes, {
+          existingPaths: existingCoverPaths
+        });
+        if (!preQuotaCheck.allowed) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 표지 업로드 차단', target: `${fileName} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
+      }
+
       try {
         const buffer = await readRequestBodyBuffer(req, 10 * 1024 * 1024);
-        storageService.saveCoverImage(fileName, buffer, targetUserFolder);
+
+        const writeResult = await withUserStorageLock(targetUserFolder, () => {
+          if (targetUserFolder) {
+            const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, buffer.length, userQuotaBytes, {
+              existingPaths: existingCoverPaths
+            });
+            if (!quotaCheck.allowed) {
+              return { quotaExceeded: true };
+            }
+          }
+
+          storageService.saveCoverImage(fileName, buffer, targetUserFolder);
+          return { quotaExceeded: false };
+        });
+
+        if (writeResult.quotaExceeded) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 표지 업로드 차단 (실측)', target: `${fileName} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
+
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 업로드', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
         sendJsonResponse(req, res, 200, { ok: true, fileName });
         return true;
@@ -286,7 +389,9 @@ export async function handleStorageBookRoute(req, res, pathname, clientIp, userA
     }
 
     if (req.method === 'DELETE') {
-      storageService.deleteCoverImage(fileName, targetUserFolder);
+      await withUserStorageLock(targetUserFolder, () =>
+        storageService.deleteCoverImage(fileName, targetUserFolder)
+      );
       auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '🖼️ 표지 단일 삭제', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
       sendJsonResponse(req, res, 200, { ok: true, fileName });
       return true;

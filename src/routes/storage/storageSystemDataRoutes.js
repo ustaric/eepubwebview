@@ -1,14 +1,20 @@
 /**
  * @file src/routes/storage/storageSystemDataRoutes.js
  * @description 자체 스토리지 시스템 데이터·기기 슬롯·크래시 리포트(/api/storage/crash-reports*, /devices*, /settings*) 라우터
- * - 🛑 [크래시 리포트 수신] ENABLE_CRASH_REPORTS=false 시 403 차단 및 JSON 저장
+ * - 🛑 [크래시 리포트 수신] ENABLE_CRASH_REPORTS=false 시 403 차단, 사용자 crash-reports/ 샌드박스 저장 및 용량 통제
  * - 📱 [등록 기기 관리] GET /api/storage/devices 및 DELETE /api/storage/devices/:id 슬롯 반환
- * - ⚙️ [설정 파일 I/O] GET/POST /api/storage/settings/:fileName 동기화 처리
+ * - ⚙️ [설정 파일 I/O] GET/POST /api/storage/settings/:fileName 동기화 처리 및 용량 통제 (묘비 동기화 데드락 예외 포함)
  */
 
+import path from 'path';
 import { storageService } from '../../storageService.js';
 import { auditLogger } from '../../auditLogger.js';
 import { apiKeyManager } from '../../apiKeyManager.js';
+import {
+  resolveStorageContext,
+  sanitizeFileName,
+  withUserStorageLock
+} from '../../services/storage/storageContext.js';
 import {
   sendJsonResponse,
   readRequestBodyBuffer
@@ -28,6 +34,7 @@ export async function handleStorageSystemDataRoute(req, res, pathname, clientIp,
   const {
     env,
     targetUserFolder,
+    userQuotaBytes,
     userMaxDevices,
     authenticatedUserMemo
   } = context;
@@ -40,16 +47,66 @@ export async function handleStorageSystemDataRoute(req, res, pathname, clientIp,
     }
 
     const fileName = decodeURIComponent(pathname.replace('/api/storage/crash-reports/', ''));
+    const safeCrashName = sanitizeFileName(fileName);
+    const existingCrashPath = (targetUserFolder && safeCrashName)
+      ? path.join(resolveStorageContext(targetUserFolder).crashReportsDir, safeCrashName)
+      : null;
+
+    const contentLength = Number(req.headers['content-length'] || 0);
+    if (targetUserFolder && contentLength > 0) {
+      const preQuotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes, {
+        existingFilePath: existingCrashPath
+      });
+      if (!preQuotaCheck.allowed) {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '용량 초과 크래시 리포트 차단',
+          target: `${fileName} (${targetUserFolder})`,
+          status: 413,
+          user: authenticatedUserMemo
+        });
+        sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+        return true;
+      }
+    }
+
     try {
       const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
       const reportData = JSON.parse(buffer.toString('utf-8'));
-      storageService.saveCrashReport(fileName, reportData);
+
+      const writeResult = await withUserStorageLock(targetUserFolder, () => {
+        if (targetUserFolder) {
+          const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, buffer.length, userQuotaBytes, {
+            existingFilePath: existingCrashPath
+          });
+          if (!quotaCheck.allowed) {
+            return { quotaExceeded: true };
+          }
+        }
+
+        storageService.saveCrashReport(fileName, reportData, targetUserFolder);
+        return { quotaExceeded: false };
+      });
+
+      if (writeResult.quotaExceeded) {
+        auditLogger.recordAccessLog({
+          ip: clientIp,
+          userAgent,
+          action: '용량 초과 크래시 리포트 차단 (실측)',
+          target: `${fileName} (${targetUserFolder})`,
+          status: 413,
+          user: authenticatedUserMemo
+        });
+        sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+        return true;
+      }
 
       auditLogger.recordAccessLog({
         ip: clientIp,
         userAgent,
         action: '크래시 리포트 수신',
-        target: fileName,
+        target: `${fileName} (${targetUserFolder || 'root'})`,
         status: 200,
         user: authenticatedUserMemo
       });
@@ -113,10 +170,49 @@ export async function handleStorageSystemDataRoute(req, res, pathname, clientIp,
     const fileName = decodeURIComponent(pathname.replace('/api/storage/settings/', ''));
 
     if (req.method === 'POST') {
+      const safeSettingsName = sanitizeFileName(fileName);
+      const existingSettingsPath = (targetUserFolder && safeSettingsName)
+        ? path.join(resolveStorageContext(targetUserFolder).settingsDir, safeSettingsName)
+        : null;
+
+      const contentLength = Number(req.headers['content-length'] || 0);
+      const isPreTombstoneAllow = safeSettingsName === 'deleted-books.json' && contentLength <= 512 * 1024;
+      if (targetUserFolder && contentLength > 0 && !isPreTombstoneAllow) {
+        const preQuotaCheck = storageService.checkUserStorageQuota(targetUserFolder, contentLength, userQuotaBytes, {
+          existingFilePath: existingSettingsPath
+        });
+        if (!preQuotaCheck.allowed) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 설정 동기화 차단', target: `${fileName} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
+      }
+
       try {
         const buffer = await readRequestBodyBuffer(req, 5 * 1024 * 1024);
         const data = JSON.parse(buffer.toString('utf-8'));
-        storageService.saveSettingsFile(fileName, data, targetUserFolder);
+
+        const writeResult = await withUserStorageLock(targetUserFolder, () => {
+          if (targetUserFolder) {
+            const isTombstoneAllow = safeSettingsName === 'deleted-books.json' && buffer.length <= 512 * 1024;
+            const quotaCheck = storageService.checkUserStorageQuota(targetUserFolder, buffer.length, userQuotaBytes, {
+              existingFilePath: existingSettingsPath
+            });
+            if (!quotaCheck.allowed && !isTombstoneAllow) {
+              return { quotaExceeded: true };
+            }
+          }
+
+          storageService.saveSettingsFile(fileName, data, targetUserFolder);
+          return { quotaExceeded: false };
+        });
+
+        if (writeResult.quotaExceeded) {
+          auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '용량 초과 설정 동기화 차단 (실측)', target: `${fileName} (${targetUserFolder})`, status: 413, user: authenticatedUserMemo });
+          sendJsonResponse(req, res, 413, { error: 'STORAGE_QUOTA_EXCEEDED: 저장 용량을 초과했습니다.' });
+          return true;
+        }
+
         auditLogger.recordAccessLog({ ip: clientIp, userAgent, action: '⚙️ 시스템 데이터 동기화', target: `${fileName} (${targetUserFolder || 'root'})`, status: 200, user: authenticatedUserMemo });
         sendJsonResponse(req, res, 200, { ok: true, fileName });
         return true;

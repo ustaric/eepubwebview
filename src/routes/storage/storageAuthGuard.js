@@ -2,9 +2,9 @@
  * @file src/routes/storage/storageAuthGuard.js
  * @description 자체 스토리지 API(/api/storage/*) 공통 인증·보안·기기 화이트리스트 게이트 모듈
  * - 🚦 [요청 제한 & 모드 확인] 분당 600회 Rate Limit 및 STORAGE_MODE === 'true' 검증
- * - 🔒 [Root / User API 키 인증] 상수 시간 Root 키 비교, 빈 키 차단 및 만료·폐기 키 거부
+ * - 🔒 [Root / User API 키 인증] 상수 시간 Root 키 비교, 빈 키 차단, 만료·폐기 키 거부 및 공용 폴백 우회 차단
  * - 📱 [기기 화이트리스트 & 토큰 검증] X-Device-Id 형식·예약어, verifyAndTouchDevice(토큰·차단·한도·미등록) 검증
- * - 🧭 [최소 권한 컨텍스트 반환] 통과 시 하위 라우터가 사용할 authContext 객체 반환 (차단 시 직접 응답 후 handled: true)
+ * - 🧭 [최소 권한 컨텍스트 반환] Fail-Closed 샌드박스 검증 후 하위 라우터가 사용할 authContext 반환
  */
 
 import { auditLogger } from '../../auditLogger.js';
@@ -14,7 +14,6 @@ import { isAuthenticated } from '../../adminController.js';
 import {
   extractApiKey,
   extractDeviceInfo,
-  isAllowedClientOrigin,
   checkRateLimit,
   safeCompareSecret,
   sendJsonResponse
@@ -371,11 +370,12 @@ export function authenticateStorageRequest(req, res, pathname, reqUrl, clientIp,
     isRootAdmin = true;
     targetUserFolder = null;
     authenticatedUserMemo = 'Root Admin (Web Session)';
-  } else if (isEnforceApiKey) {
+  } else {
+    // 🛡️ 공용 폴더 폴백 차단: ENFORCE_STORAGE_API_KEY 설정 여부와 무관하게 유효한 API 키(또는 관리자 세션) 필수
     auditLogger.recordAccessLog({
       ip: clientIp,
       userAgent,
-      action: 'API 키 누락 차단',
+      action: isEnforceApiKey ? 'API 키 누락 차단' : '공용 폴백 차단 (API 키 필수)',
       target: pathname,
       status: 401,
       method: req.method,
@@ -384,13 +384,16 @@ export function authenticateStorageRequest(req, res, pathname, reqUrl, clientIp,
       origin: safeOrigin,
       authState
     });
-    sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: X-API-KEY 헤더가 누락되었습니다.' });
+    sendJsonResponse(req, res, 401, { error: 'UNAUTHORIZED_API_KEY: 유효한 API 키가 필요합니다.' });
     return { handled: true, context: null };
-  } else if (!isAllowedClientOrigin(req)) {
+  }
+
+  // 🔒 Fail-Closed 불변식 가드: 루트 관리자가 아닌 요청은 반드시 사용자 샌드박스 폴더를 보유해야 함
+  if (!isRootAdmin && (!targetUserFolder || typeof targetUserFolder !== 'string' || !targetUserFolder.trim())) {
     auditLogger.recordAccessLog({
       ip: clientIp,
       userAgent,
-      action: '비인가 출처 차단',
+      action: '🚫 사용자 샌드박스 누락 차단',
       target: pathname,
       status: 403,
       method: req.method,
@@ -399,7 +402,7 @@ export function authenticateStorageRequest(req, res, pathname, reqUrl, clientIp,
       origin: safeOrigin,
       authState
     });
-    sendJsonResponse(req, res, 403, { error: 'FORBIDDEN_ORIGIN: 승인되지 않은 도메인 접근입니다.' });
+    sendJsonResponse(req, res, 403, { error: 'USER_SANDBOX_REQUIRED: 사용자 전용 저장소 컨텍스트가 확인되지 않았습니다.' });
     return { handled: true, context: null };
   }
 
